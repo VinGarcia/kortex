@@ -127,8 +127,8 @@ func (e *OutputEvaluator) evaluateTurn(turnIndex int, assistantText string) {
 	defer cancel()
 
 	start := time.Now()
-	userMessage := "<<<RESPOSTA_PROPOSTA_INICIO>>>\n" + assistantText + "\n<<<RESPOSTA_PROPOSTA_FIM>>>"
-	eval, err := e.evaluator.Evaluate(ctx, e.systemPrompt, userMessage)
+	userMessage := "<<<RESPOSTA_PROPOSTA_INICIO>>>\n" + numberParagraphs(paragraphs) + "\n<<<RESPOSTA_PROPOSTA_FIM>>>"
+	eval, err := e.evaluator.Evaluate(ctx, e.systemPrompt+segmentationContract(len(paragraphs)), userMessage)
 	entry := callLog{
 		Facet:        outputEvaluatorFacet,
 		Model:        e.model,

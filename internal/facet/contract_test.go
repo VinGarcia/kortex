@@ -161,3 +161,43 @@ func TestInterleave(t *testing.T) {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+func TestNumberParagraphs(t *testing.T) {
+	tests := []struct {
+		name       string
+		paragraphs []string
+		want       string
+	}{
+		{
+			name:       "single paragraph",
+			paragraphs: []string{"oi"},
+			want:       "[P1]\noi",
+		},
+		{
+			name:       "paragraph with internal newline keeps its lines under one marker",
+			paragraphs: []string{"linha 1\nlinha 2", "fim"},
+			want:       "[P1]\nlinha 1\nlinha 2\n\n[P2]\nfim",
+		},
+		{
+			name:       "three blocks numbered in order",
+			paragraphs: []string{"a", "b", "c"},
+			want:       "[P1]\na\n\n[P2]\nb\n\n[P3]\nc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := numberParagraphs(tt.paragraphs); got != tt.want {
+				t.Errorf("numberParagraphs() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSegmentationContract(t *testing.T) {
+	got := segmentationContract(7)
+	for _, want := range []string{"em 7 parágrafos", "EXATAMENTE 7 elementos", `{"investment": 0, "valence": "neutra", "emotions": []}`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("segmentationContract(7) missing %q:\n%s", want, got)
+		}
+	}
+}
