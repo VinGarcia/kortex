@@ -31,6 +31,10 @@ Thin `main.go` (env/config wiring only) over two internal packages:
   orchestrator will plug into `proxy.copyLines`, the single point where every
   protocol line passes.
 
+The import direction is enforced by `go-arch-lint` (`.go-arch-lint.yml`, run
+via `make lint`). All env reading happens in `main.go`; the packages receive
+everything through parameters.
+
 Env: `KORTEX_CLAUDE_BIN` (explicit path to the real claude), `KORTEX_LOG`
 (debug traffic log path; never written to protocol stdout/stderr).
 

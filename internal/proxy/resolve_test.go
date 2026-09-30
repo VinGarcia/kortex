@@ -36,22 +36,21 @@ func TestResolveClaudeBin(t *testing.T) {
 	tests := []struct {
 		desc               string
 		explicit           string
-		path               string
+		searchDirs         []string
 		want               string
 		expectErrToContain string
 	}{
-		{desc: "explicit bin wins over PATH", explicit: real, path: selfDir, want: real},
+		{desc: "explicit bin wins over search dirs", explicit: real, searchDirs: []string{selfDir}, want: real},
 		{desc: "explicit bin missing", explicit: filepath.Join(selfDir, "nope"), expectErrToContain: "not an executable"},
-		{desc: "PATH skips self and finds real claude", path: selfDir + string(os.PathListSeparator) + realDir, want: real},
-		{desc: "PATH skips symlink to self", path: selfLinkDir + string(os.PathListSeparator) + realDir, want: real},
-		{desc: "PATH skips non-executable candidate", path: nonExecDir + string(os.PathListSeparator) + realDir, want: real},
-		{desc: "only self in PATH", path: selfDir, expectErrToContain: "not found"},
-		{desc: "empty PATH", path: "", expectErrToContain: "not found"},
+		{desc: "search skips self and finds real claude", searchDirs: []string{selfDir, realDir}, want: real},
+		{desc: "search skips symlink to self", searchDirs: []string{selfLinkDir, realDir}, want: real},
+		{desc: "search skips non-executable candidate", searchDirs: []string{nonExecDir, realDir}, want: real},
+		{desc: "only self in search dirs", searchDirs: []string{selfDir}, expectErrToContain: "not found"},
+		{desc: "no search dirs", searchDirs: nil, expectErrToContain: "not found"},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			t.Setenv("PATH", test.path)
-			got, err := ResolveClaudeBin(test.explicit, self)
+			got, err := ResolveClaudeBin(test.explicit, self, test.searchDirs)
 			if test.expectErrToContain != "" {
 				if err == nil || !strings.Contains(err.Error(), test.expectErrToContain) {
 					t.Fatalf("error = %v, want containing %q", err, test.expectErrToContain)

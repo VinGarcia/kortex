@@ -166,15 +166,10 @@ func TestRun_forwardsAuthFD(t *testing.T) {
 	var out bytes.Buffer
 	code := Run(Config{
 		ClaudeBin: bin,
+		AuthFDs:   []int{13},
 		Stdin:     strings.NewReader(""),
 		Stdout:    &out,
 		Stderr:    io.Discard,
-		Getenv: func(key string) string {
-			if key == oauthTokenFDEnv {
-				return "13"
-			}
-			return ""
-		},
 	})
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)

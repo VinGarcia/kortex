@@ -1,0 +1,18 @@
+version: 3
+allow:
+  depOnAnyVendor: false
+  deepScan: false
+components:
+  main:
+    in: .
+  proxy:
+    in: internal/proxy
+  protocol:
+    in: internal/protocol
+deps:
+  main:
+    mayDependOn:
+      - proxy
+  proxy:
+    mayDependOn:
+      - protocol

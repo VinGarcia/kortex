@@ -4,22 +4,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // ResolveClaudeBin locates the real claude binary. An explicit path (from
-// KORTEX_CLAUDE_BIN) wins; otherwise the PATH is scanned for "claude",
-// skipping any candidate that is kortex itself — as a drop-in replacement
-// kortex is typically installed under the name "claude", so a naive
-// exec.LookPath would resolve to us and fork-bomb.
-func ResolveClaudeBin(explicit string, selfPath string) (string, error) {
+// KORTEX_CLAUDE_BIN) wins; otherwise searchDirs (the PATH entries) are
+// scanned for "claude", skipping any candidate that is kortex itself — as a
+// drop-in replacement kortex is typically installed under the name "claude",
+// so a naive exec.LookPath would resolve to us and fork-bomb.
+func ResolveClaudeBin(explicit string, selfPath string, searchDirs []string) (string, error) {
 	if explicit != "" {
 		if !isExecutableFile(explicit) {
 			return "", fmt.Errorf("KORTEX_CLAUDE_BIN %q is not an executable file", explicit)
 		}
 		return explicit, nil
 	}
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+	for _, dir := range searchDirs {
 		if dir == "" {
 			continue
 		}
@@ -55,7 +54,7 @@ func sameFile(a string, b string) bool {
 	if err != nil {
 		rb = b
 	}
-	if strings.TrimSpace(ra) == strings.TrimSpace(rb) {
+	if ra == rb {
 		return true
 	}
 	sa, err := os.Stat(ra)

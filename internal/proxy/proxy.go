@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -18,39 +17,32 @@ import (
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
-// Env var names OpenClaw uses to point the backend at the auth secret it
-// writes on an inherited file descriptor (spec F0 §2). Kortex must hand that
-// same descriptor down to the real claude or auth breaks.
-const (
-	oauthTokenFDEnv = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
-	apiKeyFDEnv     = "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
-)
-
 type Config struct {
 	ClaudeBin string
 	Argv      []string
-	LogPath   string
-	Stdin     io.Reader
-	Stdout    io.Writer
-	Stderr    io.Writer
-	// Getenv defaults to os.Getenv; overridable for tests.
-	Getenv func(key string) string
+	// AuthFDs are inherited file descriptors carrying auth secrets (spec F0
+	// §2: OpenClaw announces them via CLAUDE_CODE_*_FILE_DESCRIPTOR env vars,
+	// resolved by the caller). Each must reach the child at the same number.
+	AuthFDs []int
+	LogPath string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // Run execs the real claude with untouched argv/env, proxies stdio until the
 // child exits, and returns the exit code to propagate (128+signal when the
 // child died from a signal).
 func Run(cfg Config) int {
-	getenv := cfg.Getenv
-	if getenv == nil {
-		getenv = os.Getenv
-	}
 	logger := newTrafficLogger(cfg.LogPath, cfg.Stderr)
 	defer logger.Close()
 
 	cmd := exec.Command(cfg.ClaudeBin, cfg.Argv...)
 	cmd.Stderr = cfg.Stderr
-	forwardAuthFD(cmd, getenv)
+	if err := forwardAuthFDs(cmd, cfg.AuthFDs); err != nil {
+		fmt.Fprintf(cfg.Stderr, "kortex: auth fd not forwarded: %v\n", err)
+		return 1
+	}
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -114,32 +106,43 @@ func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, direction string
 	}
 }
 
-// forwardAuthFD re-exposes the inherited auth file descriptor to the child
-// at the same FD number OpenClaw announced in the env.
-func forwardAuthFD(cmd *exec.Cmd, getenv func(string) string) {
-	value := getenv(oauthTokenFDEnv)
-	if value == "" {
-		value = getenv(apiKeyFDEnv)
+// forwardAuthFDs re-exposes inherited auth file descriptors to the child at
+// the same FD numbers the env announces. ExtraFiles maps index i to child FD
+// 3+i, so gaps are padded with /dev/null to land each FD on its number.
+func forwardAuthFDs(cmd *exec.Cmd, fds []int) error {
+	maxFD := 0
+	for _, fd := range fds {
+		if fd < 3 {
+			return fmt.Errorf("announced auth fd %d is below 3", fd)
+		}
+		if fd > maxFD {
+			maxFD = fd
+		}
 	}
-	if value == "" {
-		return
+	if maxFD == 0 {
+		return nil
 	}
-	fd, err := strconv.Atoi(value)
-	if err != nil || fd < 3 {
-		return
+	files := make([]*os.File, maxFD-3+1)
+	for _, fd := range fds {
+		files[fd-3] = os.NewFile(uintptr(fd), "kortex-auth-fd")
 	}
-	// ExtraFiles maps index i to child FD 3+i; pad gaps so the announced
-	// number lands on the same FD in the child.
-	files := make([]*os.File, fd-3+1)
-	for i := range files[:len(files)-1] {
+	for i, file := range files {
+		if file != nil {
+			continue
+		}
 		null, err := os.Open(os.DevNull)
 		if err != nil {
-			return
+			for _, opened := range files[:i] {
+				if opened != nil {
+					opened.Close()
+				}
+			}
+			return fmt.Errorf("padding fd %d: %w", i+3, err)
 		}
 		files[i] = null
 	}
-	files[fd-3] = os.NewFile(uintptr(fd), "kortex-auth-fd")
 	cmd.ExtraFiles = files
+	return nil
 }
 
 func exitCode(waitErr error) int {
@@ -176,7 +179,7 @@ func newTrafficLogger(path string, stderr io.Writer) *trafficLogger {
 }
 
 func (l *trafficLogger) Log(direction string, line []byte) {
-	if l.file == nil {
+	if l.file == nil || len(line) == 0 {
 		return
 	}
 	l.mu.Lock()
