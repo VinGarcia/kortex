@@ -34,6 +34,9 @@ deps:
     mayDependOn:
       - protocol
       - anthropic
+      # The superego consumes the canonical history read-only (its context
+      # is assembled from the history snapshot the proxy hands over).
+      - history
   history:
     mayDependOn:
       - protocol

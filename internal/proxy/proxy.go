@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
@@ -35,15 +36,17 @@ type Interceptor interface {
 
 // TurnEvaluator is the facet plug-in point on the from-backend side: the
 // observer calls it once per completed assistant turn (at the terminal
-// result event) with the turn's index in the canonical history and the
-// turn's full final assistant text. Implementations must return promptly —
+// result event) with the turn's index and a full (untruncated) snapshot of
+// the history up to and including that turn — the turn's final assistant
+// text lives at snapshot.Turns[turnIndex], and the F2d superego reviews it
+// against the whole conversation. Implementations must return promptly —
 // dispatch real work to their own goroutine — because the call runs on the
 // stdout pump goroutine: the current line is already forwarded when it
 // fires, but a blocking implementation would delay the following lines.
 // Defined here (not in a facet package) for the same reason as Interceptor:
 // proxy never imports facets; main wires the concrete implementation in.
 type TurnEvaluator interface {
-	EvaluateCompletedTurn(turnIndex int, assistantText string)
+	EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot)
 }
 
 type Config struct {

@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/vingarcia/kortex/internal/history"
 )
 
 // OutputEvaluator is the F2c facet: it runs the output emotion evaluator
@@ -26,6 +28,7 @@ type OutputEvaluator struct {
 	timeout           time.Duration
 	model             string // logged with each call; the evaluator owns the actual routing
 	gateMinInvestment int
+	superego          *Superego
 	log               *facetLogger
 
 	inFlight sync.WaitGroup
@@ -42,7 +45,11 @@ type OutputEvaluatorParams struct {
 	Timeout           time.Duration
 	Model             string
 	GateMinInvestment int
-	LogSink           io.Writer
+	// Superego, when non-nil, is fired once per turn whose hypothetical
+	// gate decision is true (the F2d shadow trigger). Review dispatches its
+	// own goroutine and returns promptly.
+	Superego *Superego
+	LogSink  io.Writer
 }
 
 func NewOutputEvaluator(params OutputEvaluatorParams) *OutputEvaluator {
@@ -52,6 +59,7 @@ func NewOutputEvaluator(params OutputEvaluatorParams) *OutputEvaluator {
 		timeout:           params.Timeout,
 		model:             params.Model,
 		gateMinInvestment: params.GateMinInvestment,
+		superego:          params.Superego,
 		log:               &facetLogger{sink: params.LogSink},
 		turns:             map[int]TurnEmotion{},
 	}
@@ -77,11 +85,11 @@ type TurnEmotion struct {
 // the evaluation on its own goroutine and returns immediately: the caller
 // sits on the stdout pump, and the assistant output must reach the gateway
 // with zero added latency.
-func (e *OutputEvaluator) EvaluateCompletedTurn(turnIndex int, assistantText string) {
+func (e *OutputEvaluator) EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot) {
 	e.inFlight.Add(1)
 	go func() {
 		defer e.inFlight.Done()
-		e.evaluateTurn(turnIndex, assistantText)
+		e.evaluateTurn(turnIndex, snapshot)
 	}()
 }
 
@@ -107,7 +115,7 @@ func (e *OutputEvaluator) TurnEmotions() map[int]TurnEmotion {
 // evaluateTurn runs one evaluation end to end: evaluator call, contract
 // validation, aggregate + hypothetical gate decision, log + metadata
 // retention. Every failure path ends in a log entry and nothing else.
-func (e *OutputEvaluator) evaluateTurn(turnIndex int, assistantText string) {
+func (e *OutputEvaluator) evaluateTurn(turnIndex int, snapshot history.Snapshot) {
 	defer func() {
 		// A panic here runs on a private goroutine: without this recover it
 		// would kill the whole proxy, which is the one thing a facet must
@@ -117,7 +125,11 @@ func (e *OutputEvaluator) evaluateTurn(turnIndex int, assistantText string) {
 		}
 	}()
 
-	paragraphs := segmentParagraphs(assistantText)
+	if turnIndex < 0 || turnIndex >= len(snapshot.Turns) {
+		e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Err: fmt.Sprintf("turn index %d outside snapshot of %d turns", turnIndex, len(snapshot.Turns))})
+		return
+	}
+	paragraphs := segmentParagraphs(snapshot.Turns[turnIndex].AssistantText)
 	if len(paragraphs) == 0 {
 		e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Skipped: "turn has no assistant text"})
 		return
@@ -169,6 +181,13 @@ func (e *OutputEvaluator) evaluateTurn(turnIndex int, assistantText string) {
 	e.mu.Lock()
 	e.turns[turnIndex] = emotion
 	e.mu.Unlock()
+
+	// The F2d shadow trigger: one superego review per gate hit. Review
+	// dispatches its own goroutine, so this evaluation goroutine's lifetime
+	// never stretches to the (much longer) superego call.
+	if fire && e.superego != nil {
+		e.superego.Review(turnIndex, snapshot, paragraphs, annotations)
+	}
 
 	entry.OK = true
 	entry.Tags = annotations

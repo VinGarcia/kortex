@@ -59,7 +59,9 @@ type entry struct {
 // the locked section so the TurnEvaluator is never called under the mutex.
 type turnNotice struct {
 	index int
-	text  string
+	// snapshot is the FULL (untruncated) history up to the completed turn —
+	// the superego's raw material. compactSnapshot stays a log-only concern.
+	snapshot history.Snapshot
 }
 
 // Observe folds one parsed wire event into the history and the structured
@@ -75,7 +77,7 @@ func (o *observer) Observe(direction protocol.Direction, event protocol.Event) {
 	// depend on an implementation honoring it while holding the lock the
 	// other pump goroutine needs.
 	if notice := o.observeLocked(direction, event); notice != nil {
-		o.turnEvaluator.EvaluateCompletedTurn(notice.index, notice.text)
+		o.turnEvaluator.EvaluateCompletedTurn(notice.index, notice.snapshot)
 	}
 }
 
@@ -100,7 +102,14 @@ func (o *observer) observeLocked(direction protocol.Direction, event protocol.Ev
 		e.ParseErr = event.ParseErr.Error()
 	}
 	if event.Type == protocol.TypeResult {
-		snapshot := compactSnapshot(o.recorder.Snapshot())
+		// When this result produced a notice the full snapshot was already
+		// taken for it; reuse instead of deep-copying the history twice
+		// (compactSnapshot never mutates its input).
+		full := o.recorder.Snapshot()
+		if notice != nil {
+			full = notice.snapshot
+		}
+		snapshot := compactSnapshot(full)
 		e.Snapshot = &snapshot
 	}
 	o.writeEntry(e)
@@ -142,8 +151,8 @@ func (o *observer) record(direction protocol.Direction, event protocol.Event) *t
 		if o.turnEvaluator == nil {
 			return nil
 		}
-		if index, turn, ok := o.recorder.LastCompletedTurn(); ok {
-			return &turnNotice{index: index, text: turn.AssistantText}
+		if index, _, ok := o.recorder.LastCompletedTurn(); ok {
+			return &turnNotice{index: index, snapshot: o.recorder.Snapshot()}
 		}
 	}
 	return nil
@@ -188,16 +197,22 @@ func (o *observer) Close() {
 // the turn.
 const snapshotFieldLimit = 300
 
+// compactSnapshot returns a truncated copy without touching s: the same
+// backing arrays may still be in flight to the turn evaluator.
 func compactSnapshot(s history.Snapshot) history.Snapshot {
-	for i := range s.Turns {
-		turn := &s.Turns[i]
+	turns := make([]history.Turn, len(s.Turns))
+	copy(turns, s.Turns)
+	for i := range turns {
+		turn := &turns[i]
 		turn.UserText = truncate(turn.UserText)
 		turn.AssistantText = truncate(turn.AssistantText)
+		turn.ToolCalls = append([]history.ToolCall(nil), turn.ToolCalls...)
 		for j := range turn.ToolCalls {
 			turn.ToolCalls[j].Input = truncate(turn.ToolCalls[j].Input)
 			turn.ToolCalls[j].Result = truncate(turn.ToolCalls[j].Result)
 		}
 	}
+	s.Turns = turns
 	return s
 }
 

@@ -77,6 +77,13 @@ func main() {
 	if facets.outputEvaluator != nil {
 		facets.outputEvaluator.WaitInFlight()
 	}
+	// After the evaluators drained, every superego dispatch already
+	// happened; now wait for the reviews themselves (this order matters:
+	// waiting on the superego first could miss a review dispatched by a
+	// still-running evaluation).
+	if facets.superego != nil {
+		facets.superego.WaitInFlight()
+	}
 	if facets.logFile != nil {
 		facets.logFile.Close()
 	}
@@ -89,6 +96,7 @@ func main() {
 type builtFacets struct {
 	annotator       *facet.InputAnnotator
 	outputEvaluator *facet.OutputEvaluator
+	superego        *facet.Superego
 	logFile         *os.File
 }
 
@@ -107,9 +115,13 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 	}
 	annCfg := cfg.Facets.InputAnnotator
 	evalCfg := cfg.Facets.OutputEvaluator
+	seCfg := cfg.Facets.Superego
 	annEnabled := annCfg != nil && annCfg.Enabled
 	evalEnabled := evalCfg != nil && evalCfg.Enabled
+	seEnabled := seCfg != nil && seCfg.Enabled
 	if !annEnabled && !evalEnabled {
+		// Config.Validate guarantees seEnabled implies evalEnabled, so no
+		// superego can exist on this path either.
 		return built, nil
 	}
 
@@ -129,13 +141,13 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 	}
 
 	if annEnabled {
-		evaluator, systemPrompt, timeout, err := buildEvaluatorDeps("inputAnnotator", annCfg.TokenEnv,
-			annCfg.SystemPromptPath, annCfg.EmotionalMemoryPath, annCfg.Model, annCfg.TimeoutSeconds)
+		client, systemPrompt, timeout, err := buildFacetDeps("inputAnnotator", annCfg.TokenEnv,
+			annCfg.SystemPromptPath, annCfg.EmotionalMemoryPath, annCfg.TimeoutSeconds, config.DefaultTimeoutSeconds)
 		if err != nil {
 			return built, err
 		}
 		built.annotator = facet.NewInputAnnotator(facet.AnnotatorParams{
-			Evaluator:    evaluator,
+			Evaluator:    facet.NewAnthropicEvaluator(client, annCfg.Model),
 			SystemPrompt: systemPrompt,
 			Timeout:      timeout,
 			Model:        annCfg.Model,
@@ -143,8 +155,29 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 		})
 	}
 	if evalEnabled {
-		evaluator, systemPrompt, timeout, err := buildEvaluatorDeps("outputEvaluator", evalCfg.TokenEnv,
-			evalCfg.SystemPromptPath, evalCfg.EmotionalMemoryPath, evalCfg.Model, evalCfg.TimeoutSeconds)
+		// The superego is built before its trigger (the output evaluator)
+		// so the evaluator can be handed the wired trigger at construction.
+		if seEnabled {
+			model := seCfg.Model
+			if model == "" {
+				model = config.DefaultSuperegoModel
+			}
+			client, systemPrompt, timeout, err := buildFacetDeps("superego", seCfg.TokenEnv,
+				seCfg.SystemPromptPath, "", seCfg.TimeoutSeconds, config.DefaultSuperegoTimeoutSeconds)
+			if err != nil {
+				return built, err
+			}
+			built.superego = facet.NewSuperego(facet.SuperegoParams{
+				Conversant:      facet.NewAnthropicConversant(client, model),
+				SystemPrompt:    systemPrompt,
+				Timeout:         timeout,
+				Model:           model,
+				MaxHistoryTurns: seCfg.MaxHistoryTurns,
+				LogSink:         logSink,
+			})
+		}
+		client, systemPrompt, timeout, err := buildFacetDeps("outputEvaluator", evalCfg.TokenEnv,
+			evalCfg.SystemPromptPath, evalCfg.EmotionalMemoryPath, evalCfg.TimeoutSeconds, config.DefaultTimeoutSeconds)
 		if err != nil {
 			return built, err
 		}
@@ -153,21 +186,23 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 			gateMinInvestment = *evalCfg.GateMinInvestment
 		}
 		built.outputEvaluator = facet.NewOutputEvaluator(facet.OutputEvaluatorParams{
-			Evaluator:         evaluator,
+			Evaluator:         facet.NewAnthropicEvaluator(client, evalCfg.Model),
 			SystemPrompt:      systemPrompt,
 			Timeout:           timeout,
 			Model:             evalCfg.Model,
 			GateMinInvestment: gateMinInvestment,
+			Superego:          built.superego,
 			LogSink:           logSink,
 		})
 	}
 	return built, nil
 }
 
-// buildEvaluatorDeps assembles the model-call dependencies one facet needs:
-// the anthropic-backed evaluator (token resolved from the env here, in the
-// composition root), the loaded system prompt, and the call timeout.
-func buildEvaluatorDeps(facetName string, tokenEnv string, promptPath string, memoryPath string, model string, timeoutSeconds int) (facet.Evaluator, string, time.Duration, error) {
+// buildFacetDeps assembles the model-call dependencies every facet shares:
+// the API client (token resolved from the env here, in the composition
+// root), the loaded system prompt, and the call timeout. The caller wraps
+// the client in its facet's own port (evaluator/conversant).
+func buildFacetDeps(facetName string, tokenEnv string, promptPath string, memoryPath string, timeoutSeconds int, defaultTimeoutSeconds int) (*anthropic.Client, string, time.Duration, error) {
 	token := os.Getenv(tokenEnv)
 	if token == "" {
 		return nil, "", 0, fmt.Errorf("facet %s: token env %s is empty or unset", facetName, tokenEnv)
@@ -177,12 +212,11 @@ func buildEvaluatorDeps(facetName string, tokenEnv string, promptPath string, me
 		return nil, "", 0, fmt.Errorf("facet %s: %w", facetName, err)
 	}
 	if timeoutSeconds == 0 {
-		timeoutSeconds = config.DefaultTimeoutSeconds
+		timeoutSeconds = defaultTimeoutSeconds
 	}
 	// The HTTP client gets no client-level timeout: the facet bounds every
 	// call with a context deadline derived from the same config field.
-	client := anthropic.NewClient(token, "", 0)
-	return facet.NewAnthropicEvaluator(client, model), systemPrompt, time.Duration(timeoutSeconds) * time.Second, nil
+	return anthropic.NewClient(token, "", 0), systemPrompt, time.Duration(timeoutSeconds) * time.Second, nil
 }
 
 func authFDsFromEnv() []int {

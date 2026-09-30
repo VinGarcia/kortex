@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
@@ -187,13 +188,13 @@ func readEntries(t *testing.T, path string) []entry {
 
 // recordingTurnEvaluator captures each turn-completion notification.
 type recordingTurnEvaluator struct {
-	indexes []int
-	texts   []string
+	indexes   []int
+	snapshots []history.Snapshot
 }
 
-func (r *recordingTurnEvaluator) EvaluateCompletedTurn(turnIndex int, assistantText string) {
+func (r *recordingTurnEvaluator) EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot) {
 	r.indexes = append(r.indexes, turnIndex)
-	r.texts = append(r.texts, assistantText)
+	r.snapshots = append(r.snapshots, snapshot)
 }
 
 // TestObserver_notifiesTurnEvaluatorOncePerCompletedTurn checks the F2c
@@ -219,10 +220,25 @@ func TestObserver_notifiesTurnEvaluatorOncePerCompletedTurn(t *testing.T) {
 	if len(evaluator.indexes) != 2 {
 		t.Fatalf("got %d notifications, want 2: %v", len(evaluator.indexes), evaluator.indexes)
 	}
-	if evaluator.indexes[0] != 0 || evaluator.texts[0] != "primeira parte\nsegunda parte" {
-		t.Errorf("first notification = (%d, %q)", evaluator.indexes[0], evaluator.texts[0])
+	if evaluator.indexes[0] != 0 {
+		t.Errorf("first notification index = %d", evaluator.indexes[0])
 	}
-	if evaluator.indexes[1] != 1 || evaluator.texts[1] != "segunda resposta" {
-		t.Errorf("second notification = (%d, %q)", evaluator.indexes[1], evaluator.texts[1])
+	if first := evaluator.snapshots[0]; len(first.Turns) != 1 || first.Turns[0].AssistantText != "primeira parte\nsegunda parte" {
+		t.Errorf("first snapshot = %+v", evaluator.snapshots[0])
+	}
+	if evaluator.indexes[1] != 1 {
+		t.Errorf("second notification index = %d", evaluator.indexes[1])
+	}
+	// The snapshot travels FULL (untruncated) and covers the whole history
+	// at completion time — the superego's raw material.
+	second := evaluator.snapshots[1]
+	if len(second.Turns) != 2 {
+		t.Fatalf("second snapshot has %d turns, want 2", len(second.Turns))
+	}
+	if second.Turns[0].UserText != "oi" || second.Turns[0].AssistantText != "primeira parte\nsegunda parte" {
+		t.Errorf("snapshot turn 0 = %+v", second.Turns[0])
+	}
+	if second.Turns[1].AssistantText != "segunda resposta" || !second.Turns[1].Completed {
+		t.Errorf("snapshot turn 1 = %+v", second.Turns[1])
 	}
 }

@@ -172,6 +172,15 @@ type callLog struct {
 	Tags          []ParagraphAnnotation `json:"tags,omitempty"`
 	Aggregate     *Aggregate            `json:"aggregate,omitempty"`
 	GateWouldFire *bool                 `json:"gateWouldFire,omitempty"`
+
+	// Superego-only fields: the shadow critique in full, the structured
+	// verdict when parseable, and how many messages the assembled context
+	// carried (cost visibility for maxHistoryTurns tuning).
+	HistoryMessages     int                  `json:"historyMessages,omitempty"`
+	Critique            string               `json:"critique,omitempty"`
+	Verdict             string               `json:"verdict,omitempty"`
+	SuperegoAnnotations []SuperegoAnnotation `json:"superegoAnnotations,omitempty"`
+	SuperegoWhy         string               `json:"superegoWhy,omitempty"`
 }
 
 // facetLogger appends one JSON object per facet call to the sink. A nil

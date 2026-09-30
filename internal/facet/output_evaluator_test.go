@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vingarcia/kortex/internal/history"
 )
 
 // newTestOutputEvaluator wires an evaluator with the default threshold; a
@@ -27,9 +29,12 @@ func newTestOutputEvaluator(evaluator Evaluator, logSink *bytes.Buffer) *OutputE
 }
 
 // evaluateAndWait drives the real async entry point and waits for the
-// evaluation to land, so assertions see the final state.
+// evaluation to land, so assertions see the final state. The snapshot holds
+// the evaluated text at turnIndex, padded with filler turns before it.
 func evaluateAndWait(e *OutputEvaluator, turnIndex int, text string) {
-	e.EvaluateCompletedTurn(turnIndex, text)
+	turns := make([]history.Turn, turnIndex+1)
+	turns[turnIndex] = history.Turn{AssistantText: text, Completed: true}
+	e.EvaluateCompletedTurn(turnIndex, history.Snapshot{Turns: turns})
 	e.WaitInFlight()
 }
 
@@ -191,7 +196,7 @@ func TestOutputEvaluator_dispatchNeverBlocksOnSlowEvaluator(t *testing.T) {
 	e.timeout = 50 * time.Millisecond
 
 	start := time.Now()
-	e.EvaluateCompletedTurn(0, "um parágrafo qualquer")
+	e.EvaluateCompletedTurn(0, history.Snapshot{Turns: []history.Turn{{AssistantText: "um parágrafo qualquer", Completed: true}}})
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("dispatch blocked for %v", elapsed)
 	}
@@ -220,6 +225,71 @@ type panicEvaluator struct{}
 
 func (panicEvaluator) Evaluate(_ context.Context, _ string, _ string) (Evaluation, error) {
 	panic("boom")
+}
+
+// TestOutputEvaluator_superegoTrigger covers the F2d dispatch decision end
+// to end through the real constructor plumbing: a real Superego (fake
+// conversant behind it) fires exactly once per gate hit and receives the
+// draft-user with the evaluator's own tags interleaved; below the threshold
+// the conversant is never called.
+func TestOutputEvaluator_superegoTrigger(t *testing.T) {
+	tests := []struct {
+		desc     string
+		response Evaluation
+		text     string
+		wantFire bool
+	}{
+		{
+			desc: "gate fires, superego reviews the draft with matching tags",
+			response: evalText(`[
+				{"investment":4,"valence":"negativa","emotions":[{"emotion":"recusa","level":4,"about":"não vou"}]},
+				{"investment":0,"valence":"neutra","emotions":[]}
+			]`),
+			text:     "não vou fazer isso\n\nrodei o script",
+			wantFire: true,
+		},
+		{
+			desc:     "gate quiet, superego never runs",
+			response: oneParagraphEval(), // investment 2, positiva
+			text:     "boa notícia pequena",
+			wantFire: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			conversant := &fakeConversant{response: evalText(`{"verdict":"approve","annotations":[],"why":"ok"}`)}
+			superego := newTestSuperego(conversant, nil)
+			e := NewOutputEvaluator(OutputEvaluatorParams{
+				Evaluator:         &fakeEvaluator{response: test.response},
+				SystemPrompt:      "avalie a carga da resposta",
+				Timeout:           time.Second,
+				Model:             "claude-haiku-4-5-20251001",
+				GateMinInvestment: 4,
+				Superego:          superego,
+			})
+
+			evaluateAndWait(e, 0, test.text)
+			superego.WaitInFlight()
+
+			if !test.wantFire {
+				if conversant.calls != 0 {
+					t.Fatalf("superego conversant called %d times, want 0", conversant.calls)
+				}
+				return
+			}
+			if conversant.calls != 1 {
+				t.Fatalf("superego conversant called %d times, want 1", conversant.calls)
+			}
+			final := conversant.gotMessages[len(conversant.gotMessages)-1]
+			if !strings.Contains(final.Content, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") ||
+				!strings.Contains(final.Content, "não vou fazer isso\n[emoções p1: investment=4 valence=negativa emotions=recusa(4)]") {
+				t.Errorf("draft-user message = %q", final.Content)
+			}
+			if critique, ok := superego.Critiques()[0]; !ok || critique.Verdict != "approve" {
+				t.Errorf("critique for turn 0 = %+v, %v", critique, ok)
+			}
+		})
+	}
 }
 
 func TestOutputEvaluator_panicIsRecoveredAndLogged(t *testing.T) {

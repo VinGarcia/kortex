@@ -156,6 +156,76 @@ func TestLoad(t *testing.T) {
 			content: `{"facets": {"inputAnnotator": {"enabled": true, "model": "m", "tokenEnv": "T", "systemPromptPath": "/p", "timeoutSeconds": -1}}}`,
 			wantErr: "timeoutSeconds must be >= 0",
 		},
+		{
+			desc: "full superego config next to its trigger",
+			content: `{
+				"facets": {
+					"outputEvaluator": {
+						"enabled": true, "model": "m", "tokenEnv": "T", "systemPromptPath": "/p.md"
+					},
+					"superego": {
+						"enabled": true,
+						"model": "claude-opus-5",
+						"tokenEnv": "CODECOMPANION_OAUTH_TOKEN",
+						"systemPromptPath": "/prompts/superego.md",
+						"timeoutSeconds": 90,
+						"maxHistoryTurns": 40
+					}
+				}
+			}`,
+			check: func(t *testing.T, cfg Config) {
+				se := cfg.Facets.Superego
+				if se == nil {
+					t.Fatal("expected superego to be present")
+				}
+				if !se.Enabled || se.Model != "claude-opus-5" || se.TokenEnv != "CODECOMPANION_OAUTH_TOKEN" ||
+					se.SystemPromptPath != "/prompts/superego.md" || se.TimeoutSeconds != 90 || se.MaxHistoryTurns != 40 {
+					t.Errorf("unexpected config: %+v", se)
+				}
+			},
+		},
+		{
+			desc: "superego model is optional (DefaultSuperegoModel applies later)",
+			content: `{"facets": {
+				"outputEvaluator": {"enabled": true, "model": "m", "tokenEnv": "T", "systemPromptPath": "/p.md"},
+				"superego": {"enabled": true, "tokenEnv": "T", "systemPromptPath": "/s.md"}
+			}}`,
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Facets.Superego.Model != "" {
+					t.Errorf("expected empty model, got %q", cfg.Facets.Superego.Model)
+				}
+			},
+		},
+		{
+			desc:    "superego missing tokenEnv",
+			content: `{"facets": {"superego": {"enabled": false, "systemPromptPath": "/s.md"}}}`,
+			wantErr: "facets.superego: tokenEnv is required",
+		},
+		{
+			desc:    "superego missing systemPromptPath",
+			content: `{"facets": {"superego": {"enabled": false, "tokenEnv": "T"}}}`,
+			wantErr: "facets.superego: systemPromptPath is required",
+		},
+		{
+			desc:    "superego negative maxHistoryTurns",
+			content: `{"facets": {"superego": {"enabled": false, "tokenEnv": "T", "systemPromptPath": "/s.md", "maxHistoryTurns": -1}}}`,
+			wantErr: "maxHistoryTurns must be >= 0",
+		},
+		{
+			desc: "superego enabled without its trigger fails loudly",
+			content: `{"facets": {"superego": {
+				"enabled": true, "tokenEnv": "T", "systemPromptPath": "/s.md"
+			}}}`,
+			wantErr: "facets.superego: enabled but facets.outputEvaluator is absent or disabled",
+		},
+		{
+			desc: "superego enabled with a disabled evaluator fails loudly too",
+			content: `{"facets": {
+				"outputEvaluator": {"enabled": false, "model": "m", "tokenEnv": "T", "systemPromptPath": "/p.md"},
+				"superego": {"enabled": true, "tokenEnv": "T", "systemPromptPath": "/s.md"}
+			}}`,
+			wantErr: "facets.superego: enabled but facets.outputEvaluator is absent or disabled",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {

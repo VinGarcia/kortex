@@ -76,6 +76,20 @@ func extractJSONArray(raw string) string {
 	return raw[start : end+1]
 }
 
+// extractJSONObject is the object-shaped sibling of extractJSONArray: first
+// '{' to last '}' (greedy), tolerating code fences or prose around the
+// object. "" when no object is present. Extraction only — validation is
+// separate. A brace in prose before the object defeats the extraction; the
+// greedy slice is a deliberate symmetry with extractJSONArray.
+func extractJSONObject(raw string) string {
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start == -1 || end == -1 || end < start {
+		return ""
+	}
+	return raw[start : end+1]
+}
+
 // parseAnnotations decodes and validates the evaluator output against the
 // v2 schema for expectedCount paragraphs: investment integer 0–5, valence
 // in the known set, each emotion with a non-empty name and level 0–5. A

@@ -53,13 +53,20 @@ root; all env reading happens here) over the internal packages:
   text (the contract ported from sylphie's `emotion-annotate.sh`).
   Handshakes, control messages, replays and tool-result carriers are never
   touched, and every failure path is fail-open (original line forwarded,
-  error recorded in `<KORTEX_LOG>.facets`).
+  error recorded in `<KORTEX_LOG>.facets`). `OutputEvaluator` runs the
+  emotion evaluator over each completed assistant turn (asynchronously,
+  observability mode: the stream is untouched) and computes the
+  hypothetical gate decision; on a gate hit it triggers `Superego`, which
+  reviews the turn against the whole canonical history in shadow mode —
+  the critique goes only to the facet log and in-memory metadata.
 
 Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
 `make lint`): `proxy` may import `protocol` and `history`; `history` may
-import `protocol`; `facet` may import `protocol` and `anthropic`; never the
+import `protocol`; `facet` may import `protocol`, `anthropic` and `history`
+(read-only consumption of the canonical history: the proxy hands facets a
+`history.Snapshot` per completed turn via `proxy.TurnEvaluator`); never the
 reverse. `proxy` never imports `facet` — facets reach the pump only through
-the `proxy.Interceptor` interface, wired by `main`. Wire-format knowledge
+the `proxy.Interceptor`/`proxy.TurnEvaluator` interfaces, wired by `main`. Wire-format knowledge
 stays in `protocol` (facets rewrite message text via
 `protocol.RewriteUserText`, never raw envelope bytes). The packages receive
 everything (paths, tokens, timeouts) through parameters — `main` translates

@@ -22,6 +22,18 @@ import (
 // that prefers annotation coverage over latency can raise it.
 const DefaultTimeoutSeconds = 10
 
+// DefaultSuperegoTimeoutSeconds bounds the superego call when the file does
+// not set timeoutSeconds. Much higher than DefaultTimeoutSeconds on purpose:
+// the superego reads the whole conversation and writes a prose critique, and
+// it runs async off the stream (shadow mode), so the timeout caps cost, not
+// latency.
+const DefaultSuperegoTimeoutSeconds = 60
+
+// DefaultSuperegoModel is the superego model when the config leaves model
+// empty. The final model choice at activation time belongs to the operator;
+// this default only keeps the config minimal in the meantime.
+const DefaultSuperegoModel = "claude-sonnet-5"
+
 // DefaultGateMinInvestment is the gate threshold when the config does not
 // set gateMinInvestment. Source: the primary path of sylphie's
 // core/emotion-output-gate-prompt.md — "investment ≥ 4; ou investment = 3
@@ -39,6 +51,7 @@ type Config struct {
 type Facets struct {
 	InputAnnotator  *InputAnnotator  `json:"inputAnnotator"`
 	OutputEvaluator *OutputEvaluator `json:"outputEvaluator"`
+	Superego        *Superego        `json:"superego"`
 }
 
 // InputAnnotator configures the emotional annotator that runs over real
@@ -94,6 +107,33 @@ type OutputEvaluator struct {
 	GateMinInvestment *int `json:"gateMinInvestment"`
 }
 
+// Superego configures the F2d facet in SHADOW MODE: when the output
+// evaluator's hypothetical gate fires on a completed turn, the superego
+// reviews that turn's text against the whole conversation; the critique goes
+// only to the facet log and to in-memory per-turn metadata (the structure
+// the F2e block→revise loop will consume). Nothing ever touches the stream.
+type Superego struct {
+	Enabled bool `json:"enabled"`
+	// Model is the superego model id; empty means DefaultSuperegoModel. The
+	// definitive model is an activation-time choice.
+	Model string `json:"model"`
+	// TokenEnv names the env var holding the OAuth token. The binary reads
+	// the env at startup; the token value itself never lives in this file.
+	TokenEnv string `json:"tokenEnv"`
+	// SystemPromptPath is the superego prompt file. Only the body after the
+	// first line that is exactly "---" is sent to the model (the header is a
+	// maintenance note), matching the sylphie prompt-file convention.
+	SystemPromptPath string `json:"systemPromptPath"`
+	// TimeoutSeconds bounds each superego call; 0 means
+	// DefaultSuperegoTimeoutSeconds.
+	TimeoutSeconds int `json:"timeoutSeconds"`
+	// MaxHistoryTurns caps how many of the most recent conversation turns
+	// (the reviewed turn included) enter the superego's context; 0 means the
+	// whole history. A cap trades review depth for token cost when a session
+	// grows long.
+	MaxHistoryTurns int `json:"maxHistoryTurns"`
+}
+
 // Load reads and validates the config file at path.
 func Load(path string) (Config, error) {
 	file, err := os.Open(path)
@@ -124,6 +164,17 @@ func (c Config) Validate() error {
 	if ev := c.Facets.OutputEvaluator; ev != nil {
 		if err := ev.Validate(); err != nil {
 			return fmt.Errorf("facets.outputEvaluator: %w", err)
+		}
+	}
+	if se := c.Facets.Superego; se != nil {
+		if err := se.Validate(); err != nil {
+			return fmt.Errorf("facets.superego: %w", err)
+		}
+		// The superego only ever runs when the output evaluator's gate
+		// fires, so enabling it without the evaluator silently disables it —
+		// the kind of misconfiguration that must fail loudly at startup.
+		if se.Enabled && (c.Facets.OutputEvaluator == nil || !c.Facets.OutputEvaluator.Enabled) {
+			return fmt.Errorf("facets.superego: enabled but facets.outputEvaluator is absent or disabled (the superego is triggered by its gate)")
 		}
 	}
 	return nil
@@ -166,6 +217,25 @@ func (e OutputEvaluator) Validate() error {
 	}
 	if e.GateMinInvestment != nil && (*e.GateMinInvestment < 0 || *e.GateMinInvestment > 5) {
 		return fmt.Errorf("gateMinInvestment must be between 0 and 5, got %d", *e.GateMinInvestment)
+	}
+	return nil
+}
+
+// Validate checks the fields the facet cannot run without. A disabled facet
+// is still validated: a config someone will later flip to enabled should be
+// complete from day one. Model stays optional here (DefaultSuperegoModel).
+func (s Superego) Validate() error {
+	if s.TokenEnv == "" {
+		return fmt.Errorf("tokenEnv is required")
+	}
+	if s.SystemPromptPath == "" {
+		return fmt.Errorf("systemPromptPath is required")
+	}
+	if s.TimeoutSeconds < 0 {
+		return fmt.Errorf("timeoutSeconds must be >= 0, got %d", s.TimeoutSeconds)
+	}
+	if s.MaxHistoryTurns < 0 {
+		return fmt.Errorf("maxHistoryTurns must be >= 0, got %d", s.MaxHistoryTurns)
 	}
 	return nil
 }
