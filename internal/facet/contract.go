@@ -143,3 +143,32 @@ func interleave(paragraphs []string, annotations []ParagraphAnnotation) string {
 	}
 	return strings.Join(blocks, "\n\n")
 }
+
+// numberParagraphs renders the pre-segmented paragraphs with a [P<i>] marker
+// line before each one. The evaluator receives this numbered copy instead of
+// the raw text: gateway-composed messages carry envelope/context blocks whose
+// paragraph count the evaluator's own judgment tends to miscount, and a count
+// mismatch discards the whole annotation (fail-open). The markers pin the
+// segmentation the orchestrator already committed to.
+func numberParagraphs(paragraphs []string) string {
+	var b strings.Builder
+	for i, paragraph := range paragraphs {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "[P%d]\n%s", i+1, paragraph)
+	}
+	return b.String()
+}
+
+// segmentationContract is appended to the evaluator system prompt to make the
+// index alignment explicit for the numbered copy built by numberParagraphs.
+func segmentationContract(count int) string {
+	return fmt.Sprintf("\n\n## SEGMENTAÇÃO PRÉ-FEITA (contrato estrito desta chamada)\n"+
+		"A mensagem entre os delimitadores foi pré-segmentada pelo orquestrador em %d parágrafos, "+
+		"cada um precedido por uma linha-marcador [P<i>]. Os marcadores NÃO fazem parte do texto original — ignore-os como conteúdo.\n"+
+		"Retorne EXATAMENTE %d elementos no array JSON: o elemento de índice i anota o parágrafo [P<i+1>].\n"+
+		"Parágrafo sem carga emocional (metadados, JSON de envelope, texto puramente técnico) recebe "+
+		"{\"investment\": 0, \"valence\": \"neutra\", \"emotions\": []} — nunca omita um elemento.",
+		count, count)
+}

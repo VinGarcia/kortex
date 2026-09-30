@@ -99,10 +99,13 @@ func TestInterceptToBackend_annotatesStringContent(t *testing.T) {
 		t.Errorf("content:\n%s\nwant:\n%s", envelope.Message.Content, wantContent)
 	}
 
-	if evaluator.gotSys != "avalie as emoções" {
-		t.Errorf("system prompt = %q", evaluator.gotSys)
+	if !strings.HasPrefix(evaluator.gotSys, "avalie as emoções") {
+		t.Errorf("system prompt should start with the configured body, got %q", evaluator.gotSys)
 	}
-	wantUser := "<<<MENSAGEM_RECEBIDA_INICIO>>>\ncontava com você ontem\n\nroda o script\n<<<MENSAGEM_RECEBIDA_FIM>>>"
+	if !strings.Contains(evaluator.gotSys, "pré-segmentada pelo orquestrador em 2 parágrafos") {
+		t.Errorf("system prompt missing the 2-paragraph segmentation contract: %q", evaluator.gotSys)
+	}
+	wantUser := "<<<MENSAGEM_RECEBIDA_INICIO>>>\n[P1]\ncontava com você ontem\n\n[P2]\nroda o script\n<<<MENSAGEM_RECEBIDA_FIM>>>"
 	if evaluator.gotUser != wantUser {
 		t.Errorf("evaluator user message = %q, want %q", evaluator.gotUser, wantUser)
 	}

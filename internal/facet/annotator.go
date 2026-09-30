@@ -117,8 +117,8 @@ func (a *InputAnnotator) annotateText(text string) (string, bool) {
 	defer cancel()
 
 	start := time.Now()
-	userMessage := "<<<MENSAGEM_RECEBIDA_INICIO>>>\n" + text + "\n<<<MENSAGEM_RECEBIDA_FIM>>>"
-	eval, err := a.evaluator.Evaluate(ctx, a.systemPrompt, userMessage)
+	userMessage := "<<<MENSAGEM_RECEBIDA_INICIO>>>\n" + numberParagraphs(paragraphs) + "\n<<<MENSAGEM_RECEBIDA_FIM>>>"
+	eval, err := a.evaluator.Evaluate(ctx, a.systemPrompt+segmentationContract(len(paragraphs)), userMessage)
 	entry := callLog{
 		Facet:        inputAnnotatorFacet,
 		Model:        a.model,
