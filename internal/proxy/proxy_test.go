@@ -142,6 +142,48 @@ func TestRun_forwardsSIGTERMToChild(t *testing.T) {
 	}
 }
 
+func TestRun_forwardsAuthFD(t *testing.T) {
+	dir := t.TempDir()
+	// Reads the secret from FD 13 the way claude reads the auth FD.
+	bin := writeExecutable(t, dir, "fake-claude-authfd", "#!/bin/sh\ncat <&13\n")
+
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeW.WriteString("secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	pipeW.Close()
+	// Pin the read end to FD 13 so the env announcement matches, as it does
+	// when OpenClaw spawns kortex with the auth FD already inherited.
+	if err := syscall.Dup2(int(pipeR.Fd()), 13); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(13)
+	defer pipeR.Close()
+
+	var out bytes.Buffer
+	code := Run(Config{
+		ClaudeBin: bin,
+		Stdin:     strings.NewReader(""),
+		Stdout:    &out,
+		Stderr:    io.Discard,
+		Getenv: func(key string) string {
+			if key == oauthTokenFDEnv {
+				return "13"
+			}
+			return ""
+		},
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if out.String() != "secret-token" {
+		t.Errorf("child read %q from auth FD, want %q", out.String(), "secret-token")
+	}
+}
+
 func TestRun_writesTrafficLog(t *testing.T) {
 	dir := t.TempDir()
 	echoBin := writeExecutable(t, dir, "fake-claude-echo", "#!/bin/sh\ncat\n")
