@@ -1,18 +1,21 @@
-// Package history reconstructs the canonical conversation history of the
-// current session out of the parsed protocol events flowing through the
+// Package history holds the canonical conversation history of the current
+// session, reconstructed out of the protocol events flowing through the
 // proxy. It is purely observational state: the F2b facets will read it, and
 // nothing here ever writes back to the stream.
+//
+// The recorder exposes intent-named entry points (a user prompt, an
+// assistant message, a tool result, a completed turn); classifying wire
+// lines into those intents — which pipe carried them, replay echoes — is
+// the caller's job, so this package knows nothing about transport details.
 package history
 
 import (
-	"encoding/json"
-
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
 // ToolCall is one assistant tool invocation, summarized: the raw input JSON
-// is kept verbatim but the result is whatever the tool_result block carried
-// (string or nested blocks, as raw JSON).
+// is kept verbatim as an opaque blob, and the result as the plain text the
+// tool_result block carried.
 type ToolCall struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -34,9 +37,9 @@ type Turn struct {
 	StopReason string `json:"stopReason,omitempty"`
 }
 
-// Recorder accumulates the canonical history of one session from observed
-// wire events. It is not safe for concurrent use; the caller serializes
-// Observe calls (the proxy observer holds a mutex).
+// Recorder accumulates the canonical history of one session. It is not safe
+// for concurrent use; the caller serializes calls (the proxy observer holds
+// a mutex).
 type Recorder struct {
 	sessionID string
 	turns     []Turn
@@ -46,40 +49,16 @@ func NewRecorder() *Recorder {
 	return &Recorder{}
 }
 
-// Observe folds one parsed wire event into the history. Events that carry
-// no durable conversation state (stream deltas, control traffic, system
-// notices, unknown lines) are ignored.
-func (r *Recorder) Observe(direction protocol.Direction, event protocol.Event) {
-	if r.sessionID == "" && event.SessionID != "" {
-		r.sessionID = event.SessionID
-	}
-	switch event.Type {
-	case protocol.TypeUser:
-		r.observeUser(direction, event)
-	case protocol.TypeAssistant:
-		r.observeAssistant(event)
-	case protocol.TypeResult:
-		r.observeResult(event)
+// SetSessionID pins the session id on first sight; later calls are no-ops
+// (the id never changes within one process).
+func (r *Recorder) SetSessionID(id string) {
+	if r.sessionID == "" && id != "" {
+		r.sessionID = id
 	}
 }
 
-func (r *Recorder) observeUser(direction protocol.Direction, event protocol.Event) {
-	if event.Message == nil {
-		return
-	}
-	// Tool results travel as user messages; they belong to the open turn's
-	// tool calls no matter which direction carried them.
-	for _, block := range event.Message.Content {
-		if block.Type == "tool_result" {
-			r.attachToolResult(block)
-		}
-	}
-	// Only a fresh prompt on stdin opens a turn: stdout user events are
-	// either --replay-user-messages echoes or tool-result carriers.
-	if direction != protocol.ToBackend || event.IsReplay {
-		return
-	}
-	text := event.Message.TextContent()
+// RecordUserPrompt opens a new turn for a fresh user input.
+func (r *Recorder) RecordUserPrompt(text string) {
 	if text == "" {
 		return
 	}
@@ -90,8 +69,10 @@ func (r *Recorder) observeUser(direction protocol.Direction, event protocol.Even
 	r.turns = append(r.turns, Turn{UserText: text})
 }
 
-func (r *Recorder) observeAssistant(event protocol.Event) {
-	if event.Message == nil {
+// RecordAssistantMessage folds an assistant message's text and tool_use
+// blocks into the open turn.
+func (r *Recorder) RecordAssistantMessage(message *protocol.Message) {
+	if message == nil {
 		return
 	}
 	current := r.openTurn()
@@ -101,7 +82,7 @@ func (r *Recorder) observeAssistant(event protocol.Event) {
 		r.turns = append(r.turns, Turn{})
 		current = &r.turns[len(r.turns)-1]
 	}
-	for _, block := range event.Message.Content {
+	for _, block := range message.Content {
 		switch block.Type {
 		case "text":
 			if block.Text == "" {
@@ -124,15 +105,38 @@ func (r *Recorder) observeAssistant(event protocol.Event) {
 	}
 }
 
-func (r *Recorder) observeResult(event protocol.Event) {
+// AttachToolResult records a tool's outcome on the matching tool call.
+func (r *Recorder) AttachToolResult(toolUseID string, resultText string, isError bool) {
+	if toolUseID == "" {
+		return
+	}
+	for i := len(r.turns) - 1; i >= 0; i-- {
+		calls := r.turns[i].ToolCalls
+		for j := range calls {
+			if calls[j].ID != toolUseID {
+				continue
+			}
+			// First writer wins: the same result can arrive again as a
+			// replay echo.
+			if calls[j].Result == "" {
+				calls[j].Result = resultText
+				calls[j].IsError = isError
+			}
+			return
+		}
+	}
+}
+
+// CompleteTurn closes the open turn with the terminal result's outcome.
+func (r *Recorder) CompleteTurn(result *protocol.Result) {
 	current := r.openTurn()
 	if current == nil {
 		return
 	}
 	current.Completed = true
-	if event.Result != nil {
-		current.IsError = event.Result.IsError
-		current.StopReason = event.Result.StopReason
+	if result != nil {
+		current.IsError = result.IsError
+		current.StopReason = result.StopReason
 	}
 }
 
@@ -159,47 +163,6 @@ func (r *Recorder) hasToolCall(turn *Turn, id string) bool {
 		}
 	}
 	return false
-}
-
-func (r *Recorder) attachToolResult(block protocol.ContentBlock) {
-	if block.ToolUseID == "" {
-		return
-	}
-	for i := len(r.turns) - 1; i >= 0; i-- {
-		calls := r.turns[i].ToolCalls
-		for j := range calls {
-			if calls[j].ID != block.ToolUseID {
-				continue
-			}
-			// First writer wins: the same result can arrive again as a
-			// --replay-user-messages echo.
-			if calls[j].Result == "" {
-				calls[j].Result = toolResultText(block.Content)
-				calls[j].IsError = block.IsError
-			}
-			return
-		}
-	}
-}
-
-// toolResultText renders a tool_result payload (string or nested blocks on
-// the wire) as plain text for the summary.
-func toolResultText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var blocks protocol.Content
-	if err := json.Unmarshal(raw, &blocks); err == nil {
-		msg := protocol.Message{Content: blocks}
-		if text := msg.TextContent(); text != "" {
-			return text
-		}
-	}
-	return string(raw)
 }
 
 // Snapshot is an immutable copy of the reconstructed history.

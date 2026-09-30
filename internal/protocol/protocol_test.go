@@ -24,7 +24,9 @@ func TestParse(t *testing.T) {
 	tests := []struct {
 		desc string
 		line string
-		want Event // Raw/Message/Result compared field-by-field below
+		// want covers the scalar envelope fields; Message/Result/ParseErr
+		// have dedicated tests and are zeroed before comparing.
+		want Event
 	}{
 		{
 			desc: "control_request initialize surfaces the request subtype",
@@ -55,6 +57,11 @@ func TestParse(t *testing.T) {
 			desc: "control_response surfaces subtype and request_id from the payload",
 			line: fixtureControlResp,
 			want: Event{Type: TypeControlResponse, Subtype: "success", RequestID: "req-2"},
+		},
+		{
+			desc: "control_request can_use_tool surfaces the request subtype",
+			line: fixtureCanUseTool,
+			want: Event{Type: TypeControlRequest, Subtype: "can_use_tool", RequestID: "req-2"},
 		},
 		{
 			desc: "keep_alive",
@@ -90,26 +97,9 @@ func TestParse(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			got := Parse([]byte(test.line))
-			if got.Type != test.want.Type {
-				t.Errorf("Type = %q, want %q", got.Type, test.want.Type)
-			}
-			if got.Subtype != test.want.Subtype {
-				t.Errorf("Subtype = %q, want %q", got.Subtype, test.want.Subtype)
-			}
-			if got.SessionID != test.want.SessionID {
-				t.Errorf("SessionID = %q, want %q", got.SessionID, test.want.SessionID)
-			}
-			if got.UUID != test.want.UUID {
-				t.Errorf("UUID = %q, want %q", got.UUID, test.want.UUID)
-			}
-			if got.RequestID != test.want.RequestID {
-				t.Errorf("RequestID = %q, want %q", got.RequestID, test.want.RequestID)
-			}
-			if got.IsReplay != test.want.IsReplay {
-				t.Errorf("IsReplay = %v, want %v", got.IsReplay, test.want.IsReplay)
-			}
-			if got.StreamEventType != test.want.StreamEventType {
-				t.Errorf("StreamEventType = %q, want %q", got.StreamEventType, test.want.StreamEventType)
+			got.Message, got.Result, got.ParseErr = nil, nil, nil
+			if got != test.want {
+				t.Errorf("Parse(%q) =\n%+v, want\n%+v", test.line, got, test.want)
 			}
 		})
 	}
@@ -176,6 +166,27 @@ func TestParse_messageContent(t *testing.T) {
 	})
 }
 
+func TestContentBlock_ResultText(t *testing.T) {
+	tests := []struct {
+		desc    string
+		content string // raw JSON of the tool_result "content" field
+		want    string
+	}{
+		{desc: "string payload", content: `"main.go\nREADME.md"`, want: "main.go\nREADME.md"},
+		{desc: "nested text blocks", content: `[{"type":"text","text":"conteúdo"}]`, want: "conteúdo"},
+		{desc: "empty payload", content: ``, want: ""},
+		{desc: "unrecognized shape comes back verbatim", content: `{"weird":true}`, want: `{"weird":true}`},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			block := ContentBlock{Type: "tool_result", Content: []byte(test.content)}
+			if got := block.ResultText(); got != test.want {
+				t.Errorf("ResultText() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestParse_result(t *testing.T) {
 	t.Run("success result", func(t *testing.T) {
 		got := Parse([]byte(fixtureResult))
@@ -196,28 +207,4 @@ func TestParse_result(t *testing.T) {
 			t.Errorf("Subtype = %q", got.Subtype)
 		}
 	})
-}
-
-func TestMessageType(t *testing.T) {
-	tests := []struct {
-		desc string
-		line string
-		want string
-	}{
-		{desc: "stream event envelope", line: `{"type":"stream_event","event":{"type":"message_start"}}`, want: "stream_event"},
-		{desc: "result event", line: `{"type":"result","is_error":false}` + "\n", want: "result"},
-		{desc: "line with surrounding whitespace", line: `  {"type":"assistant"}  ` + "\n", want: "assistant"},
-		{desc: "json without type field", line: `{"foo":"bar"}`, want: ""},
-		{desc: "non-json line", line: "some stray log output", want: ""},
-		{desc: "empty line", line: "", want: ""},
-		{desc: "json with non-string type", line: `{"type":42}`, want: ""},
-	}
-	for _, test := range tests {
-		t.Run(test.desc, func(t *testing.T) {
-			got := MessageType([]byte(test.line))
-			if got != test.want {
-				t.Errorf("MessageType(%q) = %q, want %q", test.line, got, test.want)
-			}
-		})
-	}
 }

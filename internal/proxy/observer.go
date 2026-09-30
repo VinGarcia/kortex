@@ -13,30 +13,24 @@ import (
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
-// observer is the F2a read-only interception layer: it parses every wire
-// line, folds it into the canonical session history, and (when KORTEX_LOG is
-// set) appends a structured event log next to the raw traffic log. It never
-// writes to the protocol's stdout/stderr, and any internal failure — parse
-// error, panic — is swallowed so the byte-identical passthrough is never at
-// risk.
+// observer is the F2a read-only interception layer: it takes every parsed
+// wire line, classifies it into canonical-history intents, and (when an
+// event log path is configured) appends a structured event log next to the
+// raw traffic log. It never writes to the protocol's stdout/stderr, and any
+// internal failure — parse error, panic — is swallowed so the
+// byte-identical passthrough is never at risk.
 type observer struct {
 	mu       sync.Mutex
 	recorder *history.Recorder
 	file     *os.File // nil disables structured logging, never observation
 }
 
-// structuredLogPath derives the structured event log path from the raw
-// traffic log path (KORTEX_LOG).
-func structuredLogPath(rawLogPath string) string {
-	return rawLogPath + ".events"
-}
-
-func newObserver(rawLogPath string, stderr io.Writer) *observer {
+func newObserver(eventLogPath string, stderr io.Writer) *observer {
 	o := &observer{recorder: history.NewRecorder()}
-	if rawLogPath == "" {
+	if eventLogPath == "" {
 		return o
 	}
-	file, err := os.OpenFile(structuredLogPath(rawLogPath), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := os.OpenFile(eventLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: structured log disabled: %v\n", err)
 		return o
@@ -57,18 +51,17 @@ type entry struct {
 	Snapshot  *history.Snapshot `json:"history,omitempty"`
 }
 
-// Observe processes one wire line. Failures never propagate to the caller.
-func (o *observer) Observe(direction protocol.Direction, line []byte) {
+// Observe folds one parsed wire event into the history and the structured
+// log. Failures never propagate to the caller.
+func (o *observer) Observe(direction protocol.Direction, event protocol.Event) {
 	defer func() {
 		if r := recover(); r != nil {
 			o.logInternalError(fmt.Sprintf("observer panic: %v", r))
 		}
 	}()
-	event := protocol.Parse(line)
-
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.recorder.Observe(direction, event)
+	o.record(direction, event)
 	if o.file == nil {
 		return
 	}
@@ -87,6 +80,35 @@ func (o *observer) Observe(direction protocol.Direction, line []byte) {
 		e.Snapshot = &snapshot
 	}
 	o.writeEntry(e)
+}
+
+// record classifies a wire event into history intents. Transport facts live
+// here on purpose: which pipe carried the line and --replay-user-messages
+// echoes are proxy knowledge, not history knowledge.
+func (o *observer) record(direction protocol.Direction, event protocol.Event) {
+	o.recorder.SetSessionID(event.SessionID)
+	switch event.Type {
+	case protocol.TypeUser:
+		if event.Message == nil {
+			return
+		}
+		// Tool results travel as user messages; they belong to the open
+		// turn's tool calls no matter which direction carried them.
+		for _, block := range event.Message.Content {
+			if block.Type == "tool_result" {
+				o.recorder.AttachToolResult(block.ToolUseID, block.ResultText(), block.IsError)
+			}
+		}
+		// Only a fresh prompt on stdin opens a turn: stdout user events are
+		// either --replay-user-messages echoes or tool-result carriers.
+		if direction == protocol.ToBackend && !event.IsReplay {
+			o.recorder.RecordUserPrompt(event.Message.TextContent())
+		}
+	case protocol.TypeAssistant:
+		o.recorder.RecordAssistantMessage(event.Message)
+	case protocol.TypeResult:
+		o.recorder.CompleteTurn(event.Result)
+	}
 }
 
 func (o *observer) writeEntry(e entry) {
@@ -113,8 +135,13 @@ func (o *observer) logInternalError(msg string) {
 }
 
 func (o *observer) Close() {
+	// The mutex keeps the un-joined stdin pump from writing to a closed
+	// file: after Close it sees nil and observation degrades to a no-op.
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.file != nil {
 		o.file.Close()
+		o.file = nil
 	}
 }
 

@@ -40,8 +40,7 @@ const (
 )
 
 // Event is one parsed NDJSON line. Only the fields relevant to the line's
-// type are populated; everything else stays zero. Raw aliases the input line
-// (trimmed), so it is only valid until the caller's buffer is reused.
+// type are populated; everything else stays zero.
 type Event struct {
 	Type string
 	// Subtype disambiguates within a type: system init/task_started/...,
@@ -62,7 +61,6 @@ type Event struct {
 	// StreamEventType is the inner SSE event type of a stream_event
 	// (message_start, content_block_delta, ...).
 	StreamEventType string
-	Raw             json.RawMessage
 	// ParseErr is non-nil when the JSON object decoded partially: the type
 	// is known but some payload field had an unexpected shape. The event is
 	// still usable; the error exists for debug logging only.
@@ -188,7 +186,7 @@ func Parse(line []byte) Event {
 	var w wireEvent
 	err := json.Unmarshal(trimmed, &w)
 	if w.Type == "" {
-		return Event{Type: TypeUnknown, Raw: trimmed}
+		return Event{Type: TypeUnknown}
 	}
 
 	// The message envelope decodes in a second pass so that a message with
@@ -214,7 +212,6 @@ func Parse(line []byte) Event {
 		RequestID: w.RequestID,
 		IsReplay:  w.IsReplay,
 		Message:   msg,
-		Raw:       trimmed,
 		ParseErr:  err,
 	}
 	switch w.Type {
@@ -246,6 +243,27 @@ func Parse(line []byte) Event {
 	return ev
 }
 
+// ResultText renders a tool_result block's payload — which the wire allows
+// as either a plain string or nested content blocks — as plain text. An
+// unrecognized shape comes back verbatim as its raw JSON.
+func (b ContentBlock) ResultText() string {
+	if len(b.Content) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(b.Content, &s); err == nil {
+		return s
+	}
+	var blocks Content
+	if err := json.Unmarshal(b.Content, &blocks); err == nil {
+		msg := Message{Content: blocks}
+		if text := msg.TextContent(); text != "" {
+			return text
+		}
+	}
+	return string(b.Content)
+}
+
 // TextContent joins the text blocks of a message with newlines; "" when the
 // message carries no plain text.
 func (m *Message) TextContent() string {
@@ -263,22 +281,6 @@ func (m *Message) TextContent() string {
 		buf.WriteString(block.Text)
 	}
 	return buf.String()
-}
-
-type envelope struct {
-	Type string `json:"type"`
-}
-
-// MessageType returns the top-level "type" field of a stream-json line, or
-// "" when the line is not a JSON object with a string type. It never fails:
-// non-JSON lines are legal on the wire (the reader on the other side ignores
-// them) and must never break the stream.
-func MessageType(line []byte) string {
-	var e envelope
-	if err := json.Unmarshal(bytes.TrimSpace(line), &e); err != nil {
-		return ""
-	}
-	return e.Type
 }
 
 func firstNonEmpty(values ...string) string {

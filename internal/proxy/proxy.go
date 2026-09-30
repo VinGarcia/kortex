@@ -24,10 +24,14 @@ type Config struct {
 	// §2: OpenClaw announces them via CLAUDE_CODE_*_FILE_DESCRIPTOR env vars,
 	// resolved by the caller). Each must reach the child at the same number.
 	AuthFDs []int
-	LogPath string
-	Stdin   io.Reader
-	Stdout  io.Writer
-	Stderr  io.Writer
+	// LogPath receives the raw wire traffic; EventLogPath the structured
+	// per-event/per-turn log. Empty disables each. Both are derived from
+	// KORTEX_LOG by main (the composition root owns all path decisions).
+	LogPath      string
+	EventLogPath string
+	Stdin        io.Reader
+	Stdout       io.Writer
+	Stderr       io.Writer
 }
 
 // Run execs the real claude with untouched argv/env, proxies stdio until the
@@ -36,7 +40,7 @@ type Config struct {
 func Run(cfg Config) int {
 	logger := newTrafficLogger(cfg.LogPath, cfg.Stderr)
 	defer logger.Close()
-	obs := newObserver(cfg.LogPath, cfg.Stderr)
+	obs := newObserver(cfg.EventLogPath, cfg.Stderr)
 	defer obs.Close()
 
 	cmd := exec.Command(cfg.ClaudeBin, cfg.Argv...)
@@ -89,8 +93,10 @@ func Run(cfg Config) int {
 // copyLines pumps NDJSON lines from r to w, byte-identical. This per-line
 // plumbing (instead of a raw io.Copy) exists so the interception layers can
 // see every protocol line; a line that does not parse as JSON passes
-// untouched, and the observer runs before the write purely as a reader —
-// it can never alter or delay-fail the passthrough.
+// untouched. Each line is parsed exactly once, and the observation layers
+// run as pure readers after the forwarding write, so they can never alter
+// the passthrough — only add their own (small, per-line) latency to the
+// pump when logging is enabled.
 func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, direction protocol.Direction) error {
 	prefix := ">>"
 	if direction == protocol.FromBackend {
@@ -100,11 +106,12 @@ func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, d
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
-			logger.Log(prefix, line)
-			obs.Observe(direction, line)
 			if _, werr := w.Write(line); werr != nil {
 				return werr
 			}
+			event := protocol.Parse(line)
+			logger.Log(prefix, event.Type, line)
+			obs.Observe(direction, event)
 		}
 		if err == io.EOF {
 			return nil
@@ -187,14 +194,13 @@ func newTrafficLogger(path string, stderr io.Writer) *trafficLogger {
 	return &trafficLogger{file: file}
 }
 
-func (l *trafficLogger) Log(direction string, line []byte) {
+func (l *trafficLogger) Log(direction string, msgType string, line []byte) {
 	if l.file == nil || len(line) == 0 {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	msgType := protocol.MessageType(line)
-	if msgType == "" {
+	if msgType == protocol.TypeUnknown {
 		msgType = "raw"
 	}
 	fmt.Fprintf(l.file, "%s %s [%s] ", time.Now().Format(time.RFC3339Nano), direction, msgType)

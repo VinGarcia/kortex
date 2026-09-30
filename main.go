@@ -27,14 +27,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "kortex: %v\n", err)
 		os.Exit(1)
 	}
+	logPath := os.Getenv("KORTEX_LOG")
+	eventLogPath := ""
+	if logPath != "" {
+		eventLogPath = logPath + ".events"
+	}
 	os.Exit(proxy.Run(proxy.Config{
-		ClaudeBin: claudeBin,
-		Argv:      os.Args[1:],
-		AuthFDs:   authFDsFromEnv(),
-		LogPath:   os.Getenv("KORTEX_LOG"),
-		Stdin:     os.Stdin,
-		Stdout:    os.Stdout,
-		Stderr:    os.Stderr,
+		ClaudeBin:    claudeBin,
+		Argv:         os.Args[1:],
+		AuthFDs:      authFDsFromEnv(),
+		LogPath:      logPath,
+		EventLogPath: eventLogPath,
+		Stdin:        os.Stdin,
+		Stdout:       os.Stdout,
+		Stderr:       os.Stderr,
 	}))
 }
 
