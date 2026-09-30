@@ -1,0 +1,11 @@
+{
+  "name": "@vingarcia/openclaw-kortex-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenClaw CLI backend that routes claude-cli traffic through the kortex binary",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

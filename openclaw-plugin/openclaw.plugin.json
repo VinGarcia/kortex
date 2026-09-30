@@ -1,0 +1,24 @@
+{
+  "id": "kortex-cli",
+  "name": "Kortex CLI backend",
+  "description": "Claude CLI backend clone that launches the kortex pass-through binary instead of claude.",
+  "categories": [
+    "models"
+  ],
+  "cliBackends": [
+    "kortex-cli"
+  ],
+  "setup": {
+    "cliBackends": [
+      "kortex-cli"
+    ],
+    "requiresRuntime": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
