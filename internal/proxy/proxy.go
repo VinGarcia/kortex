@@ -65,8 +65,8 @@ type Config struct {
 	// turn (read-only observation; the stream is never altered by it).
 	TurnEvaluator TurnEvaluator
 	Stdin         io.Reader
-	Stdout      io.Writer
-	Stderr      io.Writer
+	Stdout        io.Writer
+	Stderr        io.Writer
 }
 
 // Run execs the real claude with untouched argv/env, proxies stdio until the

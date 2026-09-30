@@ -119,36 +119,65 @@ func TestOutputEvaluator_configurableThreshold(t *testing.T) {
 	}
 }
 
-func TestOutputEvaluator_countMismatchFailsOpen(t *testing.T) {
-	// Two paragraphs in, one annotation out: index-based matching would lie.
-	evaluator := &fakeEvaluator{response: oneParagraphEval()}
-	var log bytes.Buffer
-	e := newTestOutputEvaluator(evaluator, &log)
-
-	evaluateAndWait(e, 0, "primeiro parágrafo\n\nsegundo parágrafo")
-
-	if len(e.TurnEmotions()) != 0 {
-		t.Errorf("no metadata should be retained on contract violation: %+v", e.TurnEmotions())
+// TestOutputEvaluator_failureModes drives every fail-open branch through a
+// single table (the local form — see the annotator's failure-modes table):
+// each failure retains NO metadata and ends in a log entry carrying the
+// error, and nothing else happens.
+func TestOutputEvaluator_failureModes(t *testing.T) {
+	tests := []struct {
+		desc      string
+		evaluator *fakeEvaluator
+		text      string
+		wantErr   string
+	}{
+		{
+			desc:      "evaluator API error",
+			evaluator: &fakeEvaluator{err: errors.New("api exploded")},
+			text:      "um parágrafo qualquer",
+			wantErr:   "api exploded",
+		},
+		{
+			desc:      "evaluator slower than the facet timeout",
+			evaluator: &fakeEvaluator{response: oneParagraphEval(), delay: 5 * time.Second},
+			text:      "um parágrafo qualquer",
+			wantErr:   "context deadline exceeded",
+		},
+		{
+			desc:      "no JSON array in the output",
+			evaluator: &fakeEvaluator{response: evalText("desculpa, não consigo")},
+			text:      "um parágrafo qualquer",
+			wantErr:   "no JSON array in evaluator output",
+		},
+		{
+			desc:      "malformed JSON array",
+			evaluator: &fakeEvaluator{response: evalText(`[{"investment":"alta"}]`)},
+			text:      "um parágrafo qualquer",
+			wantErr:   "not the expected JSON array",
+		},
+		{
+			// Two paragraphs in, one annotation out: index matching would lie.
+			desc:      "annotation count mismatch",
+			evaluator: &fakeEvaluator{response: oneParagraphEval()},
+			text:      "primeiro parágrafo\n\nsegundo parágrafo",
+			wantErr:   "1 annotations for 2 paragraphs",
+		},
 	}
-	entry := lastLogEntry(t, &log)
-	if entry["ok"] != false || !strings.Contains(entry["error"].(string), "1 annotations for 2 paragraphs") {
-		t.Errorf("log entry = %v", entry)
-	}
-}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			var log bytes.Buffer
+			e := newTestOutputEvaluator(test.evaluator, &log)
+			e.timeout = 50 * time.Millisecond
 
-func TestOutputEvaluator_evaluatorErrorFailsOpen(t *testing.T) {
-	evaluator := &fakeEvaluator{err: errors.New("api exploded")}
-	var log bytes.Buffer
-	e := newTestOutputEvaluator(evaluator, &log)
+			evaluateAndWait(e, 0, test.text)
 
-	evaluateAndWait(e, 1, "um parágrafo qualquer")
-
-	if len(e.TurnEmotions()) != 0 {
-		t.Errorf("no metadata on evaluator error: %+v", e.TurnEmotions())
-	}
-	entry := lastLogEntry(t, &log)
-	if entry["ok"] != false || entry["error"] != "api exploded" {
-		t.Errorf("log entry = %v", entry)
+			if len(e.TurnEmotions()) != 0 {
+				t.Errorf("no metadata should be retained on failure: %+v", e.TurnEmotions())
+			}
+			entry := lastLogEntry(t, &log)
+			if entry["ok"] != false || !strings.Contains(entry["error"].(string), test.wantErr) {
+				t.Errorf("log entry = %v, want error containing %q", entry, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -158,8 +187,7 @@ func TestOutputEvaluator_evaluatorErrorFailsOpen(t *testing.T) {
 // pump (and therefore delivery to the gateway) never waits on evaluation.
 func TestOutputEvaluator_dispatchNeverBlocksOnSlowEvaluator(t *testing.T) {
 	evaluator := &fakeEvaluator{response: oneParagraphEval(), delay: 5 * time.Second}
-	var log bytes.Buffer
-	e := newTestOutputEvaluator(evaluator, &log)
+	e := newTestOutputEvaluator(evaluator, nil)
 	e.timeout = 50 * time.Millisecond
 
 	start := time.Now()
@@ -167,15 +195,7 @@ func TestOutputEvaluator_dispatchNeverBlocksOnSlowEvaluator(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("dispatch blocked for %v", elapsed)
 	}
-
 	e.WaitInFlight()
-	if len(e.TurnEmotions()) != 0 {
-		t.Errorf("no metadata on timeout: %+v", e.TurnEmotions())
-	}
-	entry := lastLogEntry(t, &log)
-	if entry["ok"] != false || !strings.Contains(entry["error"].(string), "context deadline exceeded") {
-		t.Errorf("log entry = %v", entry)
-	}
 }
 
 func TestOutputEvaluator_emptyTurnIsSkipped(t *testing.T) {

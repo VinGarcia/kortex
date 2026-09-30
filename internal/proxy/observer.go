@@ -55,6 +55,13 @@ type entry struct {
 	Snapshot  *history.Snapshot `json:"history,omitempty"`
 }
 
+// turnNotice is one pending turn-completion notification, carried out of
+// the locked section so the TurnEvaluator is never called under the mutex.
+type turnNotice struct {
+	index int
+	text  string
+}
+
 // Observe folds one parsed wire event into the history and the structured
 // log. Failures never propagate to the caller.
 func (o *observer) Observe(direction protocol.Direction, event protocol.Event) {
@@ -63,11 +70,24 @@ func (o *observer) Observe(direction protocol.Direction, event protocol.Event) {
 			o.logInternalError(fmt.Sprintf("observer panic: %v", r))
 		}
 	}()
+	// The notification fires after the mutex is released: the evaluator
+	// contract says "return promptly", but the pump's safety should not
+	// depend on an implementation honoring it while holding the lock the
+	// other pump goroutine needs.
+	if notice := o.observeLocked(direction, event); notice != nil {
+		o.turnEvaluator.EvaluateCompletedTurn(notice.index, notice.text)
+	}
+}
+
+// observeLocked does the mutex-protected part of Observe: history
+// recording and structured logging. It returns the pending turn-completion
+// notification, if this event produced one.
+func (o *observer) observeLocked(direction protocol.Direction, event protocol.Event) *turnNotice {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.record(direction, event)
+	notice := o.record(direction, event)
 	if o.file == nil {
-		return
+		return notice
 	}
 	e := entry{
 		Time:      time.Now().Format(time.RFC3339Nano),
@@ -84,17 +104,19 @@ func (o *observer) Observe(direction protocol.Direction, event protocol.Event) {
 		e.Snapshot = &snapshot
 	}
 	o.writeEntry(e)
+	return notice
 }
 
-// record classifies a wire event into history intents. Transport facts live
-// here on purpose: which pipe carried the line and --replay-user-messages
-// echoes are proxy knowledge, not history knowledge.
-func (o *observer) record(direction protocol.Direction, event protocol.Event) {
+// record classifies a wire event into history intents, returning the
+// turn-completion notification to deliver (nil for none). Transport facts
+// live here on purpose: which pipe carried the line and
+// --replay-user-messages echoes are proxy knowledge, not history knowledge.
+func (o *observer) record(direction protocol.Direction, event protocol.Event) *turnNotice {
 	o.recorder.SetSessionID(event.SessionID)
 	switch event.Type {
 	case protocol.TypeUser:
 		if event.Message == nil {
-			return
+			return nil
 		}
 		// Tool results travel as user messages; they belong to the open
 		// turn's tool calls no matter which direction carried them.
@@ -111,19 +133,20 @@ func (o *observer) record(direction protocol.Direction, event protocol.Event) {
 	case protocol.TypeAssistant:
 		o.recorder.RecordAssistantMessage(event.Message)
 	case protocol.TypeResult:
-		// Only a result that closed a turn NOW notifies the evaluator: a
+		// Only a result that closed a turn NOW produces a notification: a
 		// stray duplicate result must not re-evaluate (and re-bill) the
 		// previous turn.
 		if !o.recorder.CompleteTurn(event.Result) {
-			return
+			return nil
 		}
 		if o.turnEvaluator == nil {
-			return
+			return nil
 		}
 		if index, turn, ok := o.recorder.LastCompletedTurn(); ok {
-			o.turnEvaluator.EvaluateCompletedTurn(index, turn.AssistantText)
+			return &turnNotice{index: index, text: turn.AssistantText}
 		}
 	}
+	return nil
 }
 
 func (o *observer) writeEntry(e entry) {

@@ -128,9 +128,9 @@ func (r *Recorder) AttachToolResult(toolUseID string, resultText string, isError
 }
 
 // CompleteTurn closes the open turn with the terminal result's outcome. It
-// reports whether a turn was actually closed NOW: a stray extra result
+// reports whether a turn was closed by this call: a stray extra result
 // event with no open turn returns false, so a caller reacting to turn
-// completion (the output evaluator hook) never fires twice for one turn.
+// completion never reacts twice to the same turn.
 func (r *Recorder) CompleteTurn(result *protocol.Result) bool {
 	current := r.openTurn()
 	if current == nil {
