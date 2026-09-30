@@ -22,6 +22,13 @@ import (
 // that prefers annotation coverage over latency can raise it.
 const DefaultTimeoutSeconds = 10
 
+// DefaultGateMinInvestment is the gate threshold when the config does not
+// set gateMinInvestment. Source: the primary path of sylphie's
+// core/emotion-output-gate-prompt.md — "investment ≥ 4; ou investment = 3
+// com valence mista ou negativa" — i.e. today's gate fires at 4, and at 4-1
+// when the valence is negative or mixed.
+const DefaultGateMinInvestment = 4
+
 // Config is the root of the kortex config file.
 type Config struct {
 	Facets Facets `json:"facets"`
@@ -30,7 +37,8 @@ type Config struct {
 // Facets declares which facets exist and how each is wired. A facet absent
 // from the file (nil) is off.
 type Facets struct {
-	InputAnnotator *InputAnnotator `json:"inputAnnotator"`
+	InputAnnotator  *InputAnnotator  `json:"inputAnnotator"`
+	OutputEvaluator *OutputEvaluator `json:"outputEvaluator"`
 }
 
 // InputAnnotator configures the emotional annotator that runs over real
@@ -52,6 +60,38 @@ type InputAnnotator struct {
 	// TimeoutSeconds bounds each evaluator call; 0 means
 	// DefaultTimeoutSeconds.
 	TimeoutSeconds int `json:"timeoutSeconds"`
+}
+
+// OutputEvaluator configures the F2c emotional evaluator that runs over
+// each completed assistant turn, in observability mode: the stream is never
+// touched; tags + gate aggregate + the hypothetical gate decision go to the
+// facet log and to in-memory turn metadata. The InputAnnotator and this
+// struct stay separate types on purpose: they configure different facets
+// that diverge (gateMinInvestment exists only here) even though most fields
+// coincide today.
+type OutputEvaluator struct {
+	Enabled bool `json:"enabled"`
+	// Model is the evaluator model id (e.g. claude-haiku-4-5-20251001).
+	Model string `json:"model"`
+	// TokenEnv names the env var holding the OAuth token. The binary reads
+	// the env at startup; the token value itself never lives in this file.
+	TokenEnv string `json:"tokenEnv"`
+	// SystemPromptPath is the evaluator prompt file. Only the body after the
+	// first line that is exactly "---" is sent to the model (the header is a
+	// maintenance note), matching the sylphie prompt-file convention.
+	SystemPromptPath string `json:"systemPromptPath"`
+	// EmotionalMemoryPath, when set, is a file injected into the evaluator's
+	// system prompt as trusted context before the untrusted text.
+	EmotionalMemoryPath string `json:"emotionalMemoryPath"`
+	// TimeoutSeconds bounds each evaluator call; 0 means
+	// DefaultTimeoutSeconds.
+	TimeoutSeconds int `json:"timeoutSeconds"`
+	// GateMinInvestment is the aggregate investment at which the
+	// hypothetical gate fires (it also fires at GateMinInvestment-1 when the
+	// valence is negativa or mista, mirroring the gate prompt). A pointer so
+	// an explicit 0 ("fire on everything") stays distinguishable from
+	// absent; nil means DefaultGateMinInvestment.
+	GateMinInvestment *int `json:"gateMinInvestment"`
 }
 
 // Load reads and validates the config file at path.
@@ -81,6 +121,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("facets.inputAnnotator: %w", err)
 		}
 	}
+	if ev := c.Facets.OutputEvaluator; ev != nil {
+		if err := ev.Validate(); err != nil {
+			return fmt.Errorf("facets.outputEvaluator: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -99,6 +144,28 @@ func (a InputAnnotator) Validate() error {
 	}
 	if a.TimeoutSeconds < 0 {
 		return fmt.Errorf("timeoutSeconds must be >= 0, got %d", a.TimeoutSeconds)
+	}
+	return nil
+}
+
+// Validate checks the fields the facet cannot run without. A disabled facet
+// is still validated: a config someone will later flip to enabled should be
+// complete from day one.
+func (e OutputEvaluator) Validate() error {
+	if e.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+	if e.TokenEnv == "" {
+		return fmt.Errorf("tokenEnv is required")
+	}
+	if e.SystemPromptPath == "" {
+		return fmt.Errorf("systemPromptPath is required")
+	}
+	if e.TimeoutSeconds < 0 {
+		return fmt.Errorf("timeoutSeconds must be >= 0, got %d", e.TimeoutSeconds)
+	}
+	if e.GateMinInvestment != nil && (*e.GateMinInvestment < 0 || *e.GateMinInvestment > 5) {
+		return fmt.Errorf("gateMinInvestment must be between 0 and 5, got %d", *e.GateMinInvestment)
 	}
 	return nil
 }

@@ -15,15 +15,17 @@ import (
 // The model only ever returns JSON; the user's original text is never
 // rewritten by the model — kortex splices the tags in deterministically.
 
-// paragraphAnnotation is one element of the evaluator's output array,
-// annotating the paragraph at the same index.
-type paragraphAnnotation struct {
+// ParagraphAnnotation is one element of the evaluator's output array,
+// annotating the paragraph at the same index. Exported because the output
+// evaluator retains it as per-turn metadata for downstream facets (F2d
+// superego), `about` included.
+type ParagraphAnnotation struct {
 	Investment int       `json:"investment"`
 	Valence    string    `json:"valence"`
-	Emotions   []emotion `json:"emotions"`
+	Emotions   []Emotion `json:"emotions"`
 }
 
-type emotion struct {
+type Emotion struct {
 	Emotion string `json:"emotion"`
 	Level   int    `json:"level"`
 	About   string `json:"about"`
@@ -79,8 +81,8 @@ func extractJSONArray(raw string) string {
 // in the known set, each emotion with a non-empty name and level 0–5. A
 // count mismatch is an error because the index-based interleaving would
 // silently annotate the wrong paragraphs.
-func parseAnnotations(jsonArray string, expectedCount int) ([]paragraphAnnotation, error) {
-	var annotations []paragraphAnnotation
+func parseAnnotations(jsonArray string, expectedCount int) ([]ParagraphAnnotation, error) {
+	var annotations []ParagraphAnnotation
 	if err := json.Unmarshal([]byte(jsonArray), &annotations); err != nil {
 		return nil, fmt.Errorf("evaluator output is not the expected JSON array: %w", err)
 	}
@@ -114,7 +116,7 @@ func parseAnnotations(jsonArray string, expectedCount int) ([]paragraphAnnotatio
 // Newlines inside an emotion name are collapsed to spaces so the annotation
 // stays a single line (a model-supplied "\n" would otherwise desync the
 // line-oriented format).
-func annotationLine(index int, ann paragraphAnnotation) string {
+func annotationLine(index int, ann ParagraphAnnotation) string {
 	var emotions string
 	if len(ann.Emotions) == 0 {
 		emotions = "nenhuma"
@@ -134,7 +136,7 @@ func annotationLine(index int, ann paragraphAnnotation) string {
 // interleave rebuilds the text as each original paragraph followed by its
 // annotation line, blocks separated by a blank line. Paragraph text is
 // spliced verbatim — it never passes through the model.
-func interleave(paragraphs []string, annotations []paragraphAnnotation) string {
+func interleave(paragraphs []string, annotations []ParagraphAnnotation) string {
 	blocks := make([]string, len(paragraphs))
 	for i, para := range paragraphs {
 		blocks[i] = para + "\n" + annotationLine(i, annotations[i])

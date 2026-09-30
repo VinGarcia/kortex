@@ -43,90 +43,146 @@ func main() {
 	// broken config fails fast at startup (before any exec): silently
 	// degrading a flag the operator explicitly set would hide the
 	// misconfiguration; a startup failure is immediately visible.
-	annotator, facetLogFile, err := buildAnnotator(os.Getenv("KORTEX_CONFIG"), logPath)
+	facets, err := buildFacets(os.Getenv("KORTEX_CONFIG"), logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kortex: %v\n", err)
 		os.Exit(1)
 	}
 	var interceptor proxy.Interceptor
-	if annotator != nil {
-		interceptor = annotator
+	if facets.annotator != nil {
+		interceptor = facets.annotator
+	}
+	var turnEvaluator proxy.TurnEvaluator
+	if facets.outputEvaluator != nil {
+		turnEvaluator = facets.outputEvaluator
 	}
 
 	// os.Exit skips defers, so the facet log is closed explicitly after Run.
 	code := proxy.Run(proxy.Config{
-		ClaudeBin:    claudeBin,
-		Argv:         os.Args[1:],
-		AuthFDs:      authFDsFromEnv(),
-		LogPath:      logPath,
-		EventLogPath: eventLogPath,
-		Interceptor:  interceptor,
-		Stdin:        os.Stdin,
-		Stdout:       os.Stdout,
-		Stderr:       os.Stderr,
+		ClaudeBin:     claudeBin,
+		Argv:          os.Args[1:],
+		AuthFDs:       authFDsFromEnv(),
+		LogPath:       logPath,
+		EventLogPath:  eventLogPath,
+		Interceptor:   interceptor,
+		TurnEvaluator: turnEvaluator,
+		Stdin:         os.Stdin,
+		Stdout:        os.Stdout,
+		Stderr:        os.Stderr,
 	})
-	if facetLogFile != nil {
-		facetLogFile.Close()
+	// The child already exited and its output is long delivered; waiting
+	// here only keeps the process alive until the final turn's async
+	// evaluation lands in the log (bounded by the facet timeout), instead
+	// of killing it by exiting.
+	if facets.outputEvaluator != nil {
+		facets.outputEvaluator.WaitInFlight()
+	}
+	if facets.logFile != nil {
+		facets.logFile.Close()
 	}
 	os.Exit(code)
 }
 
-// buildAnnotator loads the config at cfgPath and constructs the input
-// annotator facet, plus the facet-log file it writes to (nil when logging
-// is off; the caller owns closing it). (nil, nil, nil) when cfgPath is
-// empty or the facet is absent or disabled. All env reading stays here in
-// the composition root: the facet receives the token, never the env name.
-func buildAnnotator(cfgPath string, logPath string) (*facet.InputAnnotator, *os.File, error) {
+// builtFacets is what the composition root assembled from the config: the
+// constructed facets (each nil when absent or disabled) plus the facet-log
+// file they share (nil when logging is off; the caller owns closing it).
+type builtFacets struct {
+	annotator       *facet.InputAnnotator
+	outputEvaluator *facet.OutputEvaluator
+	logFile         *os.File
+}
+
+// buildFacets loads the config at cfgPath and constructs every enabled
+// facet. The zero builtFacets when cfgPath is empty. All env reading stays
+// here in the composition root: a facet receives the token, never the env
+// name.
+func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
+	var built builtFacets
 	if cfgPath == "" {
-		return nil, nil, nil
+		return built, nil
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, nil, err
+		return built, err
 	}
 	annCfg := cfg.Facets.InputAnnotator
-	if annCfg == nil || !annCfg.Enabled {
-		return nil, nil, nil
+	evalCfg := cfg.Facets.OutputEvaluator
+	annEnabled := annCfg != nil && annCfg.Enabled
+	evalEnabled := evalCfg != nil && evalCfg.Enabled
+	if !annEnabled && !evalEnabled {
+		return built, nil
 	}
-
-	token := os.Getenv(annCfg.TokenEnv)
-	if token == "" {
-		return nil, nil, fmt.Errorf("facet inputAnnotator: token env %s is empty or unset", annCfg.TokenEnv)
-	}
-	systemPrompt, err := facet.LoadSystemPrompt(annCfg.SystemPromptPath, annCfg.EmotionalMemoryPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("facet inputAnnotator: %w", err)
-	}
-	timeoutSeconds := annCfg.TimeoutSeconds
-	if timeoutSeconds == 0 {
-		timeoutSeconds = config.DefaultTimeoutSeconds
-	}
-	timeout := time.Duration(timeoutSeconds) * time.Second
 
 	// The structured facet-call log lives next to the other KORTEX_LOG
-	// artifacts. An open failure degrades to no facet log (stderr warning),
-	// never to no facet.
-	var facetLogFile *os.File
+	// artifacts, shared by every facet (each log line names its facet). An
+	// open failure degrades to no facet log (stderr warning), never to no
+	// facet.
 	var logSink io.Writer
 	if logPath != "" {
-		facetLogFile, err = os.OpenFile(logPath+".facets", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		built.logFile, err = os.OpenFile(logPath+".facets", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "kortex: facet log disabled: %v\n", err)
+			built.logFile = nil
 		} else {
-			logSink = facetLogFile
+			logSink = built.logFile
 		}
 	}
 
+	if annEnabled {
+		evaluator, systemPrompt, timeout, err := buildEvaluatorDeps("inputAnnotator", annCfg.TokenEnv,
+			annCfg.SystemPromptPath, annCfg.EmotionalMemoryPath, annCfg.Model, annCfg.TimeoutSeconds)
+		if err != nil {
+			return built, err
+		}
+		built.annotator = facet.NewInputAnnotator(facet.AnnotatorParams{
+			Evaluator:    evaluator,
+			SystemPrompt: systemPrompt,
+			Timeout:      timeout,
+			Model:        annCfg.Model,
+			LogSink:      logSink,
+		})
+	}
+	if evalEnabled {
+		evaluator, systemPrompt, timeout, err := buildEvaluatorDeps("outputEvaluator", evalCfg.TokenEnv,
+			evalCfg.SystemPromptPath, evalCfg.EmotionalMemoryPath, evalCfg.Model, evalCfg.TimeoutSeconds)
+		if err != nil {
+			return built, err
+		}
+		gateMinInvestment := config.DefaultGateMinInvestment
+		if evalCfg.GateMinInvestment != nil {
+			gateMinInvestment = *evalCfg.GateMinInvestment
+		}
+		built.outputEvaluator = facet.NewOutputEvaluator(facet.OutputEvaluatorParams{
+			Evaluator:         evaluator,
+			SystemPrompt:      systemPrompt,
+			Timeout:           timeout,
+			Model:             evalCfg.Model,
+			GateMinInvestment: gateMinInvestment,
+			LogSink:           logSink,
+		})
+	}
+	return built, nil
+}
+
+// buildEvaluatorDeps assembles the model-call dependencies one facet needs:
+// the anthropic-backed evaluator (token resolved from the env here, in the
+// composition root), the loaded system prompt, and the call timeout.
+func buildEvaluatorDeps(facetName string, tokenEnv string, promptPath string, memoryPath string, model string, timeoutSeconds int) (facet.Evaluator, string, time.Duration, error) {
+	token := os.Getenv(tokenEnv)
+	if token == "" {
+		return nil, "", 0, fmt.Errorf("facet %s: token env %s is empty or unset", facetName, tokenEnv)
+	}
+	systemPrompt, err := facet.LoadSystemPrompt(promptPath, memoryPath)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("facet %s: %w", facetName, err)
+	}
+	if timeoutSeconds == 0 {
+		timeoutSeconds = config.DefaultTimeoutSeconds
+	}
 	// The HTTP client gets no client-level timeout: the facet bounds every
 	// call with a context deadline derived from the same config field.
 	client := anthropic.NewClient(token, "", 0)
-	return facet.NewInputAnnotator(facet.AnnotatorParams{
-		Evaluator:    facet.NewAnthropicEvaluator(client, annCfg.Model),
-		SystemPrompt: systemPrompt,
-		Timeout:      timeout,
-		Model:        annCfg.Model,
-		LogSink:      logSink,
-	}), facetLogFile, nil
+	return facet.NewAnthropicEvaluator(client, model), systemPrompt, time.Duration(timeoutSeconds) * time.Second, nil
 }
 
 func authFDsFromEnv() []int {

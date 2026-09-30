@@ -31,7 +31,7 @@ func TestCopyLines_interceptorRewritesOnlyUserLines(t *testing.T) {
 	interceptor := &rewriteUserInterceptor{replacement: `{"type":"user","message":{"role":"user","content":"annotated"}}`}
 
 	var out bytes.Buffer
-	err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard), interceptor, protocol.ToBackend)
+	err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard, nil), interceptor, protocol.ToBackend)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestCopyLines_nilReturnKeepsPassthroughByteIdentical(t *testing.T) {
 	decline := interceptorFunc(func(line []byte, event protocol.Event) []byte { return nil })
 
 	var out bytes.Buffer
-	err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard), decline, protocol.ToBackend)
+	err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard, nil), decline, protocol.ToBackend)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestCopyLines_malformedReplacementIsDiscarded(t *testing.T) {
 				return []byte(test.replacement)
 			})
 			var out bytes.Buffer
-			err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard), bad, protocol.ToBackend)
+			err := copyLines(strings.NewReader(input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard, nil), bad, protocol.ToBackend)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -162,3 +162,32 @@ func TestRecorder_edgeCases(t *testing.T) {
 		})
 	}
 }
+
+func TestRecorder_lastCompletedTurn(t *testing.T) {
+	rec := NewRecorder()
+
+	if _, _, ok := rec.LastCompletedTurn(); ok {
+		t.Error("empty recorder should have no completed turn")
+	}
+
+	rec.RecordUserPrompt("oi")
+	rec.RecordAssistantMessage(&protocol.Message{Content: protocol.Content{
+		{Type: "text", Text: "resposta"},
+	}})
+	if _, _, ok := rec.LastCompletedTurn(); ok {
+		t.Error("open turn must not report as completed")
+	}
+
+	if !rec.CompleteTurn(&protocol.Result{StopReason: "end_turn"}) {
+		t.Fatal("CompleteTurn should report closing the open turn")
+	}
+	index, turn, ok := rec.LastCompletedTurn()
+	if !ok || index != 0 || turn.AssistantText != "resposta" || !turn.Completed {
+		t.Fatalf("LastCompletedTurn = (%d, %+v, %v)", index, turn, ok)
+	}
+
+	// A stray duplicate result closes nothing: the hook must not re-fire.
+	if rec.CompleteTurn(&protocol.Result{}) {
+		t.Error("duplicate result must not report a newly closed turn")
+	}
+}

@@ -33,6 +33,19 @@ type Interceptor interface {
 	InterceptToBackend(line []byte, event protocol.Event) []byte
 }
 
+// TurnEvaluator is the facet plug-in point on the from-backend side: the
+// observer calls it once per completed assistant turn (at the terminal
+// result event) with the turn's index in the canonical history and the
+// turn's full final assistant text. Implementations must return promptly —
+// dispatch real work to their own goroutine — because the call runs on the
+// stdout pump goroutine: the current line is already forwarded when it
+// fires, but a blocking implementation would delay the following lines.
+// Defined here (not in a facet package) for the same reason as Interceptor:
+// proxy never imports facets; main wires the concrete implementation in.
+type TurnEvaluator interface {
+	EvaluateCompletedTurn(turnIndex int, assistantText string)
+}
+
 type Config struct {
 	ClaudeBin string
 	Argv      []string
@@ -48,7 +61,10 @@ type Config struct {
 	// Interceptor, when non-nil, may rewrite to-backend lines (facets).
 	// nil keeps the F1 behavior: pure byte-identical passthrough.
 	Interceptor Interceptor
-	Stdin       io.Reader
+	// TurnEvaluator, when non-nil, is notified of each completed assistant
+	// turn (read-only observation; the stream is never altered by it).
+	TurnEvaluator TurnEvaluator
+	Stdin         io.Reader
 	Stdout      io.Writer
 	Stderr      io.Writer
 }
@@ -59,7 +75,7 @@ type Config struct {
 func Run(cfg Config) int {
 	logger := newTrafficLogger(cfg.LogPath, cfg.Stderr)
 	defer logger.Close()
-	obs := newObserver(cfg.EventLogPath, cfg.Stderr)
+	obs := newObserver(cfg.EventLogPath, cfg.Stderr, cfg.TurnEvaluator)
 	defer obs.Close()
 
 	cmd := exec.Command(cfg.ClaudeBin, cfg.Argv...)

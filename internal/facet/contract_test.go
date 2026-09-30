@@ -145,8 +145,8 @@ func TestParseAnnotations(t *testing.T) {
 }
 
 func TestInterleave(t *testing.T) {
-	annotations := []paragraphAnnotation{
-		{Investment: 4, Valence: "negativa", Emotions: []emotion{
+	annotations := []ParagraphAnnotation{
+		{Investment: 4, Valence: "negativa", Emotions: []Emotion{
 			{Emotion: "exaustão", Level: 4},
 			{Emotion: "co\nbrança", Level: 3}, // newline in name must collapse to a space
 		}},

@@ -23,7 +23,7 @@ func observeAll(obs *observer, lines []wireLine) {
 }
 
 func TestObserver_disabledWithoutLogPath(t *testing.T) {
-	obs := newObserver("", io.Discard)
+	obs := newObserver("", io.Discard, nil)
 	defer obs.Close()
 	// Must observe (history state) without a file and without panicking.
 	obs.Observe(protocol.ToBackend, protocol.Parse([]byte(`{"type":"user","message":{"role":"user","content":"oi"}}`)))
@@ -38,7 +38,7 @@ func TestObserver_disabledWithoutLogPath(t *testing.T) {
 // reconstructed canonical history in the logged snapshot.
 func TestObserver_reconstructsMultiTurnSession(t *testing.T) {
 	eventLog := t.TempDir() + "/traffic.log.events"
-	obs := newObserver(eventLog, io.Discard)
+	obs := newObserver(eventLog, io.Discard, nil)
 	defer obs.Close()
 
 	observeAll(obs, []wireLine{
@@ -104,7 +104,7 @@ func TestObserver_reconstructsMultiTurnSession(t *testing.T) {
 
 func TestObserver_writesStructuredLog(t *testing.T) {
 	eventLog := t.TempDir() + "/traffic.log.events"
-	obs := newObserver(eventLog, io.Discard)
+	obs := newObserver(eventLog, io.Discard, nil)
 	defer obs.Close()
 
 	observeAll(obs, []wireLine{
@@ -141,7 +141,7 @@ func TestObserver_writesStructuredLog(t *testing.T) {
 func TestObserver_truncatesSnapshotFields(t *testing.T) {
 	long := strings.Repeat("á", 400) // multi-byte: exercises the rune-safe cut
 	eventLog := t.TempDir() + "/traffic.log.events"
-	obs := newObserver(eventLog, io.Discard)
+	obs := newObserver(eventLog, io.Discard, nil)
 	defer obs.Close()
 
 	userLine, err := json.Marshal(map[string]any{
@@ -183,4 +183,46 @@ func readEntries(t *testing.T, path string) []entry {
 		entries = append(entries, e)
 	}
 	return entries
+}
+
+// recordingTurnEvaluator captures each turn-completion notification.
+type recordingTurnEvaluator struct {
+	indexes []int
+	texts   []string
+}
+
+func (r *recordingTurnEvaluator) EvaluateCompletedTurn(turnIndex int, assistantText string) {
+	r.indexes = append(r.indexes, turnIndex)
+	r.texts = append(r.texts, assistantText)
+}
+
+// TestObserver_notifiesTurnEvaluatorOncePerCompletedTurn checks the F2c
+// hook: each terminal result fires exactly one notification with the turn's
+// full final assistant text, and a stray duplicate result fires nothing.
+func TestObserver_notifiesTurnEvaluatorOncePerCompletedTurn(t *testing.T) {
+	evaluator := &recordingTurnEvaluator{}
+	obs := newObserver("", io.Discard, evaluator)
+	defer obs.Close()
+
+	observeAll(obs, []wireLine{
+		{protocol.ToBackend, `{"type":"user","message":{"role":"user","content":"oi"},"uuid":"u1","session_id":"s1"}`},
+		{protocol.FromBackend, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"primeira parte"}]},"session_id":"s1"}`},
+		{protocol.FromBackend, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"segunda parte"}]},"session_id":"s1"}`},
+		{protocol.FromBackend, `{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"s1"}`},
+		// Stray duplicate result: no open turn, must not re-notify.
+		{protocol.FromBackend, `{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"s1"}`},
+		{protocol.ToBackend, `{"type":"user","message":{"role":"user","content":"mais um"},"uuid":"u2","session_id":"s1"}`},
+		{protocol.FromBackend, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"segunda resposta"}]},"session_id":"s1"}`},
+		{protocol.FromBackend, `{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"s1"}`},
+	})
+
+	if len(evaluator.indexes) != 2 {
+		t.Fatalf("got %d notifications, want 2: %v", len(evaluator.indexes), evaluator.indexes)
+	}
+	if evaluator.indexes[0] != 0 || evaluator.texts[0] != "primeira parte\nsegunda parte" {
+		t.Errorf("first notification = (%d, %q)", evaluator.indexes[0], evaluator.texts[0])
+	}
+	if evaluator.indexes[1] != 1 || evaluator.texts[1] != "segunda resposta" {
+		t.Errorf("second notification = (%d, %q)", evaluator.indexes[1], evaluator.texts[1])
+	}
 }

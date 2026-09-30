@@ -127,17 +127,37 @@ func (r *Recorder) AttachToolResult(toolUseID string, resultText string, isError
 	}
 }
 
-// CompleteTurn closes the open turn with the terminal result's outcome.
-func (r *Recorder) CompleteTurn(result *protocol.Result) {
+// CompleteTurn closes the open turn with the terminal result's outcome. It
+// reports whether a turn was actually closed NOW: a stray extra result
+// event with no open turn returns false, so a caller reacting to turn
+// completion (the output evaluator hook) never fires twice for one turn.
+func (r *Recorder) CompleteTurn(result *protocol.Result) bool {
 	current := r.openTurn()
 	if current == nil {
-		return
+		return false
 	}
 	current.Completed = true
 	if result != nil {
 		current.IsError = result.IsError
 		current.StopReason = result.StopReason
 	}
+	return true
+}
+
+// LastCompletedTurn returns the most recent turn and its index when that
+// turn has completed; ok=false while the last turn is still open or no turn
+// exists. The turn is a copy — mutating it never touches the history.
+func (r *Recorder) LastCompletedTurn() (index int, turn Turn, ok bool) {
+	if len(r.turns) == 0 {
+		return 0, Turn{}, false
+	}
+	index = len(r.turns) - 1
+	turn = r.turns[index]
+	if !turn.Completed {
+		return 0, Turn{}, false
+	}
+	turn.ToolCalls = append([]ToolCall(nil), turn.ToolCalls...)
+	return index, turn, true
 }
 
 // openTurn returns the turn still accumulating output, or nil when the last

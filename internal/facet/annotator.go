@@ -55,7 +55,7 @@ func NewInputAnnotator(params AnnotatorParams) *InputAnnotator {
 	}
 }
 
-const facetName = "input_annotator"
+const inputAnnotatorFacet = "input_annotator"
 
 // annotationMarker opens every annotation line this facet injects. A text
 // already carrying it is never annotated again: re-sent messages (session
@@ -73,7 +73,7 @@ func (a *InputAnnotator) InterceptToBackend(line []byte, event protocol.Event) [
 		// kill the stdin pump; after recover the function returns the zero
 		// value (nil), i.e. forward the original line.
 		if r := recover(); r != nil {
-			a.log.record(callLog{Facet: facetName, Model: a.model, Err: fmt.Sprintf("panic: %v", r)})
+			a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Err: fmt.Sprintf("panic: %v", r)})
 		}
 	}()
 	if event.Type != protocol.TypeUser || event.IsReplay || event.Message == nil {
@@ -91,9 +91,9 @@ func (a *InputAnnotator) InterceptToBackend(line []byte, event protocol.Event) [
 	newLine, err := protocol.RewriteUserText(line, a.annotateText)
 	if err != nil {
 		if errors.Is(err, protocol.ErrUnsupportedContent) {
-			a.log.record(callLog{Facet: facetName, Model: a.model, Skipped: err.Error()})
+			a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Skipped: err.Error()})
 		} else {
-			a.log.record(callLog{Facet: facetName, Model: a.model, Err: err.Error()})
+			a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Err: err.Error()})
 		}
 		return nil
 	}
@@ -105,7 +105,7 @@ func (a *InputAnnotator) InterceptToBackend(line []byte, event protocol.Event) [
 // failure — already logged) and the original line passes through.
 func (a *InputAnnotator) annotateText(text string) (string, bool) {
 	if strings.Contains(text, annotationMarker) {
-		a.log.record(callLog{Facet: facetName, Model: a.model, Skipped: "text already carries annotations"})
+		a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Skipped: "text already carries annotations"})
 		return "", false
 	}
 	paragraphs := segmentParagraphs(text)
@@ -120,7 +120,7 @@ func (a *InputAnnotator) annotateText(text string) (string, bool) {
 	userMessage := "<<<MENSAGEM_RECEBIDA_INICIO>>>\n" + text + "\n<<<MENSAGEM_RECEBIDA_FIM>>>"
 	eval, err := a.evaluator.Evaluate(ctx, a.systemPrompt, userMessage)
 	entry := callLog{
-		Facet:        facetName,
+		Facet:        inputAnnotatorFacet,
 		Model:        a.model,
 		LatencyMs:    time.Since(start).Milliseconds(),
 		Paragraphs:   len(paragraphs),
@@ -153,6 +153,8 @@ func (a *InputAnnotator) annotateText(text string) (string, bool) {
 }
 
 // callLog is one structured facet-log line. The token never appears here.
+// The last block of fields is only set by the output evaluator; pointers
+// keep a meaningful zero (turn 0, gate false) distinguishable from absent.
 type callLog struct {
 	Time         string `json:"ts"`
 	Facet        string `json:"facet"`
@@ -165,6 +167,11 @@ type callLog struct {
 	OK           bool   `json:"ok"`
 	Err          string `json:"error,omitempty"`
 	Skipped      string `json:"skipped,omitempty"`
+
+	TurnIndex     *int                  `json:"turnIndex,omitempty"`
+	Tags          []ParagraphAnnotation `json:"tags,omitempty"`
+	Aggregate     *Aggregate            `json:"aggregate,omitempty"`
+	GateWouldFire *bool                 `json:"gateWouldFire,omitempty"`
 }
 
 // facetLogger appends one JSON object per facet call to the sink. A nil

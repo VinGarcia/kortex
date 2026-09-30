@@ -23,10 +23,14 @@ type observer struct {
 	mu       sync.Mutex
 	recorder *history.Recorder
 	file     *os.File // nil disables structured logging, never observation
+	// turnEvaluator, when non-nil, is notified of each newly completed
+	// turn. The notification happens under the observer mutex; the
+	// implementation returns promptly by contract (see proxy.TurnEvaluator).
+	turnEvaluator TurnEvaluator
 }
 
-func newObserver(eventLogPath string, stderr io.Writer) *observer {
-	o := &observer{recorder: history.NewRecorder()}
+func newObserver(eventLogPath string, stderr io.Writer, turnEvaluator TurnEvaluator) *observer {
+	o := &observer{recorder: history.NewRecorder(), turnEvaluator: turnEvaluator}
 	if eventLogPath == "" {
 		return o
 	}
@@ -107,7 +111,18 @@ func (o *observer) record(direction protocol.Direction, event protocol.Event) {
 	case protocol.TypeAssistant:
 		o.recorder.RecordAssistantMessage(event.Message)
 	case protocol.TypeResult:
-		o.recorder.CompleteTurn(event.Result)
+		// Only a result that closed a turn NOW notifies the evaluator: a
+		// stray duplicate result must not re-evaluate (and re-bill) the
+		// previous turn.
+		if !o.recorder.CompleteTurn(event.Result) {
+			return
+		}
+		if o.turnEvaluator == nil {
+			return
+		}
+		if index, turn, ok := o.recorder.LastCompletedTurn(); ok {
+			o.turnEvaluator.EvaluateCompletedTurn(index, turn.AssistantText)
+		}
 	}
 }
 
