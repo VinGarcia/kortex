@@ -35,6 +35,10 @@ export default definePluginEntry({
       config: {
         ...base.config,
         command: "kortex",
+        // The bundled backend omits this and relies on providerId ===
+        // "claude-cli" inside isClaudeStreamJsonDialect; without it the
+        // gateway treats our stdout as plain text and chats receive raw JSON.
+        jsonlDialect: "claude-stream-json",
       },
     });
   },
