@@ -36,6 +36,8 @@ type Config struct {
 func Run(cfg Config) int {
 	logger := newTrafficLogger(cfg.LogPath, cfg.Stderr)
 	defer logger.Close()
+	obs := newObserver(cfg.LogPath, cfg.Stderr)
+	defer obs.Close()
 
 	cmd := exec.Command(cfg.ClaudeBin, cfg.Argv...)
 	cmd.Stderr = cfg.Stderr
@@ -74,25 +76,32 @@ func Run(cfg Config) int {
 	go func() {
 		// Write errors here mean the child went away; the exit code from
 		// Wait is the meaningful outcome, not this copy error.
-		_ = copyLines(cfg.Stdin, stdinPipe, logger, ">>")
+		_ = copyLines(cfg.Stdin, stdinPipe, logger, obs, protocol.ToBackend)
 		stdinPipe.Close()
 	}()
 
-	if err := copyLines(stdoutPipe, cfg.Stdout, logger, "<<"); err != nil {
+	if err := copyLines(stdoutPipe, cfg.Stdout, logger, obs, protocol.FromBackend); err != nil {
 		fmt.Fprintf(cfg.Stderr, "kortex: stdout copy: %v\n", err)
 	}
 	return exitCode(cmd.Wait())
 }
 
 // copyLines pumps NDJSON lines from r to w, byte-identical. This per-line
-// plumbing (instead of a raw io.Copy) exists so F2 can intercept and rewrite
-// protocol messages here; a line that does not parse as JSON passes untouched.
-func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, direction string) error {
+// plumbing (instead of a raw io.Copy) exists so the interception layers can
+// see every protocol line; a line that does not parse as JSON passes
+// untouched, and the observer runs before the write purely as a reader —
+// it can never alter or delay-fail the passthrough.
+func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, direction protocol.Direction) error {
+	prefix := ">>"
+	if direction == protocol.FromBackend {
+		prefix = "<<"
+	}
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
-			logger.Log(direction, line)
+			logger.Log(prefix, line)
+			obs.Observe(direction, line)
 			if _, werr := w.Write(line); werr != nil {
 				return werr
 			}
