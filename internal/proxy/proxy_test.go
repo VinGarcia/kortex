@@ -30,7 +30,7 @@ func TestCopyLines(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			var out bytes.Buffer
-			err := copyLines(strings.NewReader(test.input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard), protocol.ToBackend)
+			err := copyLines(strings.NewReader(test.input), &out, newTrafficLogger("", io.Discard), newObserver("", io.Discard), nil, protocol.ToBackend)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -11,17 +11,21 @@ enforces their permissions and arbitrates what actually gets sent.
 
 ## Status
 
-Early development. Current milestone: **F2a — observing interception**: on
-top of the F1 pass-through (byte-identical proxy to the real `claude`,
-running in production as a canary), kortex now parses every protocol line,
-reconstructs the canonical session history in memory, and can log a
-structured per-turn view — still with zero behavior change; interception is
-read-only and any internal error in the new layers is swallowed, never
-propagated to the stream.
+Early development. Current milestone: **F2b — first facet (input emotional
+annotator), off by default**: on top of the F2a observing interception
+(parse every line, reconstruct canonical history, structured logging),
+kortex can now run its first facet — a model-backed annotator that tags
+each paragraph of a real user message with emotional valence/investment
+before it reaches the core model. Facets only exist when the `KORTEX_CONFIG`
+env points at a config file; without it kortex remains the byte-identical
+pass-through proxy (F1 behavior, running in production as a canary).
+Facets are strictly fail-open: any evaluator failure (API error, timeout,
+malformed output) forwards the original line untouched.
 
 ## Architecture
 
-Thin `main.go` (env/config wiring only) over three internal packages:
+Thin `main.go` (env/config wiring and facet construction — the composition
+root; all env reading happens here) over the internal packages:
 
 - `internal/proxy` — process plumbing: resolves the real `claude` binary
   (avoiding self-resolution, since kortex installs under the name `claude`),
@@ -35,20 +39,40 @@ Thin `main.go` (env/config wiring only) over three internal packages:
 - `internal/history` — reconstructs the canonical conversation history of
   the current session (turns of user text, assistant text, summarized tool
   calls) from the parsed events. Purely observational state; this is the
-  structure the F2b facets will operate on.
+  structure later facets will operate on.
+- `internal/config` — loads the facet configuration file (JSON, pointed at
+  by `KORTEX_CONFIG`). Declares which facets are enabled, their model, the
+  env var carrying the OAuth token (the binary reads the env; the token
+  value never lives in the file), and the facet prompt/memory paths.
+- `internal/anthropic` — minimal Messages API client with OAuth Bearer
+  auth (subscription setup-token flow): one non-streaming call with
+  system + messages, timeouts, typed API errors.
+- `internal/facet` — the facets. `InputAnnotator` implements the proxy's
+  to-backend interception point: for each real user prompt it calls the
+  evaluator model and splices per-paragraph emotion annotations into the
+  text (the contract ported from sylphie's `emotion-annotate.sh`).
+  Handshakes, control messages, replays and tool-result carriers are never
+  touched, and every failure path is fail-open (original line forwarded,
+  error recorded in `<KORTEX_LOG>.facets`).
 
-`proxy` may import `protocol` and `history`; `history` may import
-`protocol`; never the reverse. The facet orchestrator will plug into
-`proxy.copyLines`, the single point where every protocol line passes. The
-import direction is enforced by `go-arch-lint` (`.go-arch-lint.yml`, run via
-`make lint`). All env reading happens in `main.go`; the packages receive
-everything through parameters.
+Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
+`make lint`): `proxy` may import `protocol` and `history`; `history` may
+import `protocol`; `facet` may import `protocol` and `anthropic`; never the
+reverse. `proxy` never imports `facet` — facets reach the pump only through
+the `proxy.Interceptor` interface, wired by `main`. Wire-format knowledge
+stays in `protocol` (facets rewrite message text via
+`protocol.RewriteUserText`, never raw envelope bytes). The packages receive
+everything (paths, tokens, timeouts) through parameters — `main` translates
+`config` into plain values, so only the composition root knows the file
+format.
 
 Env: `KORTEX_CLAUDE_BIN` (explicit path to the real claude), `KORTEX_LOG`
 (debug log path; never written to protocol stdout/stderr — raw wire traffic
-goes to the path itself, and the structured per-turn event log to
-`<path>.events`, one JSON object per line with a compact history snapshot
-at each terminal result).
+goes to the path itself, the structured per-turn event log to
+`<path>.events`, and the structured facet-call log — latency, model,
+success/error, never the token — to `<path>.facets`), `KORTEX_CONFIG`
+(facet config file; absent = no facets, pure passthrough), plus the env var
+the config names as the facet OAuth token source.
 
 ## Design notes
 

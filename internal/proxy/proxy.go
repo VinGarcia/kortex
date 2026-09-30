@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,21 @@ import (
 
 	"github.com/vingarcia/kortex/internal/protocol"
 )
+
+// Interceptor is the facet plug-in point on the to-backend pump: it sees
+// every stdin protocol line already parsed and may return a replacement
+// line (ending in '\n') to forward instead, or nil to forward the original
+// untouched. Implementations own their fail-open behavior — an interceptor
+// must never block indefinitely; the pump itself rejects a replacement that
+// is not exactly one newline-terminated line, so a buggy interceptor cannot
+// corrupt the NDJSON framing. Defined here (not in a facet package) so
+// proxy never imports facets; main wires the concrete implementation in.
+// Deliberately narrow while there is a single facet: richer semantics
+// (from-backend hooks, drop/inject, chaining) belong to the F3 orchestrator
+// and will be designed when a second participant exists.
+type Interceptor interface {
+	InterceptToBackend(line []byte, event protocol.Event) []byte
+}
 
 type Config struct {
 	ClaudeBin string
@@ -29,9 +45,12 @@ type Config struct {
 	// KORTEX_LOG by main (the composition root owns all path decisions).
 	LogPath      string
 	EventLogPath string
-	Stdin        io.Reader
-	Stdout       io.Writer
-	Stderr       io.Writer
+	// Interceptor, when non-nil, may rewrite to-backend lines (facets).
+	// nil keeps the F1 behavior: pure byte-identical passthrough.
+	Interceptor Interceptor
+	Stdin       io.Reader
+	Stdout      io.Writer
+	Stderr      io.Writer
 }
 
 // Run execs the real claude with untouched argv/env, proxies stdio until the
@@ -80,24 +99,25 @@ func Run(cfg Config) int {
 	go func() {
 		// Write errors here mean the child went away; the exit code from
 		// Wait is the meaningful outcome, not this copy error.
-		_ = copyLines(cfg.Stdin, stdinPipe, logger, obs, protocol.ToBackend)
+		_ = copyLines(cfg.Stdin, stdinPipe, logger, obs, cfg.Interceptor, protocol.ToBackend)
 		stdinPipe.Close()
 	}()
 
-	if err := copyLines(stdoutPipe, cfg.Stdout, logger, obs, protocol.FromBackend); err != nil {
+	if err := copyLines(stdoutPipe, cfg.Stdout, logger, obs, nil, protocol.FromBackend); err != nil {
 		fmt.Fprintf(cfg.Stderr, "kortex: stdout copy: %v\n", err)
 	}
 	return exitCode(cmd.Wait())
 }
 
-// copyLines pumps NDJSON lines from r to w, byte-identical. This per-line
-// plumbing (instead of a raw io.Copy) exists so the interception layers can
-// see every protocol line; a line that does not parse as JSON passes
-// untouched. Each line is parsed exactly once, and the observation layers
-// run as pure readers after the forwarding write, so they can never alter
-// the passthrough — only add their own (small, per-line) latency to the
-// pump when logging is enabled.
-func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, direction protocol.Direction) error {
+// copyLines pumps NDJSON lines from r to w. This per-line plumbing (instead
+// of a raw io.Copy) exists so the interception layers can see every protocol
+// line; a line that does not parse as JSON passes untouched. Without an
+// interceptor the pump is byte-identical; with one (to-backend only), a line
+// the interceptor rewrites is forwarded in its rewritten form and re-parsed
+// so the log and history record what the backend actually received. The
+// observation layers stay pure readers after the forwarding write; only the
+// interceptor (which owns its fail-open rules) can alter or delay the pump.
+func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, interceptor Interceptor, direction protocol.Direction) error {
 	prefix := ">>"
 	if direction == protocol.FromBackend {
 		prefix = "<<"
@@ -106,10 +126,20 @@ func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, d
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
+			event := protocol.Parse(line)
+			if interceptor != nil {
+				// NDJSON framing is this pump's own invariant: a replacement
+				// that is not exactly one newline-terminated line is
+				// discarded and the original forwarded (fail-open), so no
+				// interceptor bug can corrupt the stream.
+				if replacement := interceptor.InterceptToBackend(line, event); isSingleLine(replacement) {
+					line = replacement
+					event = protocol.Parse(line)
+				}
+			}
 			if _, werr := w.Write(line); werr != nil {
 				return werr
 			}
-			event := protocol.Parse(line)
 			logger.Log(prefix, event.Type, line)
 			obs.Observe(direction, event)
 		}
@@ -120,6 +150,15 @@ func copyLines(r io.Reader, w io.Writer, logger *trafficLogger, obs *observer, d
 			return err
 		}
 	}
+}
+
+// isSingleLine reports whether data is exactly one '\n'-terminated line —
+// the only replacement shape copyLines accepts from an interceptor.
+func isSingleLine(data []byte) bool {
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		return false
+	}
+	return bytes.IndexByte(data[:len(data)-1], '\n') == -1
 }
 
 // forwardAuthFDs re-exposes inherited auth file descriptors to the child at

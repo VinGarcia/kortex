@@ -11,14 +11,29 @@ components:
     in: internal/protocol
   history:
     in: internal/history
+  config:
+    in: internal/config
+  anthropic:
+    in: internal/anthropic
+  facet:
+    in: internal/facet
 deps:
   main:
     mayDependOn:
       - proxy
+      - facet
+      - config
+      - anthropic
+  # proxy calls facets only through its own Interceptor interface (wired by
+  # main); it must never import facet — the reverse direction is the rule.
   proxy:
     mayDependOn:
       - protocol
       - history
+  facet:
+    mayDependOn:
+      - protocol
+      - anthropic
   history:
     mayDependOn:
       - protocol
