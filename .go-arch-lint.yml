@@ -9,10 +9,16 @@ components:
     in: internal/proxy
   protocol:
     in: internal/protocol
+  history:
+    in: internal/history
 deps:
   main:
     mayDependOn:
       - proxy
   proxy:
+    mayDependOn:
+      - protocol
+      - history
+  history:
     mayDependOn:
       - protocol
