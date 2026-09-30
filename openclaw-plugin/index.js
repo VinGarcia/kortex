@@ -6,8 +6,33 @@
 // middle of the stdio stream.
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
+
+// Facet activation for the canary. The config path is the kortex feature
+// flag; the OAuth token is read from the secrets file at each spawn (never
+// stored in this source) and handed to the child via the env var the config
+// names in tokenEnv. Missing/unreadable files degrade to pure passthrough.
+const KORTEX_CONFIG_PATH =
+  "/home/vingarcia/projects/sylphie/kortex/canary-config.json";
+const KORTEX_LOG_PATH = "/home/vingarcia/.openclaw/kortex/kortex.log";
+const KORTEX_TOKEN_PATH =
+  "/home/vingarcia/.openclaw/secrets/kortex-oauth-token";
+
+function kortexEnv() {
+  try {
+    const token = readFileSync(KORTEX_TOKEN_PATH, "utf8").trim();
+    if (!token) return {};
+    return {
+      KORTEX_CONFIG: KORTEX_CONFIG_PATH,
+      KORTEX_LOG: KORTEX_LOG_PATH,
+      CODECOMPANION_OAUTH_TOKEN: token,
+    };
+  } catch {
+    return {};
+  }
+}
 
 // Stable re-export inside the installed openclaw package, resolved relative to
 // the openclaw package so nvm/version moves keep working. Loaded with
@@ -26,6 +51,7 @@ export default definePluginEntry({
   description: "Claude CLI backend clone that launches the kortex pass-through binary",
   register(api) {
     const base = buildAnthropicCliBackend();
+    const basePrepare = base.prepareExecution;
     api.registerCliBackend({
       ...base,
       id: "kortex-cli",
@@ -39,6 +65,16 @@ export default definePluginEntry({
         // "claude-cli" inside isClaudeStreamJsonDialect; without it the
         // gateway treats our stdout as plain text and chats receive raw JSON.
         jsonlDialect: "claude-stream-json",
+      },
+      prepareExecution: (context) => {
+        const merge = (prepared) => ({
+          ...prepared,
+          env: { ...prepared.env, ...kortexEnv() },
+        });
+        const prepared = basePrepare(context);
+        return prepared && typeof prepared.then === "function"
+          ? prepared.then(merge)
+          : merge(prepared);
       },
     });
   },
