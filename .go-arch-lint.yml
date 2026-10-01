@@ -19,6 +19,11 @@ components:
     in: internal/facet
   tools:
     in: internal/tools
+  # Live-smoke driver for RunLoop (F3b caveat): runs the tool-loop against the
+  # real Messages API. A hack/ entrypoint, so it wires the client + builtins
+  # the same way main does.
+  loopsmoke:
+    in: hack/loopsmoke
 deps:
   main:
     mayDependOn:
@@ -49,3 +54,7 @@ deps:
   tools:
     mayDependOn:
       - anthropic
+  loopsmoke:
+    mayDependOn:
+      - anthropic
+      - tools
