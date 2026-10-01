@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestRunBash(t *testing.T) {
@@ -63,6 +64,27 @@ func TestRunBash_cwd(t *testing.T) {
 	}
 	if !strings.Contains(strings.TrimSpace(output), resolvedDir) {
 		t.Errorf("pwd output = %q, want it to contain cwd %q", output, resolvedDir)
+	}
+}
+
+// TestRunBash_truncationIsValidUTF8 produces output one byte past
+// bashMaxOutputBytes where the very last byte within the cap is the lead
+// byte of a 2-byte UTF-8 rune (0xC3 0xA9, "é") and its continuation byte
+// falls just past the cap. A raw byte-offset cut would keep the lone 0xC3
+// and return invalid UTF-8; RunBash must instead back off that dangling
+// byte.
+func TestRunBash_truncationIsValidUTF8(t *testing.T) {
+	output, isError := RunBash(context.Background(), BashInput{
+		Command: "head -c 262143 /dev/zero | tr '\\0' 'a'; printf '\\303\\251'",
+	})
+	if isError {
+		t.Fatalf("unexpected error: %q", output)
+	}
+	if !utf8.ValidString(output) {
+		t.Errorf("output is not valid UTF-8: %q", output)
+	}
+	if !strings.Contains(output, "[output truncated at 262144 bytes]") {
+		t.Errorf("output = %q, want the truncation notice", output)
 	}
 }
 

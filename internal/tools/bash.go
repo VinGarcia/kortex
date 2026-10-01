@@ -16,10 +16,9 @@ import (
 )
 
 // DefaultBashTimeoutSeconds bounds a bash call when the tool_use input does
-// not set timeout_seconds. 120s covers the crons/git/scripts workloads F3b
-// targets (per the roadmap note "bash já cobre crons, git, scripts")
-// without letting one runaway command block the whole tool-loop turn
-// indefinitely.
+// not set timeout_seconds: long enough for a typical cron/git/script
+// command, short enough that one runaway command can't block the whole
+// tool-loop turn indefinitely.
 const DefaultBashTimeoutSeconds = 120
 
 // bashMaxOutputBytes caps the combined stdout+stderr returned in the
@@ -81,12 +80,7 @@ func RunBash(ctx context.Context, input BashInput) (output string, isError bool)
 
 	runErr := cmd.Run()
 
-	out := combined.Bytes()
-	truncated := false
-	if len(out) > bashMaxOutputBytes {
-		out = out[:bashMaxOutputBytes]
-		truncated = true
-	}
+	out, truncated := truncateUTF8(combined.Bytes(), bashMaxOutputBytes)
 	result := string(out)
 	if truncated {
 		result += fmt.Sprintf("\n[output truncated at %d bytes]", bashMaxOutputBytes)
