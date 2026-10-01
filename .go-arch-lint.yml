@@ -59,6 +59,11 @@ deps:
   tools:
     mayDependOn:
       - anthropic
+      # F3c slice-3: mcp.Tool -> anthropic.ToolDef / mcp.CallToolResult ->
+      # anthropic.ToolResultBlock mapping lives here, per the slice-2
+      # architecture review (tools already owns Definitions()/Dispatcher and
+      # depends on anthropic; mcp must stay provider-agnostic/stdlib-only).
+      - mcp
   loopsmoke:
     mayDependOn:
       - anthropic
