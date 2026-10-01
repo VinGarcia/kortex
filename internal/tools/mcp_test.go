@@ -38,14 +38,8 @@ func TestMCPToolDef(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			got := MCPToolDef(test.tool)
-			if got.Name != test.want.Name {
-				t.Errorf("Name = %q, want %q", got.Name, test.want.Name)
-			}
-			if got.Description != test.want.Description {
-				t.Errorf("Description = %q, want %q", got.Description, test.want.Description)
-			}
-			if string(got.InputSchema) != string(test.want.InputSchema) {
-				t.Errorf("InputSchema = %s, want %s", got.InputSchema, test.want.InputSchema)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Errorf("MCPToolDef = %+v, want %+v", got, test.want)
 			}
 		})
 	}

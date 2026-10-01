@@ -67,12 +67,11 @@ func TestBuildMCPClient(t *testing.T) {
 			wantNilCli:  true,
 		},
 		{
-			desc: "--mcp-config present and valid: client built, getenv expands headers",
+			desc: "--mcp-config present and valid: client built",
 			argvFromDir: func(dir string) []string {
 				return []string{"--strict-mcp-config", "--mcp-config", filepath.Join(dir, "mcp-config.json")}
 			},
 			configFile: validConfig,
-			env:        map[string]string{"OPENCLAW_MCP_TOKEN": "tok-abc"},
 			wantNilCli: false,
 		},
 		{

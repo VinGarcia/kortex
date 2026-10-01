@@ -236,27 +236,12 @@ func buildFacetDeps(facetName string, tokenEnv string, promptPath string, memory
 	return anthropic.NewClient(token, "", 0), systemPrompt, time.Duration(timeoutSeconds) * time.Second, nil
 }
 
-// buildMCPClient constructs the MCP client for the OpenClaw loopback server
-// (F3c), following the same injected-getenv seam as every other secret in
-// this file: getenv is passed in (main calls this with os.Getenv; tests
-// pass a fake map lookup) so internal/mcp never reads the process
-// environment itself. It returns a nil client (no error) when --mcp-config
-// is absent from argv — e.g. a developer running kortex by hand outside
-// OpenClaw, with no MCP bridge available — mirroring KORTEX_CONFIG's own
-// "absent means disabled" contract. Construction itself makes no network
-// call (it only parses the config file and expands header placeholders), so
-// calling this unconditionally adds no latency or risk to the passthrough
-// hot path.
-//
-// Nothing in proxy.Run consumes facets.mcpClient yet: the internalized
-// tool-loop that will dispatch mcp__openclaw__-prefixed tool_use blocks
-// through it (RunLoop/Dispatcher, F3b/F3c) is not wired into the production
-// path — kortex still execs the real claude-cli (see README "Status").
-// Wiring that consumer is a separate, later change, not this slice's scope
-// (see sylphie/memory/autonomous_work.md item (3), slice-1's fix note on
-// not inventing a main consumer prematurely — the same judgment applies
-// here). This function and the client it builds exist and are tested so
-// that consumer needs no further composition-root wiring when it lands.
+// buildMCPClient constructs the MCP client for the OpenClaw loopback server.
+// getenv is injected (main passes os.Getenv; tests pass a fake lookup) so
+// internal/mcp never reads the process environment itself. It is fail-open:
+// a nil client and nil error when --mcp-config is absent from argv, since no
+// consumer wires the client into the production path yet (kortex still execs
+// the real claude-cli).
 func buildMCPClient(argv []string, getenv func(string) string) (*mcp.Client, error) {
 	path := mcpConfigPathFromArgv(argv)
 	if path == "" {
