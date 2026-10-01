@@ -240,6 +240,13 @@ func TestNewClientFromConfigFile_expandsEnvAndHandshakes(t *testing.T) {
 // of fake servers, mirroring TestClient_Handshake's per-row serverHandler
 // pattern.
 func TestClient_CallTool(t *testing.T) {
+	// Captured by the "builds tools/call params" row's serverHandler and read
+	// back by its checkResult; scoped to the whole test func but only ever
+	// written/read by that one row (mirrors TestClient_Handshake's
+	// gotSessionIDOnToolsList precedent).
+	var gotName string
+	var gotArguments map[string]any
+
 	tests := []struct {
 		name            string
 		serverHandler   func(w http.ResponseWriter, r *http.Request)
@@ -343,6 +350,59 @@ func TestClient_CallTool(t *testing.T) {
 				w.Write([]byte("data: {}\n\n"))
 			},
 			wantErrContains: []string{"unsupported response Content-Type"},
+		},
+		{
+			// A well-formed JSON-RPC error envelope on HTTP 200 (distinct from a
+			// tool-level isError result): CallTool must surface rpcResp.Error as
+			// a returned error, not a CallToolResult (client.go:141-143).
+			name: "jsonrpc error envelope surfaces as err",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"invalid params"}}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			wantErrContains: []string{"jsonrpc error", "-32602", "invalid params"},
+		},
+		{
+			// Round-trip of the request CallTool builds (client.go:127-130): the
+			// handler decodes the incoming body and the row's checkResult asserts
+			// params.name and params.arguments arrived intact, guarding against a
+			// silent param-building regression the method-only rows would miss.
+			name: "builds tools/call params with name and arguments",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Method string `json:"method"`
+					Params struct {
+						Name      string         `json:"name"`
+						Arguments map[string]any `json:"arguments"`
+					} `json:"params"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("fake server: decoding request body: %v", err)
+				}
+				if req.Method != "tools/call" {
+					t.Errorf("fake server: unexpected method %q", req.Method)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				gotName = req.Params.Name
+				gotArguments = req.Params.Arguments
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}`))
+			},
+			checkResult: func(t *testing.T, result CallToolResult) {
+				if gotName != "some_tool" {
+					t.Errorf("tools/call params.name = %q, want %q", gotName, "some_tool")
+				}
+				if gotArguments["arg"] != "value" {
+					t.Errorf("tools/call params.arguments = %+v, want map[arg:value]", gotArguments)
+				}
+			},
 		},
 	}
 
