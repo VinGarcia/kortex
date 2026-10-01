@@ -2,13 +2,13 @@
 // client transport against the OpenClaw loopback MCP server: parsing the
 // --mcp-config file the gateway writes for the subprocess-CLI, performing
 // the initialize / notifications/initialized / tools/list handshake, and
-// returning the typed tool catalog the server reports. tools/call (the
-// actual tool invocation) and the GET /mcp server->client SSE channel are
-// out of scope for this slice — see
-// sylphie/memory/design-prefrontal-redesign.md §F3c(d) for the full
-// slice-1..4 plan this package starts.
+// invoking tools/call. Mapping an mcp.Tool to an anthropic.ToolDef and
+// wiring CallTool into the Dispatcher/main are a later slice's concern, not
+// this package's — see sylphie/memory/design-prefrontal-redesign.md §F3c(d)
+// for the full slice-1..4 plan this package starts. The GET /mcp
+// server->client SSE channel is likewise out of scope.
 //
-// Caveat (slice-1, by design): JSON-RPC responses are only decoded when
+// Caveat (by design): JSON-RPC responses are only decoded when
 // Content-Type is application/json. The live gateway observed in §F3c's
 // LIVE HANDSHAKE DUMP always answered single-response calls that way, never
 // as an SSE stream, so a text/event-stream response is rejected with a

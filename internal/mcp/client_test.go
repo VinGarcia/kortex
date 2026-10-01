@@ -236,6 +236,145 @@ func TestNewClientFromConfigFile_expandsEnvAndHandshakes(t *testing.T) {
 	}
 }
 
+// TestClient_CallTool covers the slice-2 tools/call parsing against a table
+// of fake servers, mirroring TestClient_Handshake's per-row serverHandler
+// pattern.
+func TestClient_CallTool(t *testing.T) {
+	tests := []struct {
+		name            string
+		serverHandler   func(w http.ResponseWriter, r *http.Request)
+		wantErrContains []string
+		checkResult     func(t *testing.T, result CallToolResult)
+	}{
+		{
+			name: "success with a single text block",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			checkResult: func(t *testing.T, result CallToolResult) {
+				if result.IsError {
+					t.Error("IsError = true, want false")
+				}
+				want := []Content{{Type: "text", Text: "ok"}}
+				if len(result.Content) != len(want) || result.Content[0] != want[0] {
+					t.Errorf("Content = %+v, want %+v", result.Content, want)
+				}
+			},
+		},
+		{
+			name: "tool-level failure surfaces as isError, not err",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"boom"}],"isError":true}}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			checkResult: func(t *testing.T, result CallToolResult) {
+				if !result.IsError {
+					t.Error("IsError = false, want true")
+				}
+				if len(result.Content) != 1 || result.Content[0].Text != "boom" {
+					t.Errorf("Content = %+v, want a single %q block", result.Content, "boom")
+				}
+			},
+		},
+		{
+			name: "success with multiple content blocks",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}],"isError":false}}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			checkResult: func(t *testing.T, result CallToolResult) {
+				want := []Content{{Type: "text", Text: "first"}, {Type: "text", Text: "second"}}
+				if len(result.Content) != len(want) || result.Content[0] != want[0] || result.Content[1] != want[1] {
+					t.Errorf("Content = %+v, want %+v", result.Content, want)
+				}
+			},
+		},
+		{
+			name: "malformed result is a decode error",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":"not-an-array"}}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			wantErrContains: []string{"decoding result"},
+		},
+		{
+			name: "non-200 is an error",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				switch decodeRequestMethod(r) {
+				case "tools/call":
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte(`{"error":"boom"}`))
+				default:
+					t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			},
+			wantErrContains: []string{"http 500"},
+		},
+		{
+			name: "rejects a text/event-stream response (same caveat as Handshake)",
+			serverHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Write([]byte("data: {}\n\n"))
+			},
+			wantErrContains: []string{"unsupported response Content-Type"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(test.serverHandler))
+			defer server.Close()
+
+			client := NewClient(ServerConfig{URL: server.URL}, nil)
+			result, err := client.CallTool(context.Background(), "some_tool", map[string]any{"arg": "value"})
+
+			if len(test.wantErrContains) > 0 {
+				if err == nil {
+					t.Fatal("want an error, got nil")
+				}
+				for _, want := range test.wantErrContains {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %v, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.checkResult != nil {
+				test.checkResult(t, result)
+			}
+		})
+	}
+}
+
 func TestNewClientFromConfigFile_malformedConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "mcp-config.json")
 	if err := os.WriteFile(path, []byte(`{not json`), 0o644); err != nil {

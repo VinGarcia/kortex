@@ -105,9 +105,53 @@ type HandshakeResult struct {
 	Tools      []Tool
 }
 
+// Content is one block of a tools/call result. Type is "text" in every
+// observed response; Text is kept as the server sent it, including when it
+// is itself JSON — this package does not interpret a tool's payload.
+type Content struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// CallToolResult is the decoded result of a tools/call request.
+type CallToolResult struct {
+	Content []Content `json:"content"`
+	IsError bool      `json:"isError"`
+}
+
+// CallTool invokes the named tool with arguments and returns its result.
+// IsError reports a tool-level failure the server still answered with
+// HTTP 200/JSON-RPC success (per the observed wire shape); a transport or
+// JSON-RPC-envelope failure instead comes back as err.
+func (c *Client) CallTool(ctx context.Context, name string, arguments map[string]any) (CallToolResult, error) {
+	params := map[string]any{
+		"name":      name,
+		"arguments": arguments,
+	}
+	resp, err := c.post(ctx, rpcRequest{JSONRPC: "2.0", ID: 3, Method: "tools/call", Params: params})
+	if err != nil {
+		return CallToolResult{}, err
+	}
+	defer resp.Body.Close()
+
+	body, rpcResp, err := decodeRPCResponse(resp)
+	if err != nil {
+		return CallToolResult{}, err
+	}
+	if rpcResp.Error != nil {
+		return CallToolResult{}, rpcResp.Error
+	}
+
+	var result CallToolResult
+	if err := json.Unmarshal(rpcResp.Result, &result); err != nil {
+		return CallToolResult{}, fmt.Errorf("decoding result: %w (body=%s)", err, body)
+	}
+	return result, nil
+}
+
 // Handshake performs the slice-1 sequence against the server: initialize,
 // notifications/initialized, tools/list. It returns the server identity and
-// the typed tool catalog. tools/call is a later slice (see package doc).
+// the typed tool catalog. Call CallTool separately to invoke a tool.
 func (c *Client) Handshake(ctx context.Context) (HandshakeResult, error) {
 	init, err := c.initialize(ctx)
 	if err != nil {
