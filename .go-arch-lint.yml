@@ -19,6 +19,11 @@ components:
     in: internal/facet
   tools:
     in: internal/tools
+  # F3c slice-1: MCP (Streamable-HTTP) client transport + handshake against
+  # the OpenClaw loopback server. Provider-agnostic outbound transport — no
+  # dependency on anthropic or any other component, stdlib only.
+  mcp:
+    in: internal/mcp
   # Live-smoke driver for RunLoop (F3b caveat): runs the tool-loop against the
   # real Messages API. A hack/ entrypoint, so it wires the client + builtins
   # the same way main does.
