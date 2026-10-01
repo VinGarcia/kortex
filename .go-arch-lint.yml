@@ -17,6 +17,8 @@ components:
     in: internal/anthropic
   facet:
     in: internal/facet
+  tools:
+    in: internal/tools
 deps:
   main:
     mayDependOn:
@@ -40,3 +42,10 @@ deps:
   history:
     mayDependOn:
       - protocol
+  # Native tool-use builtins + the tool-loop runner/dispatcher. The bash/fs
+  # executors are provider-agnostic (plain *Input in, (string,bool) out); the
+  # only internal coupling is the dispatcher/loop driving the anthropic client
+  # and declaring ToolDefs — the same sanctioned concrete dependency facet has.
+  tools:
+    mayDependOn:
+      - anthropic
