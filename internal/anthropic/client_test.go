@@ -66,6 +66,83 @@ func TestCreateMessage_success(t *testing.T) {
 	}
 }
 
+// TestCreateMessage_toolUse reproduces the F3a spike's round trip: a
+// request declaring a bash tool gets back a tool_use block (with the
+// observed-but-unmodeled "caller" field), and echoing that block's Raw back
+// as the assistant turn alongside a tool_result produces the exact
+// messages[2] shape the spike proved the API accepts.
+func TestCreateMessage_toolUse(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decoding request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"content": [{"type":"tool_use","id":"toolu_01abc","name":"bash","input":{"command":"pwd"},"caller":{"type":"direct"}}],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 10, "output_tokens": 5}
+		}`))
+	}))
+	defer server.Close()
+
+	client := NewClient("secret-token", server.URL, time.Second)
+	schema, _ := json.Marshal(map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"command": map[string]any{"type": "string"}},
+		"required":   []string{"command"},
+	})
+	resp, err := client.CreateMessage(context.Background(), MessageRequest{
+		Model:     "claude-haiku-4-5-20251001",
+		MaxTokens: 1024,
+		Messages:  []Message{{Role: "user", Content: "run pwd"}},
+		Tools:     []ToolDef{{Name: "bash", Description: "run a shell command", InputSchema: schema}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotToolsRaw, ok := gotBody["tools"]; !ok || gotToolsRaw == nil {
+		t.Fatalf("request did not carry tools: %v", gotBody)
+	}
+
+	if resp.StopReason != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use", resp.StopReason)
+	}
+	toolUses := resp.ToolUseBlocks()
+	if len(toolUses) != 1 {
+		t.Fatalf("want 1 tool_use block, got %d", len(toolUses))
+	}
+	tu := toolUses[0]
+	if tu.ID != "toolu_01abc" || tu.Name != "bash" {
+		t.Errorf("unexpected tool_use block: %+v", tu)
+	}
+	var input struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(tu.Input, &input); err != nil || input.Command != "pwd" {
+		t.Errorf("tool_use.input.command = %+v, err=%v, want pwd", input, err)
+	}
+
+	// Build the follow-up turn the way the tool-loop must: echo the raw
+	// assistant content back verbatim, then a user turn with the
+	// tool_result keyed to the tool_use id.
+	followUp := []Message{
+		{Role: "user", Content: "run pwd"},
+		{Role: "assistant", Content: resp.RawContent()},
+		{Role: "user", Content: []ToolResultBlock{NewToolResultBlock(tu.ID, "/home/vingarcia", false)}},
+	}
+	encoded, err := json.Marshal(followUp)
+	if err != nil {
+		t.Fatalf("follow-up turn did not marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"tool_use_id":"toolu_01abc"`) {
+		t.Errorf("follow-up turn missing tool_result with matching tool_use_id: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"caller":{"type":"direct"}`) {
+		t.Errorf("follow-up turn did not preserve the unmodeled caller field: %s", encoded)
+	}
+}
+
 func TestCreateMessage_errors(t *testing.T) {
 	tests := []struct {
 		desc        string

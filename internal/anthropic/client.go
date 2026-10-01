@@ -46,18 +46,51 @@ func NewClient(token string, baseURL string, timeout time.Duration) *Client {
 	}
 }
 
-// Message is one conversation message of a request.
+// Message is one conversation message of a request. Content is either a
+// plain string (the simple facet calls use this) or a JSON-serializable
+// value carrying content blocks (tool_use echoed back from a prior
+// response, or []ToolResultBlock for a tool_result turn) — whatever the
+// tool-loop needs to send. Both shapes marshal correctly because
+// encoding/json accepts any JSON-serializable value in an `any` field.
 type Message struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
 }
 
-// MessageRequest is a non-streaming Messages API call.
+// ToolDef declares one tool in the "tools" field of a request, in the exact
+// shape the Messages API expects (see hack/toolloop.sh, proven against the
+// real API in the F3a spike).
+type ToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// ToolResultBlock is a tool_result content block sent back to the API as
+// part of a user turn, keyed to the tool_use block it answers by
+// ToolUseID. This is the exact shape the F3a spike proved the API accepts
+// (stop_reason: end_turn on the reply).
+type ToolResultBlock struct {
+	Type      string `json:"type"`
+	ToolUseID string `json:"tool_use_id"`
+	Content   string `json:"content"`
+	IsError   bool   `json:"is_error,omitempty"`
+}
+
+// NewToolResultBlock builds a tool_result content block for toolUseID.
+func NewToolResultBlock(toolUseID string, content string, isError bool) ToolResultBlock {
+	return ToolResultBlock{Type: "tool_result", ToolUseID: toolUseID, Content: content, IsError: isError}
+}
+
+// MessageRequest is a non-streaming Messages API call. Tools is nil for the
+// plain facet calls that predate the tool-loop; non-nil, it is forwarded
+// verbatim in the "tools" field.
 type MessageRequest struct {
 	Model     string
 	System    string
 	MaxTokens int
 	Messages  []Message
+	Tools     []ToolDef
 }
 
 // Usage carries the token counters of a response.
@@ -68,12 +101,52 @@ type Usage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
+// ContentBlock is one parsed content block of a response. Fields populate
+// depending on Type ("text" -> Text; "tool_use" -> ID/Name/Input). Raw holds
+// the exact bytes the API returned for this block so a tool-loop can echo
+// the assistant turn back verbatim in the next request's Messages — this
+// matters because tool_use blocks carry fields this client does not model
+// (e.g. the F3a spike observed a "caller":{"type":"direct"} field on every
+// tool_use block; Raw preserves it even though ContentBlock does not parse
+// it).
+type ContentBlock struct {
+	Type  string
+	Text  string
+	ID    string
+	Name  string
+	Input json.RawMessage
+	Raw   json.RawMessage
+}
+
 // MessageResponse is the decoded non-streaming response.
 type MessageResponse struct {
 	// Text is the concatenation of the response's text content blocks.
 	Text       string
+	Content    []ContentBlock
 	StopReason string
 	Usage      Usage
+}
+
+// ToolUseBlocks filters Content down to the tool_use blocks, in order.
+func (r MessageResponse) ToolUseBlocks() []ContentBlock {
+	var blocks []ContentBlock
+	for _, b := range r.Content {
+		if b.Type == "tool_use" {
+			blocks = append(blocks, b)
+		}
+	}
+	return blocks
+}
+
+// RawContent returns the response's content blocks as their exact raw JSON,
+// suitable to assign verbatim to a follow-up Message.Content when echoing
+// the assistant turn back to the API.
+func (r MessageResponse) RawContent() []json.RawMessage {
+	raw := make([]json.RawMessage, len(r.Content))
+	for i, b := range r.Content {
+		raw[i] = b.Raw
+	}
+	return raw
 }
 
 // APIError is a non-2xx answer from the API. Status is always set; Type and
@@ -96,15 +169,23 @@ type wireRequest struct {
 	System    string    `json:"system,omitempty"`
 	MaxTokens int       `json:"max_tokens"`
 	Messages  []Message `json:"messages"`
+	Tools     []ToolDef `json:"tools,omitempty"`
 }
 
 type wireResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	StopReason string `json:"stop_reason"`
-	Usage      Usage  `json:"usage"`
+	Content    []json.RawMessage `json:"content"`
+	StopReason string            `json:"stop_reason"`
+	Usage      Usage             `json:"usage"`
+}
+
+// wireContentBlock is the superset of fields any response content block may
+// carry, used only to parse each raw block in wireResponse.Content.
+type wireContentBlock struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
 }
 
 type wireError struct {
@@ -122,6 +203,7 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 		System:    req.System,
 		MaxTokens: req.MaxTokens,
 		Messages:  req.Messages,
+		Tools:     req.Tools,
 	})
 	if err != nil {
 		return MessageResponse{}, fmt.Errorf("anthropic: encoding request: %w", err)
@@ -164,13 +246,27 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 		return MessageResponse{}, fmt.Errorf("anthropic: decoding response: %w", err)
 	}
 	var text strings.Builder
-	for _, block := range wr.Content {
-		if block.Type == "text" {
-			text.WriteString(block.Text)
+	blocks := make([]ContentBlock, len(wr.Content))
+	for i, raw := range wr.Content {
+		var wb wireContentBlock
+		if err := json.Unmarshal(raw, &wb); err != nil {
+			return MessageResponse{}, fmt.Errorf("anthropic: decoding content block %d: %w", i, err)
+		}
+		if wb.Type == "text" {
+			text.WriteString(wb.Text)
+		}
+		blocks[i] = ContentBlock{
+			Type:  wb.Type,
+			Text:  wb.Text,
+			ID:    wb.ID,
+			Name:  wb.Name,
+			Input: wb.Input,
+			Raw:   raw,
 		}
 	}
 	return MessageResponse{
 		Text:       text.String(),
+		Content:    blocks,
 		StopReason: wr.StopReason,
 		Usage:      wr.Usage,
 	}, nil
