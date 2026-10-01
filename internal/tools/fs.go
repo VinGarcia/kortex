@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// readMaxOutputBytes caps the file content returned in the tool_result,
+// mirroring bash's own output cap: without it, reading one large file would
+// inflate the next request's token cost far more than any other builtin
+// does.
+const readMaxOutputBytes = 256 << 10
+
 // ReadInput is the read tool's input_schema.
 type ReadInput struct {
 	// Path is the absolute or relative file path to read.
@@ -33,7 +39,12 @@ func RunRead(input ReadInput) (output string, isError bool) {
 	if err != nil {
 		return fmt.Sprintf("error: reading %s: %v", input.Path, err), true
 	}
-	return string(data), false
+	out, truncated := truncateUTF8(data, readMaxOutputBytes)
+	result := string(out)
+	if truncated {
+		result += fmt.Sprintf("\n[output truncated at %d bytes]", readMaxOutputBytes)
+	}
+	return result, false
 }
 
 // WriteInput is the write tool's input_schema.

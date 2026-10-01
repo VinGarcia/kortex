@@ -3,7 +3,9 @@ package tools
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestRunRead(t *testing.T) {
@@ -36,11 +38,57 @@ func TestRunRead(t *testing.T) {
 	}
 }
 
+// TestRunRead_capAtBoundaryIsUntouched writes a file exactly
+// readMaxOutputBytes long and checks RunRead returns it byte-identical,
+// with no truncation notice appended — the cap must only kick in once the
+// file is strictly larger than it.
+func TestRunRead_capAtBoundaryIsUntouched(t *testing.T) {
+	content := strings.Repeat("a", readMaxOutputBytes)
+	path := filepath.Join(t.TempDir(), "at-cap.txt")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output, isError := RunRead(ReadInput{Path: path})
+	if isError {
+		t.Fatalf("unexpected error: %q", output)
+	}
+	if output != content {
+		t.Errorf("output differs from the at-cap file content (len got=%d want=%d)", len(output), len(content))
+	}
+}
+
+// TestRunRead_truncationIsValidUTF8 writes a file one byte past
+// readMaxOutputBytes where the last byte within the cap is the lead byte of
+// a 2-byte UTF-8 rune (0xC3 0xA9, "é") and its continuation byte falls just
+// past the cap. A raw byte-offset cut would keep the lone 0xC3 and return
+// invalid UTF-8; RunRead must instead back off that dangling byte.
+func TestRunRead_truncationIsValidUTF8(t *testing.T) {
+	data := append([]byte(strings.Repeat("a", readMaxOutputBytes-1)), 0xC3, 0xA9)
+	path := filepath.Join(t.TempDir(), "over-cap.txt")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output, isError := RunRead(ReadInput{Path: path})
+	if isError {
+		t.Fatalf("unexpected error: %q", output)
+	}
+	if !utf8.ValidString(output) {
+		t.Errorf("output is not valid UTF-8: %q", output)
+	}
+	wantNotice := "[output truncated at 262144 bytes]"
+	if !strings.Contains(output, wantNotice) {
+		t.Errorf("output does not contain %q", wantNotice)
+	}
+	wantContent := strings.Repeat("a", readMaxOutputBytes-1)
+	if !strings.HasPrefix(output, wantContent) {
+		t.Errorf("output content was not the dangling-byte-free %d 'a's", readMaxOutputBytes-1)
+	}
+}
+
 func TestRunWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.txt")
 
-	// create
 	if _, isError := RunWrite(WriteInput{Path: path, Content: "first"}); isError {
 		t.Fatalf("unexpected error creating file")
 	}
@@ -49,7 +97,6 @@ func TestRunWrite(t *testing.T) {
 		t.Fatalf("after create: got %q, err=%v", got, err)
 	}
 
-	// overwrite
 	if _, isError := RunWrite(WriteInput{Path: path, Content: "second"}); isError {
 		t.Fatalf("unexpected error overwriting file")
 	}
