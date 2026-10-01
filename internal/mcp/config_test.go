@@ -62,15 +62,13 @@ func TestLoadServerConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			for k, v := range test.env {
-				t.Setenv(k, v)
-			}
 			path := filepath.Join(t.TempDir(), "mcp-config.json")
 			if err := os.WriteFile(path, []byte(test.content), 0o644); err != nil {
 				t.Fatal(err)
 			}
 
-			server, err := LoadServerConfig(path)
+			getenv := func(name string) string { return test.env[name] }
+			server, err := LoadServerConfig(path, getenv)
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, test.wantErr)
@@ -86,7 +84,7 @@ func TestLoadServerConfig(t *testing.T) {
 }
 
 func TestLoadServerConfig_missingFile(t *testing.T) {
-	_, err := LoadServerConfig("/nonexistent/path/mcp-config.json")
+	_, err := LoadServerConfig("/nonexistent/path/mcp-config.json", func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "reading config") {
 		t.Fatalf("err = %v, want a reading config error", err)
 	}

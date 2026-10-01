@@ -64,10 +64,12 @@ func NewClient(server ServerConfig, httpClient *http.Client) *Client {
 }
 
 // NewClientFromConfigFile loads the "openclaw" server entry from the
-// --mcp-config file at path (expanding ${VAR} header placeholders, see
-// LoadServerConfig) and builds a Client for it.
-func NewClientFromConfigFile(path string, httpClient *http.Client) (*Client, error) {
-	server, err := LoadServerConfig(path)
+// --mcp-config file at path (expanding ${VAR} header placeholders via
+// getenv, see LoadServerConfig) and builds a Client for it. getenv is
+// supplied by the caller — this package never reads the process
+// environment itself (main.go passes os.Getenv; tests pass a fake lookup).
+func NewClientFromConfigFile(path string, getenv func(string) string, httpClient *http.Client) (*Client, error) {
+	server, err := LoadServerConfig(path, getenv)
 	if err != nil {
 		return nil, err
 	}

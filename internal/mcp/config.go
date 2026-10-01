@@ -45,14 +45,18 @@ const openclawServerName = "openclaw"
 
 // LoadServerConfig reads the --mcp-config file at path and returns the
 // "openclaw" server entry, with every "${VAR}" placeholder in its header
-// values expanded from the process environment. The gateway writes header
-// values as literal placeholders — e.g. "Authorization": "Bearer
-// ${OPENCLAW_MCP_TOKEN}" and "x-openclaw-cli-capture-key":
-// "${OPENCLAW_MCP_CLI_CAPTURE_KEY}" (§F3c LIVE HANDSHAKE DUMP) — and expects
-// the client to resolve them before the first request goes out; sending the
-// literal placeholder is rejected by the server the same way a missing
-// header is.
-func LoadServerConfig(path string) (ServerConfig, error) {
+// values expanded via getenv. The gateway writes header values as literal
+// placeholders — e.g. "Authorization": "Bearer ${OPENCLAW_MCP_TOKEN}" and
+// "x-openclaw-cli-capture-key": "${OPENCLAW_MCP_CLI_CAPTURE_KEY}" (§F3c LIVE
+// HANDSHAKE DUMP) — and expects the client to resolve them before the first
+// request goes out; sending the literal placeholder is rejected by the
+// server the same way a missing header is.
+//
+// This package never reads the process environment itself (every
+// os.Getenv lives in the composition root, main.go, per README
+// §Architecture): getenv is supplied by the caller — main.go passes
+// os.Getenv, tests pass a fake lookup over a map.
+func LoadServerConfig(path string, getenv func(string) string) (ServerConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ServerConfig{}, fmt.Errorf("mcp: reading config %s: %w", path, err)
@@ -74,13 +78,13 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 	expanded := make(map[string]string, len(server.Headers))
 	for name, value := range server.Headers {
 		// os.Expand already implements general "${NAME}"/"$NAME" ->
-		// mapping(NAME) substitution; os.Getenv itself is the mapping
-		// function, so no custom placeholder parsing is needed here. A
-		// variable absent from the environment expands to "" rather than
-		// erroring — the server's own auth check is what turns that into a
-		// surfaced failure (a 401 on the following request), matching how
-		// the live gateway behaves on a bad/missing grant.
-		expanded[name] = os.Expand(value, os.Getenv)
+		// mapping(NAME) substitution; getenv is that mapping function, so no
+		// custom placeholder parsing is needed here. A variable absent from
+		// the environment expands to "" rather than erroring — the server's
+		// own auth check is what turns that into a surfaced failure (a 401
+		// on the following request), matching how the live gateway behaves
+		// on a bad/missing grant.
+		expanded[name] = os.Expand(value, getenv)
 	}
 	server.Headers = expanded
 
