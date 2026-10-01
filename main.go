@@ -212,9 +212,8 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 	return built, nil
 }
 
-// resolveSuperegoModel applies the compiled per-facet default when the
-// superego config leaves model empty, so the facet table's Opus choice holds
-// without every config having to restate it.
+// resolveSuperegoModel lets a config omit model and still get the facet
+// table's Opus default, so that choice holds without every config restating it.
 func resolveSuperegoModel(configured string) string {
 	if configured == "" {
 		return config.DefaultSuperegoModel
