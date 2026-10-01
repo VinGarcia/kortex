@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/config"
 	"github.com/vingarcia/kortex/internal/facet"
+	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/proxy"
 )
 
@@ -47,6 +49,18 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kortex: %v\n", err)
 		os.Exit(1)
+	}
+	// --mcp-config is unconditionally injected by OpenClaw on the live path
+	// (F3c), whether or not kortex has a consumer for it yet — unlike
+	// KORTEX_CONFIG, a parse failure here is fail-open (warn, nil client),
+	// not fatal: nothing depends on the MCP client in Run() yet (see
+	// buildMCPClient's doc comment), so refusing to start over it would put
+	// today's passthrough/facets behavior at risk for zero benefit.
+	mcpClient, err := buildMCPClient(os.Args[1:], os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kortex: mcp client disabled: %v\n", err)
+	} else {
+		facets.mcpClient = mcpClient
 	}
 	var interceptor proxy.Interceptor
 	if facets.annotator != nil {
@@ -90,14 +104,17 @@ func main() {
 	os.Exit(code)
 }
 
-// builtFacets is what the composition root assembled from the config: the
-// constructed facets (each nil when absent or disabled) plus the facet-log
-// file they share (nil when logging is off; the caller owns closing it).
+// builtFacets is what the composition root assembled: the constructed
+// facets (each nil when absent or disabled) plus the facet-log file they
+// share (nil when logging is off; the caller owns closing it), plus the MCP
+// client (nil when --mcp-config was absent or unparseable; see
+// buildMCPClient).
 type builtFacets struct {
 	annotator       *facet.InputAnnotator
 	outputEvaluator *facet.OutputEvaluator
 	superego        *facet.Superego
 	logFile         *os.File
+	mcpClient       *mcp.Client
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -217,6 +234,59 @@ func buildFacetDeps(facetName string, tokenEnv string, promptPath string, memory
 	// The HTTP client gets no client-level timeout: the facet bounds every
 	// call with a context deadline derived from the same config field.
 	return anthropic.NewClient(token, "", 0), systemPrompt, time.Duration(timeoutSeconds) * time.Second, nil
+}
+
+// buildMCPClient constructs the MCP client for the OpenClaw loopback server
+// (F3c), following the same injected-getenv seam as every other secret in
+// this file: getenv is passed in (main calls this with os.Getenv; tests
+// pass a fake map lookup) so internal/mcp never reads the process
+// environment itself. It returns a nil client (no error) when --mcp-config
+// is absent from argv — e.g. a developer running kortex by hand outside
+// OpenClaw, with no MCP bridge available — mirroring KORTEX_CONFIG's own
+// "absent means disabled" contract. Construction itself makes no network
+// call (it only parses the config file and expands header placeholders), so
+// calling this unconditionally adds no latency or risk to the passthrough
+// hot path.
+//
+// Nothing in proxy.Run consumes facets.mcpClient yet: the internalized
+// tool-loop that will dispatch mcp__openclaw__-prefixed tool_use blocks
+// through it (RunLoop/Dispatcher, F3b/F3c) is not wired into the production
+// path — kortex still execs the real claude-cli (see README "Status").
+// Wiring that consumer is a separate, later change, not this slice's scope
+// (see sylphie/memory/autonomous_work.md item (3), slice-1's fix note on
+// not inventing a main consumer prematurely — the same judgment applies
+// here). This function and the client it builds exist and are tested so
+// that consumer needs no further composition-root wiring when it lands.
+func buildMCPClient(argv []string, getenv func(string) string) (*mcp.Client, error) {
+	path := mcpConfigPathFromArgv(argv)
+	if path == "" {
+		return nil, nil
+	}
+	client, err := mcp.NewClientFromConfigFile(path, getenv, nil)
+	if err != nil {
+		return nil, fmt.Errorf("mcp client: %w", err)
+	}
+	return client, nil
+}
+
+// mcpConfigPathFromArgv scans argv for the "--mcp-config" flag OpenClaw
+// passes the subprocess-CLI (kortex, impersonating claude-cli) alongside
+// "--strict-mcp-config" (§F3c LIVE HANDSHAKE DUMP). It accepts both the
+// space-separated form ("--mcp-config", "<path>", observed) and the
+// "--mcp-config=<path>" form (not observed, but cheap to also accept and
+// avoids a silent miss if claude-cli's flag parser allows it). Returns ""
+// when the flag is absent.
+func mcpConfigPathFromArgv(argv []string) string {
+	const flag = "--mcp-config"
+	for i, arg := range argv {
+		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
+			return value
+		}
+		if arg == flag && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	return ""
 }
 
 func authFDsFromEnv() []int {
