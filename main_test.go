@@ -50,6 +50,34 @@ func TestMcpConfigPathFromArgv(t *testing.T) {
 	}
 }
 
+func TestResolveSuperegoModel(t *testing.T) {
+	tests := []struct {
+		desc       string
+		configured string
+		want       string
+	}{
+		{
+			desc:       "empty model falls back to the compiled per-facet default",
+			configured: "",
+			want:       "claude-opus-4-8",
+		},
+		{
+			desc:       "explicit model overrides the default",
+			configured: "claude-sonnet-5",
+			want:       "claude-sonnet-5",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			got := resolveSuperegoModel(test.configured)
+			if got != test.want {
+				t.Errorf("resolveSuperegoModel(%q) = %q, want %q", test.configured, got, test.want)
+			}
+		})
+	}
+}
+
 func TestBuildMCPClient(t *testing.T) {
 	validConfig := `{"mcpServers":{"openclaw":{"type":"http","url":"http://127.0.0.1:37439/mcp","headers":{"Authorization":"Bearer ${OPENCLAW_MCP_TOKEN}"}}}}`
 

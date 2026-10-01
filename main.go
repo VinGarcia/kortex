@@ -175,10 +175,7 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 		// The superego is built before its trigger (the output evaluator)
 		// so the evaluator can be handed the wired trigger at construction.
 		if seEnabled {
-			model := seCfg.Model
-			if model == "" {
-				model = config.DefaultSuperegoModel
-			}
+			model := resolveSuperegoModel(seCfg.Model)
 			client, systemPrompt, timeout, err := buildFacetDeps("superego", seCfg.TokenEnv,
 				seCfg.SystemPromptPath, "", seCfg.TimeoutSeconds, config.DefaultSuperegoTimeoutSeconds)
 			if err != nil {
@@ -213,6 +210,16 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 		})
 	}
 	return built, nil
+}
+
+// resolveSuperegoModel applies the compiled per-facet default when the
+// superego config leaves model empty, so the facet table's Opus choice holds
+// without every config having to restate it.
+func resolveSuperegoModel(configured string) string {
+	if configured == "" {
+		return config.DefaultSuperegoModel
+	}
+	return configured
 }
 
 // buildFacetDeps assembles the model-call dependencies every facet shares:

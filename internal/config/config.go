@@ -32,7 +32,7 @@ const DefaultSuperegoTimeoutSeconds = 60
 // DefaultSuperegoModel is the superego model when the config leaves model
 // empty. The final model choice at activation time belongs to the operator;
 // this default only keeps the config minimal in the meantime.
-const DefaultSuperegoModel = "claude-sonnet-5"
+const DefaultSuperegoModel = "claude-opus-4-8"
 
 // DefaultGateMinInvestment is the gate threshold when the config does not
 // set gateMinInvestment. Source: the primary path of sylphie's
