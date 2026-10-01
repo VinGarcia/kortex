@@ -32,7 +32,7 @@ func decodeRequestMethod(r *http.Request) string {
 // Mcp-Session-Id header; notifications/initialized answers 202 empty; and
 // tools/list answers with a small typed catalog using names observed
 // without the mcp__openclaw__ prefix.
-func authHandshakeHandler(wantToken string, wantCaptureKey string) func(w http.ResponseWriter, r *http.Request) {
+func authHandshakeHandler(t *testing.T, wantToken string, wantCaptureKey string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+wantToken || r.Header.Get("x-openclaw-cli-capture-key") != wantCaptureKey {
 			w.Header().Set("Content-Type", "application/json")
@@ -54,6 +54,13 @@ func authHandshakeHandler(wantToken string, wantCaptureKey string) func(w http.R
 				{"name":"memory_search","description":"semantic memory search","inputSchema":{"type":"object","properties":{}}},
 				{"name":"ask_user","description":"ask the human user","inputSchema":{"type":"object","properties":{}}}
 			]}}`))
+		default:
+			// Safety net: any RPC outside the handshake sequence (including a
+			// method that failed to decode) is a test bug, not a valid case.
+			// t.Errorf (not Fatalf) because this runs in the server goroutine,
+			// where Fatalf's runtime.Goexit would not stop the test.
+			t.Errorf("fake server: unexpected method %q", decodeRequestMethod(r))
+			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}
 }
@@ -82,7 +89,7 @@ func TestClient_Handshake(t *testing.T) {
 				"Authorization":              "Bearer test-token",
 				"x-openclaw-cli-capture-key": "test-capture-key",
 			},
-			serverHandler: authHandshakeHandler("test-token", "test-capture-key"),
+			serverHandler: authHandshakeHandler(t, "test-token", "test-capture-key"),
 			checkResult: func(t *testing.T, result HandshakeResult) {
 				if result.ServerInfo.Name != "openclaw" || result.ServerInfo.Version != "0.1.0" {
 					t.Errorf("unexpected server info: %+v", result.ServerInfo)
@@ -113,7 +120,7 @@ func TestClient_Handshake(t *testing.T) {
 			headers: map[string]string{
 				"Authorization": "Bearer test-token",
 			},
-			serverHandler:   authHandshakeHandler("test-token", "test-capture-key"),
+			serverHandler:   authHandshakeHandler(t, "test-token", "test-capture-key"),
 			wantErrContains: []string{"401", "initialize"},
 		},
 		{
@@ -201,7 +208,7 @@ func TestClient_Handshake(t *testing.T) {
 // getenv over those placeholders, and confirm the resolved client completes
 // a real handshake against the fake server.
 func TestNewClientFromConfigFile_expandsEnvAndHandshakes(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(authHandshakeHandler("live-token", "live-capture-key")))
+	server := httptest.NewServer(http.HandlerFunc(authHandshakeHandler(t, "live-token", "live-capture-key")))
 	defer server.Close()
 
 	fakeEnv := map[string]string{
