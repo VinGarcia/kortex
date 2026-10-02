@@ -67,6 +67,10 @@ deps:
       # architecture review (tools already owns Definitions()/Dispatcher and
       # depends on anthropic; mcp must stay provider-agnostic/stdlib-only).
       - mcp
+      # F3d slice-3a: RunLoop emits its turns as stream-json via the protocol
+      # marshallers. protocol stays a stdlib-only leaf (it never imports back),
+      # so this edge keeps the one-way tools -> protocol direction.
+      - protocol
   loopsmoke:
     mayDependOn:
       - anthropic

@@ -22,6 +22,11 @@ type LoopRequest struct {
 	UserMessage string
 	// MaxTurns bounds tool_use round trips; 0 means DefaultMaxTurns.
 	MaxTurns int
+	// Emitter, when non-nil, receives the loop's turns as stream-json (NDJSON)
+	// events: system/init, one assistant event per turn, one user event per
+	// tool_result batch, and the terminal result. Nil disables emission, in
+	// which case RunLoop behaves exactly as it did before F3d.
+	Emitter *StreamEmitter
 }
 
 // LoopResult is the outcome of a completed tool-loop.
@@ -54,6 +59,10 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	messages := []anthropic.Message{{Role: "user", Content: req.UserMessage}}
 	tools := Definitions()
 
+	if err := req.Emitter.systemInit(); err != nil {
+		return LoopResult{}, err
+	}
+
 	for turn := 1; turn <= maxTurns; turn++ {
 		resp, err := client.CreateMessage(ctx, anthropic.MessageRequest{
 			Model:     req.Model,
@@ -65,21 +74,28 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		if err != nil {
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
-
-		if resp.StopReason != "tool_use" {
-			return LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn}, nil
+		if err := req.Emitter.assistant(resp); err != nil {
+			return LoopResult{}, err
 		}
 
 		toolUses := resp.ToolUseBlocks()
-		if len(toolUses) == 0 {
-			// stop_reason says tool_use but no tool_use block decoded; treat
-			// as resolved rather than looping forever on the same state.
-			return LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn}, nil
+		// stop_reason other than tool_use — or tool_use with no decodable block,
+		// which we treat as resolved rather than looping forever on the same
+		// state — ends the loop with the terminal result event.
+		if resp.StopReason != "tool_use" || len(toolUses) == 0 {
+			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn}
+			if err := req.Emitter.result(result, resp.Usage); err != nil {
+				return LoopResult{}, err
+			}
+			return result, nil
 		}
 
 		results := make([]anthropic.ToolResultBlock, len(toolUses))
 		for i, block := range toolUses {
 			results[i] = dispatcher.Execute(ctx, block)
+		}
+		if err := req.Emitter.toolResults(results); err != nil {
+			return LoopResult{}, err
 		}
 
 		messages = append(messages,
