@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -75,6 +77,53 @@ func TestResolveSuperegoModel(t *testing.T) {
 				t.Errorf("resolveSuperegoModel(%q) = %q, want %q", test.configured, got, test.want)
 			}
 		})
+	}
+}
+
+func TestStreamEmitterEnabled(t *testing.T) {
+	tests := []struct {
+		gate string
+		want bool
+	}{
+		{gate: "", want: false},
+		{gate: "0", want: false},
+		{gate: "off", want: false},
+		{gate: "no", want: false},
+		{gate: "anything-else", want: false},
+		{gate: "1", want: true},
+		{gate: "true", want: true},
+		{gate: "TRUE", want: true},
+		{gate: "yes", want: true},
+		{gate: " on ", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.gate, func(t *testing.T) {
+			if got := streamEmitterEnabled(test.gate); got != test.want {
+				t.Errorf("streamEmitterEnabled(%q) = %v, want %v", test.gate, got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildStreamEmitter(t *testing.T) {
+	newUUID := func() string { return "uuid-fixed" }
+
+	if got := buildStreamEmitter("", &bytes.Buffer{}, newUUID); got != nil {
+		t.Errorf("gate off: emitter = %v, want nil (dormant by default)", got)
+	}
+	if got := buildStreamEmitter("1", &bytes.Buffer{}, newUUID); got == nil {
+		t.Error("gate on: emitter = nil, want constructed")
+	}
+}
+
+func TestNewUUIDv4(t *testing.T) {
+	v4 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	first := newUUIDv4()
+	if !v4.MatchString(first) {
+		t.Fatalf("newUUIDv4() = %q, not a v4 uuid", first)
+	}
+	if second := newUUIDv4(); second == first {
+		t.Errorf("newUUIDv4() returned the same id twice: %q", first)
 	}
 }
 

@@ -122,6 +122,68 @@ func TestRunLoop_emitsStreamJSON(t *testing.T) {
 	}
 }
 
+// TestRunLoop_resultUsageCumulative proves the terminal result reports usage
+// summed across every turn, not just the last one. It drives a three-turn loop
+// (two tool_use turns then end_turn), each turn carrying distinct counters, and
+// reads the emitted result line's usage back to assert the per-counter total.
+func TestRunLoop_resultUsageCumulative(t *testing.T) {
+	turnUsages := []anthropic.Usage{
+		{InputTokens: 10, OutputTokens: 5, CacheReadInputTokens: 1, CacheCreationInputTokens: 2},
+		{InputTokens: 12, OutputTokens: 6, CacheReadInputTokens: 3, CacheCreationInputTokens: 4},
+		{InputTokens: 14, OutputTokens: 7, CacheReadInputTokens: 5, CacheCreationInputTokens: 6},
+	}
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := turnUsages[call]
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		body := map[string]any{
+			"usage": map[string]int{
+				"input_tokens":                u.InputTokens,
+				"output_tokens":               u.OutputTokens,
+				"cache_read_input_tokens":     u.CacheReadInputTokens,
+				"cache_creation_input_tokens": u.CacheCreationInputTokens,
+			},
+		}
+		if call < len(turnUsages) {
+			body["stop_reason"] = "tool_use"
+			body["content"] = []map[string]any{{"type": "tool_use", "id": "toolu_1", "name": "bash", "input": map[string]string{"command": "echo loop-ok"}}}
+		} else {
+			body["stop_reason"] = "end_turn"
+			body["content"] = []map[string]any{{"type": "text", "text": "done"}}
+		}
+		json.NewEncoder(w).Encode(body)
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-haiku-4-5-20251001",
+		MaxTokens:   1024,
+		UserMessage: "run echo loop-ok",
+		Emitter:     NewStreamEmitter(&out, "sess-1", sequencedUUIDs()),
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if result.Turns != len(turnUsages) {
+		t.Fatalf("Turns = %d, want %d", result.Turns, len(turnUsages))
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	var got struct {
+		Usage protocol.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal(lines[len(lines)-1], &got); err != nil {
+		t.Fatalf("decoding result line: %v\n%s", err, lines[len(lines)-1])
+	}
+	want := protocol.Usage{InputTokens: 36, OutputTokens: 18, CacheReadInputTokens: 9, CacheCreationInputTokens: 12}
+	if got.Usage != want {
+		t.Errorf("result usage = %+v, want %+v (sum of every turn)", got.Usage, want)
+	}
+}
+
 // TestRunLoop_nilEmitterSilent proves a nil Emitter leaves RunLoop's behavior
 // unchanged — no emission, same result — so the sink is purely additive.
 func TestRunLoop_nilEmitterSilent(t *testing.T) {

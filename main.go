@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/vingarcia/kortex/internal/facet"
 	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/proxy"
+	"github.com/vingarcia/kortex/internal/tools"
 )
 
 // Env vars OpenClaw uses to announce the FD carrying the auth secret
@@ -62,6 +64,7 @@ func main() {
 	} else {
 		facets.mcpClient = mcpClient
 	}
+	facets.streamEmitter = buildStreamEmitter(os.Getenv("KORTEX_STREAM_EMITTER"), os.Stdout, newUUIDv4)
 	var interceptor proxy.Interceptor
 	if facets.annotator != nil {
 		interceptor = facets.annotator
@@ -115,6 +118,12 @@ type builtFacets struct {
 	superego        *facet.Superego
 	logFile         *os.File
 	mcpClient       *mcp.Client
+	// streamEmitter is the F3d stream-json producer, constructed only when
+	// KORTEX_STREAM_EMITTER opts in and nil otherwise. Like mcpClient it is
+	// dormant: no consumer drives it on the production path yet (proxy.Run
+	// still owns stdout), so it is wired here ahead of the separately gated
+	// canary step that will make RunLoop the stdout producer.
+	streamEmitter *tools.StreamEmitter
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -278,6 +287,46 @@ func mcpConfigPathFromArgv(argv []string) string {
 		}
 	}
 	return ""
+}
+
+// buildStreamEmitter constructs the F3d stream-json producer over stdout when
+// the operator opts in through KORTEX_STREAM_EMITTER. It is DORMANT by default
+// (gate unset -> nil) and has no consumer yet: proxy.Run still owns stdout, so
+// making RunLoop the producer is a separate, canary-gated step. newUUID is
+// injected so main feeds newUUIDv4 while tests feed a deterministic sequence.
+func buildStreamEmitter(gate string, stdout io.Writer, newUUID func() string) *tools.StreamEmitter {
+	if !streamEmitterEnabled(gate) {
+		return nil
+	}
+	// A fresh claude-cli session mints its own session id and announces it in
+	// system/init; kortex-as-producer mints the same v4 id at the handshake.
+	return tools.NewStreamEmitter(stdout, newUUID(), newUUID)
+}
+
+// streamEmitterEnabled reads the KORTEX_STREAM_EMITTER gate. Only an explicit
+// affirmative turns the F3d producer on, so an unset or unrelated value keeps
+// the default pass-through path.
+func streamEmitterEnabled(gate string) bool {
+	switch strings.ToLower(strings.TrimSpace(gate)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// newUUIDv4 mints a random RFC 4122 v4 UUID for the stream-json identity the
+// protocol marshallers refuse to invent (the session id and each message
+// uuid). crypto/rand never fails on the platforms kortex runs on, so a read
+// error is unrecoverable rather than a case to degrade: panicking surfaces a
+// broken entropy source instead of emitting a predictable or malformed id.
+func newUUIDv4() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("kortex: reading random for uuid: %v", err))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func authFDsFromEnv() []int {

@@ -39,6 +39,9 @@ deps:
       # F3c slice-3: main builds the MCP client (--mcp-config argv + injected
       # getenv) in the composition root, same seam as anthropic's token.
       - mcp
+      # F3d slice-3b: main constructs the stream-json emitter (os.Stdout +
+      # injected uuid-v4) in the composition root, dormant behind an env gate.
+      - tools
   # proxy calls facets only through its own Interceptor interface (wired by
   # main); it must never import facet — the reverse direction is the rule.
   proxy:

@@ -63,6 +63,10 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		return LoopResult{}, err
 	}
 
+	// The terminal result reports usage summed across every turn, not just the
+	// last one: OpenClaw bills the round on the result's usage, so a multi-turn
+	// tool loop that reported only the final turn would under-count the round.
+	var totalUsage anthropic.Usage
 	for turn := 1; turn <= maxTurns; turn++ {
 		resp, err := client.CreateMessage(ctx, anthropic.MessageRequest{
 			Model:     req.Model,
@@ -74,6 +78,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		if err != nil {
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
+		totalUsage = sumUsage(totalUsage, resp.Usage)
 		if err := req.Emitter.assistant(resp); err != nil {
 			return LoopResult{}, err
 		}
@@ -84,7 +89,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		// state — ends the loop with the terminal result event.
 		if resp.StopReason != "tool_use" || len(toolUses) == 0 {
 			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn}
-			if err := req.Emitter.result(result, resp.Usage); err != nil {
+			if err := req.Emitter.result(result, totalUsage); err != nil {
 				return LoopResult{}, err
 			}
 			return result, nil
@@ -105,4 +110,14 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	}
 
 	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
+}
+
+// sumUsage returns the running total of two usage snapshots, counter by
+// counter, so RunLoop can accumulate every turn's usage into the round total.
+func sumUsage(a anthropic.Usage, b anthropic.Usage) anthropic.Usage {
+	a.InputTokens += b.InputTokens
+	a.OutputTokens += b.OutputTokens
+	a.CacheReadInputTokens += b.CacheReadInputTokens
+	a.CacheCreationInputTokens += b.CacheCreationInputTokens
+	return a
 }
