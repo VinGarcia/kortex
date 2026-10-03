@@ -28,6 +28,15 @@ import (
 // ids, token counts, cost, durations) are compared by presence/type, never by
 // value — a captured fixture's uuid can never equal a freshly emitted one.
 //
+// Scope boundary: "structural equivalence" here is bounded by what
+// internal/protocol models. The comparison only sees fields protocol.Event
+// exposes, so a wire field protocol.go does not model is invisible to this
+// test by construction. Concretely, claude's system/init carries tools, model,
+// mcp_servers, slash_commands, etc. that kortex's EmitSystemInit omits; both
+// collapse to {system,init} here. That is correct precisely because OpenClaw
+// (the F0 reader protocol.go mirrors) consumes only the modeled subset — this
+// test proves parity within that contract, not against the full claude payload.
+//
 // Two documented, deliberate differences are normalized away rather than
 // treated as divergences, because OpenClaw's read side tolerates both:
 //   - claude emits auxiliary events kortex has no analog for: rate_limit_event
@@ -138,6 +147,14 @@ func runKortexStream(t *testing.T, userMessage string, turns []string) []protoco
 	t.Helper()
 	call := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A scripted turn count that RunLoop overruns is a test-authoring bug;
+		// fail it cleanly (the client surfaces the 500 as a RunLoop error the
+		// caller's error check catches) rather than panicking on turns[call].
+		if call >= len(turns) {
+			t.Errorf("RunLoop made upstream call %d but only %d turn(s) were scripted", call+1, len(turns))
+			http.Error(w, "unexpected extra upstream call", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(turns[call]))
 		call++
