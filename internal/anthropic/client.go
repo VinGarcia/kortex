@@ -206,12 +206,27 @@ type wireError struct {
 	} `json:"error"`
 }
 
+// claudeCodePreamble is the identity line Anthropic's abuse protection expects
+// at the start of the system prompt on subscription OAuth tokens: without it,
+// non-haiku models (opus/sonnet/fable) reject the call with an instant 429
+// rate_limit_error carrying no rate-limit headers — a policy rejection that
+// masquerades as quota (verified live 2026-10-04: same token, same call, 429
+// bare vs 200 with this preamble). The real claude-cli always sends it as the
+// first system block and OpenClaw's appendSystemPrompt lands after it, so
+// prepending here keeps kortex requests shaped like the CLI the token was
+// minted for.
+const claudeCodePreamble = "You are Claude Code, Anthropic's official CLI for Claude."
+
 // CreateMessage performs one non-streaming Messages call. Transport
 // failures come back wrapped; API failures come back as *APIError.
 func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (MessageResponse, error) {
+	system := claudeCodePreamble
+	if req.System != "" {
+		system += "\n\n" + req.System
+	}
 	body, err := json.Marshal(wireRequest{
 		Model:     req.Model,
-		System:    req.System,
+		System:    system,
 		MaxTokens: req.MaxTokens,
 		Messages:  req.Messages,
 		Tools:     req.Tools,

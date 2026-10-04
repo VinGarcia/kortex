@@ -55,7 +55,9 @@ func TestCreateMessage_success(t *testing.T) {
 			t.Errorf("header %s = %q, want %q", name, got, want)
 		}
 	}
-	if gotBody["model"] != "claude-haiku-4-5-20251001" || gotBody["system"] != "system prompt" || gotBody["max_tokens"] != float64(2048) {
+	// The caller's system prompt must land AFTER the Claude Code preamble the
+	// subscription tokens require (see claudeCodePreamble).
+	if gotBody["model"] != "claude-haiku-4-5-20251001" || gotBody["system"] != claudeCodePreamble+"\n\nsystem prompt" || gotBody["max_tokens"] != float64(2048) {
 		t.Errorf("unexpected request body: %v", gotBody)
 	}
 	if resp.Text != `[{"investment":0}]` {

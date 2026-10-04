@@ -108,9 +108,12 @@ func TestRun_InitializeHandshakeAndSingleTurn(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// The system prompt must arrive from initialize, not argv.
-	if rec.lastSystem != "You are Sylphie." {
-		t.Errorf("system prompt = %q, want the one from initialize", rec.lastSystem)
+	// The system prompt must arrive from initialize, not argv — landing after
+	// the Claude Code preamble the anthropic client prepends for subscription
+	// tokens (see anthropic.claudeCodePreamble).
+	wantSystem := "You are Claude Code, Anthropic's official CLI for Claude.\n\nYou are Sylphie."
+	if rec.lastSystem != wantSystem {
+		t.Errorf("system prompt = %q, want %q", rec.lastSystem, wantSystem)
 	}
 
 	events := parseLines(t, out.String())
