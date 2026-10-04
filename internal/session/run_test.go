@@ -157,15 +157,23 @@ func TestRun_MultiTurnAccumulatesHistory(t *testing.T) {
 	if rec.lastMessageCount != 3 {
 		t.Errorf("second turn message count = %d, want 3 (prior user+assistant + new user)", rec.lastMessageCount)
 	}
-	// Two user turns => two terminal results.
-	results := 0
+	// Two user turns => two terminal results, but exactly ONE system/init for
+	// the whole session (the real claude-cli announces the session once at
+	// startup, not per turn).
+	results, inits := 0, 0
 	for _, ev := range parseLines(t, out.String()) {
-		if ev.Type == protocol.TypeResult {
+		switch {
+		case ev.Type == protocol.TypeResult:
 			results++
+		case ev.Type == protocol.TypeSystem && ev.Subtype == "init":
+			inits++
 		}
 	}
 	if results != 2 {
 		t.Errorf("terminal results = %d, want 2", results)
+	}
+	if inits != 1 {
+		t.Errorf("system/init count = %d, want exactly 1 for a multi-turn session", inits)
 	}
 }
 

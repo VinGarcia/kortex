@@ -23,6 +23,10 @@ type StreamEmitter struct {
 	w         io.Writer
 	sessionID string
 	newUUID   func() string
+	// initSent guards systemInit so a session that reuses one emitter across
+	// several RunLoop turns emits exactly one system/init — matching the real
+	// claude-cli, which announces the session once at startup, not per turn.
+	initSent bool
 }
 
 // NewStreamEmitter builds an emitter writing to w. sessionID and newUUID are
@@ -31,15 +35,21 @@ func NewStreamEmitter(w io.Writer, sessionID string, newUUID func() string) *Str
 	return &StreamEmitter{w: w, sessionID: sessionID, newUUID: newUUID}
 }
 
-// systemInit emits the system/init line that opens the round.
+// systemInit emits the system/init line that opens the session — once. RunLoop
+// calls it at the top of every turn, but a multi-turn session reuses a single
+// emitter, so the guard collapses those calls to one init (the real claude-cli
+// emits system/init once per session, not per user turn). A single-turn caller
+// (the -p path, the parity harness) builds a fresh emitter per RunLoop and so
+// still emits exactly one.
 func (e *StreamEmitter) systemInit() error {
-	if e == nil {
+	if e == nil || e.initSent {
 		return nil
 	}
 	line, err := protocol.EmitSystemInit(e.sessionID)
 	if err != nil {
 		return fmt.Errorf("tools: emitting system/init: %w", err)
 	}
+	e.initSent = true
 	return e.write(line)
 }
 

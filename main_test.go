@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -143,6 +144,35 @@ func TestNativeSessionID(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			if got := nativeSessionID(test.argv, newUUID); got != test.want {
 				t.Errorf("nativeSessionID(%v) = %q, want %q", test.argv, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRunNative_guardsFailFast(t *testing.T) {
+	// Both guards return before any Messages call, so empty stdin is enough.
+	tests := []struct {
+		desc string
+		env  map[string]string
+		argv []string
+	}{
+		{
+			desc: "missing token",
+			env:  map[string]string{},
+			argv: []string{"--model", "claude-opus-4-8"},
+		},
+		{
+			desc: "missing model",
+			env:  map[string]string{"CODECOMPANION_OAUTH_TOKEN": "secret"},
+			argv: []string{"-p", "hi"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			getenv := func(name string) string { return test.env[name] }
+			code := runNative(test.argv, getenv, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+			if code != 1 {
+				t.Errorf("runNative exit code = %d, want 1", code)
 			}
 		})
 	}

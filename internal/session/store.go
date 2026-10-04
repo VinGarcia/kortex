@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 
@@ -92,10 +93,13 @@ func (s *Store) path(sessionID string) string {
 
 // fileName maps a session id to a flat, traversal-safe filename: every
 // character outside [A-Za-z0-9._-] becomes '_'. OpenClaw's session ids are
-// already uuid-like, but sanitizing guards against a crafted id escaping the
-// state directory.
+// already uuid-like (all-safe), so they pass through unchanged. When any
+// character had to be replaced, a hash of the original id is appended so the
+// mapping stays injective — otherwise two distinct ids (e.g. "a/b" and "a_b")
+// would collide onto one file and silently cross-load each other's history.
 func fileName(sessionID string) string {
 	safe := make([]byte, 0, len(sessionID))
+	replaced := false
 	for i := 0; i < len(sessionID); i++ {
 		c := sessionID[i]
 		switch {
@@ -103,10 +107,18 @@ func fileName(sessionID string) string {
 			safe = append(safe, c)
 		default:
 			safe = append(safe, '_')
+			replaced = true
 		}
 	}
-	if len(safe) == 0 {
-		return "_"
+	if !replaced {
+		if len(safe) == 0 {
+			// An empty id can't collide with a real (non-empty) sanitized id,
+			// which always carries its hash suffix below.
+			return "_"
+		}
+		return string(safe)
 	}
-	return string(safe)
+	h := fnv.New64a()
+	h.Write([]byte(sessionID))
+	return fmt.Sprintf("%s-%016x", safe, h.Sum64())
 }

@@ -69,3 +69,23 @@ func TestStore_SaveSanitizesSessionID(t *testing.T) {
 		t.Errorf("Load after sanitized Save = %+v, err %v", got, err)
 	}
 }
+
+func TestStore_SanitizedIDsDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	// "a/b" and "a_b" both sanitize their unsafe/underscore char to '_'; without
+	// an injective mapping they would share one file and cross-load histories.
+	if err := store.Save("a/b", []anthropic.Message{{Role: "user", Content: "from a/b"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("a_b", []anthropic.Message{{Role: "user", Content: "from a_b"}}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Load("a/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Content != "from a/b" {
+		t.Errorf("a/b history = %+v, want its own content (cross-loaded from a_b?)", first)
+	}
+}

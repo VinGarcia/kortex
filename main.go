@@ -319,6 +319,14 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		fmt.Fprintln(stderr, "kortex: native mode needs CODECOMPANION_OAUTH_TOKEN; not set")
 		return 1
 	}
+	// OpenClaw always passes --model, but guard it up front: an empty model
+	// would otherwise fail every turn's Messages call, turning one clear
+	// misconfiguration into a stream of per-turn error results.
+	model := firstArgvValue(argv, "--model")
+	if model == "" {
+		fmt.Fprintln(stderr, "kortex: native mode needs --model in argv; not found")
+		return 1
+	}
 
 	// SIGINT/SIGTERM cancel the in-flight turn so the process exits promptly
 	// instead of blocking on a long Messages call.
@@ -340,7 +348,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		Dispatcher: dispatcher,
 		Store:      session.NewStore(nativeStateDir(getenv)),
 		SessionID:  sessionID,
-		Model:      firstArgvValue(argv, "--model"),
+		Model:      model,
 		MaxTokens:  defaultMaxTokens,
 		NewUUID:    newUUIDv4,
 		Diag:       stderr,
