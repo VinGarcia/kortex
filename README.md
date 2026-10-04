@@ -25,7 +25,13 @@ malformed output) forwards the original line untouched.
 ## Architecture
 
 Thin `main.go` (env/config wiring and facet construction — the composition
-root; all env reading happens here) over the internal packages:
+root; all env reading happens here) over the internal packages. `main`
+selects one of two peer code paths at startup: the default pass-through
+**proxy** (execs the real `claude`), or the **native** producer when
+`KORTEX_STREAM_EMITTER` is set (kortex speaks the stream-json protocol
+itself). Both build the same facets over the same shared packages
+(`protocol`, `history`, `config`, `anthropic`, `facet`); only the entry
+package differs — `proxy` versus `session`.
 
 - `internal/proxy` — process plumbing: resolves the real `claude` binary
   (avoiding self-resolution, since kortex installs under the name `claude`),
@@ -58,7 +64,30 @@ root; all env reading happens here) over the internal packages:
   observability mode: the stream is untouched) and computes the
   hypothetical gate decision; on a gate hit it triggers `Superego`, which
   reviews the turn against the whole canonical history in shadow mode —
-  the critique goes only to the facet log and in-memory metadata.
+  the critique goes only to the facet log and in-memory metadata. In the
+  superego's active mode, `ActiveSuperego` replaces that async shadow
+  review with a blocking governor that satisfies the native path's
+  `session.OutputGovernor`: it gates the core's draft (output evaluator →
+  deterministic gate) and, on a gate hit, runs the superego ladder
+  (`ReviewDraft`, up to `DefaultLadderRounds` rounds) — approve delivers
+  the draft, `hold_ask_human` delivers a hold-and-ask message instead,
+  `revise` feeds the critique back to the core for a redraft. The rejected
+  drafts and critiques live only in an ephemeral message tail, never
+  persisted to canonical history and never emitted on the stream.
+- `internal/session` — the native producer path, entered from
+  `main.runNative` when `KORTEX_STREAM_EMITTER` is set. Instead of execing
+  the real `claude`, `session.Run` reads the NDJSON stream-json protocol
+  from stdin, answers the initialize handshake, drives the tool-loop
+  (`internal/tools`) per user turn over the session's accumulated history,
+  emits stream-json on stdout, and persists history for cross-process
+  resume. It builds the same facets as the proxy path (`buildFacets`) and
+  defers the same post-run `WaitInFlight` drain. Its facet seams mirror the
+  proxy's: `session` defines its own `Annotator`, `TurnEvaluator` and
+  `OutputGovernor` ports, satisfied structurally by `facet` (never the
+  reverse), wired by `main`. On the active path the final turn is deferred
+  (`tools` RunLoop `DeferFinal`) so the governor decides the delivered text
+  before anything reaches the wire, then re-emitted via
+  `StreamEmitter.EmitFinalTurn`.
 
 Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
 `make lint`): `proxy` may import `protocol` and `history`; `history` may
@@ -66,7 +95,13 @@ import `protocol`; `facet` may import `protocol`, `anthropic` and `history`
 (read-only consumption of the canonical history: the proxy hands facets a
 `history.Snapshot` per completed turn via `proxy.TurnEvaluator`); never the
 reverse. `proxy` never imports `facet` — facets reach the pump only through
-the `proxy.Interceptor`/`proxy.TurnEvaluator` interfaces, wired by `main`. Wire-format knowledge
+the `proxy.Interceptor`/`proxy.TurnEvaluator` interfaces, wired by `main`.
+On the native path `session` may import `protocol`, `tools`, `anthropic`
+and `history`; `tools` may import `anthropic`, `mcp` and `protocol`; never
+the reverse. Like the proxy, `session` never imports `facet` — the input
+annotator, output evaluator and active governor reach it only through the
+`session.Annotator`, `session.TurnEvaluator` and `session.OutputGovernor`
+ports `session` defines, wired by `main`. Wire-format knowledge
 stays in `protocol` (facets rewrite message text via
 `protocol.RewriteUserText`, never raw envelope bytes). The packages receive
 everything (paths, tokens, timeouts) through parameters — `main` translates
