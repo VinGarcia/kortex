@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -105,14 +104,79 @@ func TestStreamEmitterEnabled(t *testing.T) {
 	}
 }
 
-func TestBuildStreamEmitter(t *testing.T) {
-	newUUID := func() string { return "uuid-fixed" }
-
-	if got := buildStreamEmitter("", &bytes.Buffer{}, newUUID); got != nil {
-		t.Errorf("gate off: emitter = %v, want nil (dormant by default)", got)
+func TestFirstArgvValue(t *testing.T) {
+	tests := []struct {
+		desc string
+		argv []string
+		flag string
+		want string
+	}{
+		{desc: "space-separated", argv: []string{"--model", "claude-opus-4-8"}, flag: "--model", want: "claude-opus-4-8"},
+		{desc: "equals-joined", argv: []string{"--model=claude-sonnet-5"}, flag: "--model", want: "claude-sonnet-5"},
+		{desc: "absent", argv: []string{"-p", "hi"}, flag: "--model", want: ""},
+		{desc: "flag is last element, no value", argv: []string{"--model"}, flag: "--model", want: ""},
+		{desc: "first occurrence wins", argv: []string{"--model", "a", "--model", "b"}, flag: "--model", want: "a"},
 	}
-	if got := buildStreamEmitter("1", &bytes.Buffer{}, newUUID); got == nil {
-		t.Error("gate on: emitter = nil, want constructed")
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := firstArgvValue(test.argv, test.flag); got != test.want {
+				t.Errorf("firstArgvValue(%v, %q) = %q, want %q", test.argv, test.flag, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNativeSessionID(t *testing.T) {
+	const minted = "minted-uuid"
+	newUUID := func() string { return minted }
+	tests := []struct {
+		desc string
+		argv []string
+		want string
+	}{
+		{desc: "--session-id for a fresh session", argv: []string{"--session-id", "sess-1"}, want: "sess-1"},
+		{desc: "--resume for a continuation", argv: []string{"--resume", "sess-2"}, want: "sess-2"},
+		{desc: "--session-id wins over --resume", argv: []string{"--resume", "r", "--session-id", "s"}, want: "s"},
+		{desc: "neither present: minted", argv: []string{"-p", "hi"}, want: minted},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := nativeSessionID(test.argv, newUUID); got != test.want {
+				t.Errorf("nativeSessionID(%v) = %q, want %q", test.argv, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNativeStateDir(t *testing.T) {
+	tests := []struct {
+		desc string
+		env  map[string]string
+		want string
+	}{
+		{
+			desc: "explicit KORTEX_STATE_DIR wins",
+			env:  map[string]string{"KORTEX_STATE_DIR": "/custom/state"},
+			want: "/custom/state",
+		},
+		{
+			desc: "XDG_STATE_HOME base",
+			env:  map[string]string{"XDG_STATE_HOME": "/xdg"},
+			want: "/xdg/kortex/sessions",
+		},
+		{
+			desc: "HOME fallback",
+			env:  map[string]string{"HOME": "/home/u"},
+			want: "/home/u/.local/state/kortex/sessions",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			getenv := func(name string) string { return test.env[name] }
+			if got := nativeStateDir(getenv); got != test.want {
+				t.Errorf("nativeStateDir = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

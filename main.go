@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
@@ -15,6 +18,7 @@ import (
 	"github.com/vingarcia/kortex/internal/facet"
 	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/proxy"
+	"github.com/vingarcia/kortex/internal/session"
 	"github.com/vingarcia/kortex/internal/tools"
 )
 
@@ -26,6 +30,15 @@ var authFDEnvVars = []string{
 }
 
 func main() {
+	// F3d flip: when the operator opts in through KORTEX_STREAM_EMITTER, kortex
+	// does NOT exec the real claude-cli. It runs the session natively — reading
+	// the NDJSON protocol from stdin, driving the tool-loop, and producing
+	// stream-json on stdout — so OpenClaw cannot tell it apart from the real CLI.
+	// Unset/non-affirmative keeps the byte-identical passthrough below untouched.
+	if streamEmitterEnabled(os.Getenv("KORTEX_STREAM_EMITTER")) {
+		os.Exit(runNative(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	selfPath, err := os.Executable()
 	if err != nil {
 		selfPath = os.Args[0]
@@ -64,7 +77,6 @@ func main() {
 	} else {
 		facets.mcpClient = mcpClient
 	}
-	facets.streamEmitter = buildStreamEmitter(os.Getenv("KORTEX_STREAM_EMITTER"), os.Stdout, newUUIDv4)
 	var interceptor proxy.Interceptor
 	if facets.annotator != nil {
 		interceptor = facets.annotator
@@ -118,12 +130,6 @@ type builtFacets struct {
 	superego        *facet.Superego
 	logFile         *os.File
 	mcpClient       *mcp.Client
-	// streamEmitter is the F3d stream-json producer, constructed only when
-	// KORTEX_STREAM_EMITTER opts in and nil otherwise. Like mcpClient it is
-	// dormant: no consumer drives it on the production path yet (proxy.Run
-	// still owns stdout), so it is wired here ahead of the separately gated
-	// canary step that will make RunLoop the stdout producer.
-	streamEmitter *tools.StreamEmitter
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -271,13 +277,17 @@ func buildMCPClient(argv []string, getenv func(string) string) (*mcp.Client, err
 
 // mcpConfigPathFromArgv scans argv for the "--mcp-config" flag OpenClaw
 // passes the subprocess-CLI (kortex, impersonating claude-cli) alongside
-// "--strict-mcp-config" (§F3c LIVE HANDSHAKE DUMP). It accepts both the
-// space-separated form ("--mcp-config", "<path>", observed) and the
-// "--mcp-config=<path>" form (not observed, but cheap to also accept and
-// avoids a silent miss if claude-cli's flag parser allows it). Returns ""
-// when the flag is absent.
+// "--strict-mcp-config" (§F3c LIVE HANDSHAKE DUMP). Returns "" when absent.
 func mcpConfigPathFromArgv(argv []string) string {
-	const flag = "--mcp-config"
+	return firstArgvValue(argv, "--mcp-config")
+}
+
+// firstArgvValue returns the value of flag in argv, accepting both the
+// space-separated form ("--flag", "value", as OpenClaw passes --mcp-config and
+// --model) and the "--flag=value" form (cheap to also accept, avoids a silent
+// miss if claude-cli's parser allows it). Returns "" when the flag is absent or
+// is the last element with no following value.
+func firstArgvValue(argv []string, flag string) string {
 	for i, arg := range argv {
 		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
 			return value
@@ -289,18 +299,105 @@ func mcpConfigPathFromArgv(argv []string) string {
 	return ""
 }
 
-// buildStreamEmitter constructs the F3d stream-json producer over stdout when
-// the operator opts in through KORTEX_STREAM_EMITTER. It is DORMANT by default
-// (gate unset -> nil) and has no consumer yet: proxy.Run still owns stdout, so
-// making RunLoop the producer is a separate, canary-gated step. newUUID is
-// injected so main feeds newUUIDv4 while tests feed a deterministic sequence.
-func buildStreamEmitter(gate string, stdout io.Writer, newUUID func() string) *tools.StreamEmitter {
-	if !streamEmitterEnabled(gate) {
-		return nil
+// defaultMaxTokens caps each native turn's response length. It is fixed in v0
+// (no env override): 8192 is safely within every current model's output ceiling
+// and large enough for the tool-driving turns the canary targets.
+const defaultMaxTokens = 8192
+
+// runNative runs the F3d producer path: kortex speaks the stream-json protocol
+// itself instead of execing the real claude-cli. It wires the composition-root
+// dependencies (Anthropic client from CODECOMPANION_OAUTH_TOKEN, the builtin +
+// MCP tool dispatcher, the per-session history store) and hands them to
+// session.Run. Returns the process exit code.
+//
+// v0 limitations (documented for the flip): no hook callbacks fire on this path
+// (OpenClaw's declared user-scope hooks simply don't run), and interrupts and
+// permission prompts are not implemented — kortex drives its own tools.
+func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
+	token := getenv("CODECOMPANION_OAUTH_TOKEN")
+	if token == "" {
+		fmt.Fprintln(stderr, "kortex: native mode needs CODECOMPANION_OAUTH_TOKEN; not set")
+		return 1
 	}
-	// A fresh claude-cli session mints its own session id and announces it in
-	// system/init; kortex-as-producer mints the same v4 id at the handshake.
-	return tools.NewStreamEmitter(stdout, newUUID(), newUUID)
+
+	// SIGINT/SIGTERM cancel the in-flight turn so the process exits promptly
+	// instead of blocking on a long Messages call.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
+	// legitimate long generation (a deep tool loop) must not be cut off, and
+	// OpenClaw owns the outer round deadline.
+	client := anthropic.NewClient(token, "", 0)
+
+	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
+
+	sessionID := nativeSessionID(argv, newUUIDv4)
+	err := session.Run(ctx, session.Config{
+		Stdin:      stdin,
+		Stdout:     stdout,
+		Client:     client,
+		Dispatcher: dispatcher,
+		Store:      session.NewStore(nativeStateDir(getenv)),
+		SessionID:  sessionID,
+		Model:      firstArgvValue(argv, "--model"),
+		MaxTokens:  defaultMaxTokens,
+		NewUUID:    newUUIDv4,
+		Diag:       stderr,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// buildNativeDispatcher wires the tool dispatcher for the native path: the
+// builtins always, plus the gateway's MCP tools when --mcp-config is present and
+// the handshake succeeds. A missing config or a failed handshake degrades to
+// builtins-only (warn, fail-open) rather than aborting the session — the canary
+// stays useful for shell/git/fs work even if the loopback server is unreachable.
+func buildNativeDispatcher(ctx context.Context, argv []string, getenv func(string) string, stderr io.Writer) *tools.Dispatcher {
+	client, err := buildMCPClient(argv, getenv)
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: mcp tools disabled: %v\n", err)
+		return tools.NewDispatcher()
+	}
+	if client == nil {
+		return tools.NewDispatcher()
+	}
+	handshake, err := client.Handshake(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: mcp tools disabled: handshake failed: %v\n", err)
+		return tools.NewDispatcher()
+	}
+	return tools.NewDispatcherWithMCP(client, handshake.Tools)
+}
+
+// nativeSessionID resolves the session id this process owns from argv
+// (--session-id for a fresh session, --resume for a continuation), falling back
+// to a freshly minted v4 id when OpenClaw passed neither.
+func nativeSessionID(argv []string, newUUID func() string) string {
+	if id := firstArgvValue(argv, "--session-id"); id != "" {
+		return id
+	}
+	if id := firstArgvValue(argv, "--resume"); id != "" {
+		return id
+	}
+	return newUUID()
+}
+
+// nativeStateDir resolves where per-session history is persisted:
+// KORTEX_STATE_DIR when set, else ${XDG_STATE_HOME:-$HOME/.local/state}/kortex/sessions.
+func nativeStateDir(getenv func(string) string) string {
+	if dir := getenv("KORTEX_STATE_DIR"); dir != "" {
+		return dir
+	}
+	base := getenv("XDG_STATE_HOME")
+	if base == "" {
+		base = filepath.Join(getenv("HOME"), ".local", "state")
+	}
+	return filepath.Join(base, "kortex", "sessions")
 }
 
 // streamEmitterEnabled reads the KORTEX_STREAM_EMITTER gate. Only an explicit
