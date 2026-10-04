@@ -2,6 +2,7 @@ package facet
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/vingarcia/kortex/internal/history"
@@ -88,6 +89,38 @@ func draftUnderReviewMessage(paragraphs []string, tags []ParagraphAnnotation) st
 		b.WriteString("\n\nÂncoras `about` do avaliador (a que trecho cada emoção se refere), por parágrafo, JSON: ")
 		b.WriteString(abouts)
 	}
+	return b.String()
+}
+
+// activeDraftMessage renders the draft-under-review for the active loop: the
+// deterministic draftUnderReviewMessage, prefixed with the ladder round number
+// and the annotations from previous rounds. The superego prompt expects both
+// (it is told "the review round number (1 to 4) and the annotations from
+// previous rounds"), and the round number is what enforces the 3+1 contract —
+// revise only in rounds 1-3, hold-and-ask only in round 4. prior is the
+// critiques of the earlier rounds in order; empty on round 1. The header is
+// deterministic (fixed strings), never model-generated.
+func activeDraftMessage(paragraphs []string, tags []ParagraphAnnotation, round int, prior []SuperegoCritique) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Rodada de revisão: %d de 4.\n", round)
+	if round >= 4 {
+		b.WriteString("Esta é a última rodada: você só pode APROVAR ou RETER-E-PERGUNTAR-AO-HUMANO (hold_ask_human); não emita novas anotações de revisão.\n")
+	}
+	if len(prior) > 0 {
+		b.WriteString("\nAnotações das rodadas anteriores (o rascunho abaixo já tentou incorporá-las):\n")
+		for i, crit := range prior {
+			fmt.Fprintf(&b, "- Rodada %d", i+1)
+			if crit.Why != "" {
+				fmt.Fprintf(&b, " (%s)", crit.Why)
+			}
+			b.WriteString(":\n")
+			for _, ann := range crit.Annotations {
+				fmt.Fprintf(&b, "  - parágrafo %d: %s — %s\n", ann.Paragraph, ann.Issue, ann.Why)
+			}
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(draftUnderReviewMessage(paragraphs, tags))
 	return b.String()
 }
 

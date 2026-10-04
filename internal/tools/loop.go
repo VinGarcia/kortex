@@ -34,6 +34,14 @@ type LoopRequest struct {
 	// tool_result batch, and the terminal result. Nil disables emission, in
 	// which case RunLoop behaves exactly as it did before F3d.
 	Emitter *StreamEmitter
+	// DeferFinal, when true, suppresses the emission of the FINAL turn's
+	// assistant event and the terminal result: RunLoop returns the resolved
+	// LoopResult without putting the final draft on the wire, leaving the caller
+	// (the active superego loop) to govern the draft and re-emit the delivered
+	// text via StreamEmitter.EmitFinalTurn. Intermediate tool_use assistant
+	// events and their tool_result turns are still emitted live. With DeferFinal
+	// false the emission is byte-for-byte what it was before this field existed.
+	DeferFinal bool
 }
 
 // LoopResult is the outcome of a completed tool-loop.
@@ -52,6 +60,11 @@ type LoopResult struct {
 	// History to continue the conversation (in-process or persisted across a
 	// restart).
 	Messages []anthropic.Message
+	// Usage is this turn's usage summed across every round trip — the same total
+	// the terminal result reports. A DeferFinal caller needs it to bill the round
+	// on its own re-emitted result (EmitFinalTurn), since RunLoop did not emit
+	// the result itself.
+	Usage anthropic.Usage
 }
 
 // RunLoop ports the F3a spike's tool_use/tool_result cycle
@@ -99,20 +112,33 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		if err != nil {
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
-		totalUsage = sumUsage(totalUsage, resp.Usage)
-		if err := req.Emitter.assistant(resp); err != nil {
-			return LoopResult{}, err
-		}
+		totalUsage = totalUsage.Add(resp.Usage)
 
 		toolUses := resp.ToolUseBlocks()
 		// stop_reason other than tool_use — or tool_use with no decodable block,
 		// which we treat as resolved rather than looping forever on the same
 		// state — ends the loop with the terminal result event.
-		if resp.StopReason != "tool_use" || len(toolUses) == 0 {
-			messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
-			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn, Messages: messages}
-			if err := req.Emitter.result(result, totalUsage); err != nil {
+		isFinal := resp.StopReason != "tool_use" || len(toolUses) == 0
+
+		// The final turn's assistant event is deferred when DeferFinal is set (the
+		// caller re-emits the governed text); every intermediate tool_use assistant
+		// event is always emitted live. With DeferFinal false this fires on every
+		// turn exactly as before.
+		if !(isFinal && req.DeferFinal) {
+			if err := req.Emitter.assistant(resp); err != nil {
 				return LoopResult{}, err
+			}
+		}
+
+		if isFinal {
+			messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
+			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn, Messages: messages, Usage: totalUsage}
+			// The terminal result is deferred alongside the final assistant event:
+			// the caller governs the draft and emits both via EmitFinalTurn.
+			if !req.DeferFinal {
+				if err := req.Emitter.result(result, totalUsage); err != nil {
+					return LoopResult{}, err
+				}
 			}
 			return result, nil
 		}
@@ -132,14 +158,4 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	}
 
 	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
-}
-
-// sumUsage returns the running total of two usage snapshots, counter by
-// counter, so RunLoop can accumulate every turn's usage into the round total.
-func sumUsage(a anthropic.Usage, b anthropic.Usage) anthropic.Usage {
-	a.InputTokens += b.InputTokens
-	a.OutputTokens += b.OutputTokens
-	a.CacheReadInputTokens += b.CacheReadInputTokens
-	a.CacheCreationInputTokens += b.CacheCreationInputTokens
-	return a
 }

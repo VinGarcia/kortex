@@ -197,17 +197,72 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 		return
 	}
 
-	messages := superegoMessages(snapshot, turnIndex, draftUnderReviewMessage(draftParagraphs, tags), s.maxHistoryTurns)
-
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
+	messages := superegoMessages(snapshot, turnIndex, draftUnderReviewMessage(draftParagraphs, tags), s.maxHistoryTurns)
+	critique, entry, err := s.converse(ctx, turnIndex, 0, messages)
+	s.log.record(entry)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.turns[turnIndex] = critique
+	s.mu.Unlock()
+}
+
+// ReviewDraft runs ONE superego review synchronously and returns the critique.
+// Unlike Review (shadow, async, fire-and-forget, log-only), this is the
+// active-loop primitive: the caller is the blocking core↔superego loop and
+// consumes the verdict to decide approve/revise/hold. round is the ladder
+// round (1-4), surfaced to the model alongside the prior rounds' critiques so
+// it honors the 3+1 contract (revise only in rounds 1-3, hold only in round
+// 4). ok is false (with a logged reason) only when the review could not run at
+// all (bad input, API error, timeout); the loop fails open on false. A
+// successful call with an unparseable verdict returns ok=true and an empty
+// Verdict — the loop treats that as fail-open too. draftParagraphs and tags
+// come from the SAME segmentation the evaluator committed to, so index i tags
+// paragraph i. The caller owns the context deadline.
+func (s *Superego) ReviewDraft(
+	ctx context.Context,
+	turnIndex int,
+	snapshot history.Snapshot,
+	round int,
+	prior []SuperegoCritique,
+	draftParagraphs []string,
+	tags []ParagraphAnnotation,
+) (SuperegoCritique, bool) {
+	if turnIndex < 0 || turnIndex >= len(snapshot.Turns) {
+		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, Round: round, Err: fmt.Sprintf("turn index %d outside snapshot of %d turns", turnIndex, len(snapshot.Turns))})
+		return SuperegoCritique{}, false
+	}
+	if len(draftParagraphs) == 0 || len(draftParagraphs) != len(tags) {
+		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, Round: round, Err: fmt.Sprintf("draft/tags mismatch: %d paragraphs, %d tags", len(draftParagraphs), len(tags))})
+		return SuperegoCritique{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	messages := superegoMessages(snapshot, turnIndex, activeDraftMessage(draftParagraphs, tags, round, prior), s.maxHistoryTurns)
+	critique, entry, err := s.converse(ctx, turnIndex, round, messages)
+	s.log.record(entry)
+	if err != nil {
+		return SuperegoCritique{}, false
+	}
+	return critique, true
+}
+
+// converse makes the superego's model call and builds both the critique and
+// the log entry, shared by the shadow (Review) and active (ReviewDraft) paths.
+// It never records the entry itself — the caller does, after deciding what
+// else to do with the result. round 0 means the shadow path (no ladder round).
+func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messages []ReviewMessage) (SuperegoCritique, callLog, error) {
 	start := time.Now()
 	eval, err := s.conversant.Converse(ctx, s.systemPrompt, messages)
 	entry := callLog{
 		Facet:           superegoFacet,
 		Model:           s.model,
 		TurnIndex:       &turnIndex,
+		Round:           round,
 		LatencyMs:       time.Since(start).Milliseconds(),
 		HistoryMessages: len(messages),
 		StopReason:      eval.StopReason,
@@ -216,26 +271,20 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 	}
 	if err != nil {
 		entry.Err = err.Error()
-		s.log.record(entry)
-		return
+		return SuperegoCritique{}, entry, err
 	}
-
 	critique := SuperegoCritique{TurnIndex: turnIndex, Critique: eval.Text}
 	if verdict, ok := parseSuperegoVerdict(eval.Text); ok {
 		critique.Verdict = verdict.Verdict
 		critique.Annotations = verdict.Annotations
 		critique.Why = verdict.Why
 	}
-	s.mu.Lock()
-	s.turns[turnIndex] = critique
-	s.mu.Unlock()
-
 	entry.OK = true
 	entry.Critique = critique.Critique
 	entry.Verdict = critique.Verdict
 	entry.SuperegoAnnotations = critique.Annotations
 	entry.SuperegoWhy = critique.Why
-	s.log.record(entry)
+	return critique, entry, nil
 }
 
 // superegoVerdict is the JSON object of the superego prompt contract.
@@ -245,10 +294,21 @@ type superegoVerdict struct {
 	Why         string               `json:"why"`
 }
 
+// The superego verdict vocabulary — the single source for the strings the
+// prompt contract emits and the active loop switches on. Defining them here
+// (next to validVerdicts, which gates parsing) keeps the map and the loop's
+// switch from drifting: a rename touches one place, and a typo in the loop is a
+// compile error instead of a silent fall-through to fail-open delivery.
+const (
+	VerdictApprove      = "approve"
+	VerdictRevise       = "revise"
+	VerdictHoldAskHuman = "hold_ask_human"
+)
+
 var validVerdicts = map[string]bool{
-	"approve":        true,
-	"revise":         true,
-	"hold_ask_human": true,
+	VerdictApprove:      true,
+	VerdictRevise:       true,
+	VerdictHoldAskHuman: true,
 }
 
 // parseSuperegoVerdict best-effort extracts the verdict object from the raw

@@ -112,30 +112,31 @@ func (e *OutputEvaluator) TurnEmotions() map[int]TurnEmotion {
 	return out
 }
 
-// evaluateTurn runs one evaluation end to end: evaluator call, contract
-// validation, aggregate + hypothetical gate decision, log + metadata
-// retention. Every failure path ends in a log entry and nothing else.
-func (e *OutputEvaluator) evaluateTurn(turnIndex int, snapshot history.Snapshot) {
-	defer func() {
-		// A panic here runs on a private goroutine: without this recover it
-		// would kill the whole proxy, which is the one thing a facet must
-		// never do.
-		if r := recover(); r != nil {
-			e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Err: fmt.Sprintf("panic: %v", r)})
-		}
-	}()
+// DraftEvaluation is the synchronous output-evaluation result the active
+// superego loop consumes: the paragraph segmentation the evaluator committed
+// to (so index i tags paragraph i), the per-paragraph tags, the gate aggregate
+// and its decision.
+type DraftEvaluation struct {
+	Paragraphs    []string
+	Tags          []ParagraphAnnotation
+	Aggregate     Aggregate
+	GateWouldFire bool
+}
 
-	if turnIndex < 0 || turnIndex >= len(snapshot.Turns) {
-		e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Err: fmt.Sprintf("turn index %d outside snapshot of %d turns", turnIndex, len(snapshot.Turns))})
-		return
-	}
-	paragraphs := segmentParagraphs(snapshot.Turns[turnIndex].AssistantText)
+// EvaluateDraft runs the output emotion evaluator over one draft text
+// synchronously and returns the gate decision. The bool is false (with a
+// logged reason) when the evaluator could not produce a decision; the active
+// superego loop fails open on false. It logs one call line exactly like the
+// async path. turnIndex is for logging only (the draft may be a revised
+// candidate not yet in any snapshot). The caller owns the context deadline.
+func (e *OutputEvaluator) EvaluateDraft(ctx context.Context, turnIndex int, draft string) (DraftEvaluation, bool) {
+	paragraphs := segmentParagraphs(draft)
 	if len(paragraphs) == 0 {
 		e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Skipped: "turn has no assistant text"})
-		return
+		return DraftEvaluation{}, false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
+	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
 	start := time.Now()
@@ -154,29 +155,63 @@ func (e *OutputEvaluator) evaluateTurn(turnIndex int, snapshot history.Snapshot)
 	if err != nil {
 		entry.Err = err.Error()
 		e.log.record(entry)
-		return
+		return DraftEvaluation{}, false
 	}
 
 	jsonArray := extractJSONArray(eval.Text)
 	if jsonArray == "" {
 		entry.Err = "no JSON array in evaluator output"
 		e.log.record(entry)
-		return
+		return DraftEvaluation{}, false
 	}
 	annotations, err := parseAnnotations(jsonArray, len(paragraphs))
 	if err != nil {
 		entry.Err = err.Error()
 		e.log.record(entry)
-		return
+		return DraftEvaluation{}, false
 	}
 
 	agg := aggregate(annotations)
 	fire := gateWouldFire(agg, e.gateMinInvestment)
+
+	entry.OK = true
+	entry.Tags = annotations
+	entry.Aggregate = &agg
+	entry.GateWouldFire = &fire
+	e.log.record(entry)
+	return DraftEvaluation{Paragraphs: paragraphs, Tags: annotations, Aggregate: agg, GateWouldFire: fire}, true
+}
+
+// evaluateTurn runs one async (shadow-mode) evaluation end to end over a
+// completed turn's text: it reuses EvaluateDraft for the evaluator call and
+// gate decision, retains the per-turn metadata, and — on a gate hit — fires
+// the shadow superego review. Every failure path ends in a log entry (inside
+// EvaluateDraft) and nothing else.
+func (e *OutputEvaluator) evaluateTurn(turnIndex int, snapshot history.Snapshot) {
+	defer func() {
+		// A panic here runs on a private goroutine: without this recover it
+		// would kill the whole proxy, which is the one thing a facet must
+		// never do.
+		if r := recover(); r != nil {
+			e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Err: fmt.Sprintf("panic: %v", r)})
+		}
+	}()
+
+	if turnIndex < 0 || turnIndex >= len(snapshot.Turns) {
+		e.log.record(callLog{Facet: outputEvaluatorFacet, Model: e.model, TurnIndex: &turnIndex, Err: fmt.Sprintf("turn index %d outside snapshot of %d turns", turnIndex, len(snapshot.Turns))})
+		return
+	}
+
+	de, ok := e.EvaluateDraft(context.Background(), turnIndex, snapshot.Turns[turnIndex].AssistantText)
+	if !ok {
+		return
+	}
+
 	emotion := TurnEmotion{
 		TurnIndex:     turnIndex,
-		Tags:          annotations,
-		Aggregate:     agg,
-		GateWouldFire: fire,
+		Tags:          de.Tags,
+		Aggregate:     de.Aggregate,
+		GateWouldFire: de.GateWouldFire,
 	}
 	e.mu.Lock()
 	e.turns[turnIndex] = emotion
@@ -185,13 +220,7 @@ func (e *OutputEvaluator) evaluateTurn(turnIndex int, snapshot history.Snapshot)
 	// The F2d shadow trigger: one superego review per gate hit. Review
 	// dispatches its own goroutine, so this evaluation goroutine's lifetime
 	// never stretches to the (much longer) superego call.
-	if fire && e.superego != nil {
-		e.superego.Review(turnIndex, snapshot, paragraphs, annotations)
+	if de.GateWouldFire && e.superego != nil {
+		e.superego.Review(turnIndex, snapshot, de.Paragraphs, de.Tags)
 	}
-
-	entry.OK = true
-	entry.Tags = annotations
-	entry.Aggregate = &agg
-	entry.GateWouldFire = &fire
-	e.log.record(entry)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/history"
@@ -29,6 +30,28 @@ type Annotator interface {
 // skips evaluation.
 type TurnEvaluator interface {
 	EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot)
+}
+
+// OutputGovernor is the facet seam for the active superego loop: it runs
+// SYNCHRONOUSLY before the turn's final assistant/result events are emitted and
+// decides the text to deliver. Given the core's draft, it runs the blocking
+// evaluate→review→revise ladder and returns the governed text (an approved
+// draft, a later redraft, or — when held is true — a hold-and-ask message
+// delivered instead of the draft). redraft lets the governor ask the CORE model
+// for a new draft, given an ephemeral message tail (the rejected drafts and the
+// superego critiques) appended to the turn's canonical messages; that tail is
+// never persisted and never emitted. This interface is defined here with an
+// inline func type and only shared types (context/history/anthropic), so
+// facet.ActiveSuperego satisfies it structurally without session importing
+// facet. A nil Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
+type OutputGovernor interface {
+	GovernOutput(
+		ctx context.Context,
+		turnIndex int,
+		snapshot history.Snapshot,
+		draft string,
+		redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+	) (text string, held bool)
 }
 
 // maxLineBytes bounds one NDJSON input line. The default bufio.Scanner cap
@@ -70,8 +93,17 @@ type Config struct {
 	Annotator Annotator
 	// TurnEvaluator, when non-nil, is notified of each completed turn over the
 	// session's accumulated history (the output-evaluator facet, which in turn
-	// fires the superego on a gate hit). Nil skips evaluation.
+	// fires the superego on a gate hit). Nil skips evaluation. In active-superego
+	// mode this is left nil: the governor already evaluates synchronously, so the
+	// async shadow evaluation would be redundant work on the same draft.
 	TurnEvaluator TurnEvaluator
+	// Governor, when non-nil, puts the session on the active-superego path: the
+	// final turn is deferred (RunLoop DeferFinal), the governor decides the text
+	// to deliver, and the delivered text — not the core's raw draft — is emitted
+	// and persisted. Nil keeps the plain path (final turn emitted directly by
+	// RunLoop). Governor and the async TurnEvaluator are mutually exclusive by
+	// construction in the composition root.
+	Governor OutputGovernor
 }
 
 // Run drives a native kortex session: it reads the OpenClaw NDJSON protocol
@@ -142,7 +174,7 @@ func Run(ctx context.Context, cfg Config) error {
 				userText = cfg.Annotator.Annotate(userText)
 			}
 			var turn *history.Turn
-			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, userText)
+			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, userText)
 			if err != nil {
 				return err
 			}
@@ -174,6 +206,7 @@ func runTurn(
 	emitter *tools.StreamEmitter,
 	systemPrompt string,
 	msgs []anthropic.Message,
+	priorTurns []history.Turn,
 	userText string,
 ) ([]anthropic.Message, *history.Turn, error) {
 	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
@@ -183,6 +216,9 @@ func runTurn(
 		History:     msgs,
 		UserMessage: userText,
 		Emitter:     emitter,
+		// The active path defers the final turn so the governor can decide the
+		// delivered text before anything reaches the wire.
+		DeferFinal: cfg.Governor != nil,
 	})
 	if err != nil {
 		if emitErr := emitter.ErrorResult(fmt.Sprintf("kortex: %v", err)); emitErr != nil {
@@ -191,24 +227,116 @@ func runTurn(
 		diagf(cfg.Diag, "session: turn failed, round closed with error result: %v", err)
 		return msgs, nil, nil
 	}
-	if err := cfg.Store.Save(cfg.SessionID, res.Messages); err != nil {
+
+	finalText := res.FinalText
+	finalMessages := res.Messages
+	if cfg.Governor != nil {
+		var govErr error
+		finalText, finalMessages, govErr = governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, userText, res)
+		if govErr != nil {
+			return nil, nil, govErr
+		}
+	}
+
+	if err := cfg.Store.Save(cfg.SessionID, finalMessages); err != nil {
 		// The turn already succeeded and its result reached OpenClaw; a save
 		// failure only costs cross-process resume, so it must not fail the turn.
 		diagf(cfg.Diag, "session: history not persisted (resume will lose this turn): %v", err)
 	}
 	// The turn's canonical text for the facets: the user message as sent (the
-	// annotator already rewrote it) and the assistant's final text. Unlike the
+	// annotator already rewrote it) and the assistant's DELIVERED text (the
+	// governed text on the active path, the raw draft otherwise). Unlike the
 	// proxy's event-driven history.Recorder, this native construction leaves
 	// ToolCalls and IsError unset — every current facet consumer reads only the
 	// user/assistant text, so the paths behave identically; a future facet that
 	// needs tool-call context would have to populate them from the LoopResult.
 	turn := history.Turn{
 		UserText:      userText,
-		AssistantText: res.FinalText,
+		AssistantText: finalText,
 		StopReason:    res.StopReason,
 		Completed:     true,
 	}
-	return res.Messages, &turn, nil
+	return finalMessages, &turn, nil
+}
+
+// governTurn runs the active superego loop over the deferred final draft and
+// emits the delivered turn. It returns the delivered text and the canonical
+// messages to persist: the loop's rejected drafts and critiques live only in an
+// ephemeral tail passed to the redraft callback, so the persisted messages carry
+// only the single delivered assistant turn (its content replaced with the
+// governed text), never the tail. A failure emitting the final turn (a broken
+// wire) propagates; the governor itself never errors (it fails open internally).
+func governTurn(
+	ctx context.Context,
+	cfg Config,
+	emitter *tools.StreamEmitter,
+	systemPrompt string,
+	priorTurns []history.Turn,
+	userText string,
+	res tools.LoopResult,
+) (string, []anthropic.Message, error) {
+	turnIndex := len(priorTurns)
+	reviewTurns := append(append([]history.Turn(nil), priorTurns...), history.Turn{
+		UserText:      userText,
+		AssistantText: res.FinalText,
+		StopReason:    res.StopReason,
+		Completed:     true,
+	})
+	snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: reviewTurns}
+
+	// redraft asks the core model for a new draft over the turn's canonical
+	// messages plus the ephemeral tail. No tools are offered: a redraft is a pure
+	// text revision, never a fresh round of tool execution. The tail is appended
+	// to a clone, so res.Messages (the canonical history) is never mutated by the
+	// loop. Each redraft's usage is accumulated so the re-emitted result bills the
+	// full round, not just the first draft.
+	var redraftUsage anthropic.Usage
+	redraft := func(ctx context.Context, tail []anthropic.Message) (string, error) {
+		messages := append(slices.Clone(res.Messages), tail...)
+		resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
+			Model:     cfg.Model,
+			System:    systemPrompt,
+			MaxTokens: cfg.MaxTokens,
+			Messages:  messages,
+		})
+		if err != nil {
+			return "", err
+		}
+		redraftUsage = redraftUsage.Add(resp.Usage)
+		return resp.Text, nil
+	}
+
+	// The held bool is intentionally not consumed here: when a turn is held,
+	// GovernOutput already returns the hold-and-ask text as finalText, which this
+	// seam delivers and persists like any other assistant turn (the facet log is
+	// where the hold decision is recorded). It is part of the port contract for
+	// callers that may want to signal a held turn differently; the native path
+	// does not.
+	finalText, _ := cfg.Governor.GovernOutput(ctx, turnIndex, snapshot, res.FinalText, redraft)
+	finalUsage := res.Usage.Add(redraftUsage)
+	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
+		return "", nil, fmt.Errorf("session: %w", err)
+	}
+
+	// Persist only the clean delivered text as the final assistant turn: replace
+	// the raw draft content of the last (assistant) message with the governed
+	// text. The ephemeral tail was never in res.Messages, so nothing else needs
+	// stripping.
+	finalMessages := replaceFinalAssistantText(res.Messages, finalText)
+	return finalText, finalMessages, nil
+}
+
+// replaceFinalAssistantText returns a copy of messages with the last message's
+// content replaced by text (a plain string, valid Messages API input). The
+// active path calls it to persist the governed delivered text in place of the
+// core's raw final draft, so canonical history never records a rejected draft.
+func replaceFinalAssistantText(messages []anthropic.Message, text string) []anthropic.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := slices.Clone(messages)
+	out[len(out)-1] = anthropic.Message{Role: "assistant", Content: text}
+	return out
 }
 
 func diagf(w io.Writer, format string, args ...any) {

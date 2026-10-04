@@ -202,6 +202,14 @@ type callLog struct {
 	Verdict             string               `json:"verdict,omitempty"`
 	SuperegoAnnotations []SuperegoAnnotation `json:"superegoAnnotations,omitempty"`
 	SuperegoWhy         string               `json:"superegoWhy,omitempty"`
+
+	// Active-loop-only fields (superego mode "active"): the ladder round (1-4)
+	// a review ran at, the loop's path ("primary" — the deterministic tag gate;
+	// kortex has no model-backed fallback gate), and the loop's decision for the
+	// turn ("deliver", "revise", "hold", "overrun", or "fail_open").
+	Round    int    `json:"round,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Decision string `json:"decision,omitempty"`
 }
 
 // facetLogger appends one JSON object per facet call to the sink. A nil

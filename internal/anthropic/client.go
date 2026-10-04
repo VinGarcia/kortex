@@ -101,6 +101,17 @@ type Usage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
+// Add returns the counter-by-counter sum of u and o, so a caller accumulating
+// usage across several model calls (a multi-turn tool loop, or the active
+// superego loop's redrafts) can total the round on one shared implementation.
+func (u Usage) Add(o Usage) Usage {
+	u.InputTokens += o.InputTokens
+	u.OutputTokens += o.OutputTokens
+	u.CacheReadInputTokens += o.CacheReadInputTokens
+	u.CacheCreationInputTokens += o.CacheCreationInputTokens
+	return u
+}
+
 // ContentBlock is one parsed content block of a response. Fields populate
 // depending on Type ("text" -> Text; "tool_use" -> ID/Name/Input). Raw holds
 // the exact bytes the API returned for this block so a tool-loop can echo

@@ -212,6 +212,23 @@ func TestLoad(t *testing.T) {
 			wantErr: "maxHistoryTurns must be >= 0",
 		},
 		{
+			desc:    "superego invalid mode",
+			content: `{"facets": {"superego": {"enabled": false, "tokenEnv": "T", "systemPromptPath": "/s.md", "mode": "blocking"}}}`,
+			wantErr: `mode must be "shadow" or "active", got "blocking"`,
+		},
+		{
+			desc: "superego active mode",
+			content: `{"facets": {
+				"outputEvaluator": {"enabled": true, "model": "m", "tokenEnv": "T", "systemPromptPath": "/p.md"},
+				"superego": {"enabled": true, "tokenEnv": "T", "systemPromptPath": "/s.md", "mode": "active"}
+			}}`,
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Facets.Superego.Mode != SuperegoModeActive {
+					t.Errorf("mode = %q, want active", cfg.Facets.Superego.Mode)
+				}
+			},
+		},
+		{
 			desc: "superego enabled without its trigger fails loudly",
 			content: `{"facets": {"superego": {
 				"enabled": true, "tokenEnv": "T", "systemPromptPath": "/s.md"

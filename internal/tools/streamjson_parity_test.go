@@ -302,6 +302,85 @@ func TestStreamJSONParity_toolCall(t *testing.T) {
 	assertToolLinkage(t, "kortex", kortex)
 }
 
+// TestStreamJSONParity_activePathReEmits proves the active superego path — run
+// RunLoop with DeferFinal (final turn withheld) then re-emit the governed turn
+// via EmitFinalTurn — produces a stream that normalizes to the SAME skeleton
+// OpenClaw reads on the normal undeferred path. The emission point of the final
+// assistant+result moved from inside RunLoop to the caller; this proves the
+// move preserved structural parity, not just that the pieces exist. The
+// governed text deliberately differs from the core's draft (that is the whole
+// point of governance), so the result text is asserted to be the governed text,
+// and the core's draft is asserted absent from the wire.
+func TestStreamJSONParity_activePathReEmits(t *testing.T) {
+	claude := loadFixture(t, "claude_tool.ndjson")
+
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if call >= 2 {
+			t.Errorf("RunLoop made an unexpected extra upstream call")
+			http.Error(w, "unexpected extra upstream call", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if call == 0 {
+			w.Write([]byte(`{"content":[{"type":"tool_use","id":"toolu_k1","name":"bash","input":{"command":"echo parity-tool-ok"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`))
+		} else {
+			w.Write([]byte(`{"content":[{"type":"text","text":"raw draft output"}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":6}}`))
+		}
+		call++
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	emitter := NewStreamEmitter(&out, "sess-active", sequencedUUIDs())
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	res, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-haiku-4-5-20251001",
+		MaxTokens:   1024,
+		UserMessage: "Run the shell command: echo parity-tool-ok  — then tell me its exact output.",
+		Emitter:     emitter,
+		DeferFinal:  true,
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	// The governor delivers a text that differs from the core's draft; re-emit it.
+	if err := emitter.EmitFinalTurn("governed exact output: parity-tool-ok", res.Turns, res.StopReason, res.Usage); err != nil {
+		t.Fatalf("EmitFinalTurn error: %v", err)
+	}
+
+	kortex := parseStream(t, out.Bytes())
+	wantSkeleton := []semEvent{
+		{Type: protocol.TypeSystem, Subtype: "init"},
+		{Type: protocol.TypeAssistant, BlockTypes: []string{"tool_use"}},
+		{Type: protocol.TypeUser, BlockTypes: []string{"tool_result"}},
+		{Type: protocol.TypeAssistant, BlockTypes: []string{"text"}},
+		{Type: protocol.TypeResult, Subtype: "success"},
+	}
+	cNorm := normalize(claude)
+	kNorm := normalize(kortex)
+	if !reflect.DeepEqual(cNorm, wantSkeleton) {
+		t.Fatalf("claude fixture skeleton drifted:\n got %+v\nwant %+v", cNorm, wantSkeleton)
+	}
+	if !reflect.DeepEqual(kNorm, cNorm) {
+		t.Fatalf("active-path skeleton != claude skeleton:\n kortex %+v\n claude %+v", kNorm, cNorm)
+	}
+
+	// The core's raw draft must never reach the wire; the governed text does.
+	if bytes.Contains(out.Bytes(), []byte("raw draft output")) {
+		t.Errorf("the governed-away draft leaked onto the wire:\n%s", out.String())
+	}
+	assertSessionConsistent(t, "kortex-active", kortex)
+	assertToolLinkage(t, "kortex-active", kortex)
+	result := resultOf(t, "kortex-active", kortex)
+	if result.Result.NumTurns != 2 || result.Result.StopReason != "end_turn" {
+		t.Errorf("active result num_turns=%d stop_reason=%q, want 2/end_turn", result.Result.NumTurns, result.Result.StopReason)
+	}
+	if result.Result.Text != "governed exact output: parity-tool-ok" {
+		t.Errorf("active result text = %q, want the governed text", result.Result.Text)
+	}
+}
+
 // assertToolLinkage checks the structural invariant OpenClaw relies on to pair
 // a tool result with its call: the user turn's tool_result.tool_use_id equals
 // the id of a tool_use the assistant emitted, and both ids are non-empty.

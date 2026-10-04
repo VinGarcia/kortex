@@ -99,6 +99,39 @@ func (e *StreamEmitter) result(res LoopResult, usage anthropic.Usage) error {
 	return e.write(line)
 }
 
+// EmitFinalTurn emits the deferred final turn: one assistant text event
+// followed by the terminal result, both carrying the governed text. The active
+// superego loop runs RunLoop with DeferFinal (so the core's final draft never
+// reached the wire), governs the draft, then calls this with the text actually
+// delivered — so a rejected draft or a hold-and-ask substitution is what the
+// stream shows, never the original draft. text is run through StripToolMarkup to
+// honor EmitResult's no-markup contract and to keep the assistant event's text
+// consistent with the result. usage bills the round (the core loop total plus
+// any redraft calls the caller summed in). numTurns and stopReason are the
+// LoopResult's, so the result line matches the undeferred path's shape.
+func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason string, usage anthropic.Usage) error {
+	if e == nil {
+		return nil
+	}
+	clean := StripToolMarkup(text)
+	assistantLine, err := protocol.EmitAssistant(e.sessionID, e.newUUID(), []protocol.ContentBlock{{Type: "text", Text: clean}}, protocol.Usage(usage))
+	if err != nil {
+		return fmt.Errorf("tools: emitting final assistant turn: %w", err)
+	}
+	if err := e.write(assistantLine); err != nil {
+		return err
+	}
+	resultLine, err := protocol.EmitResult(e.sessionID, protocol.Result{
+		Text:       clean,
+		NumTurns:   numTurns,
+		StopReason: stopReason,
+	}, protocol.Usage(usage))
+	if err != nil {
+		return fmt.Errorf("tools: emitting final result: %w", err)
+	}
+	return e.write(resultLine)
+}
+
 // ErrorResult emits a terminal result marking the round as failed. The native
 // session calls it when RunLoop returns an error instead of a result (e.g. the
 // Messages API call failed), so OpenClaw completes the round on a visible error

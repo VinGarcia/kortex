@@ -128,8 +128,14 @@ type builtFacets struct {
 	annotator       *facet.InputAnnotator
 	outputEvaluator *facet.OutputEvaluator
 	superego        *facet.Superego
-	logFile         *os.File
-	mcpClient       *mcp.Client
+	// governor is non-nil only in superego mode "active": the blocking
+	// evaluate→review→revise loop that governs the delivered text. In that mode
+	// the output evaluator is built WITHOUT its shadow trigger (the governor
+	// drives the superego directly), so the session wires the governor instead
+	// of the async TurnEvaluator.
+	governor  *facet.ActiveSuperego
+	logFile   *os.File
+	mcpClient *mcp.Client
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -186,6 +192,9 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 			LogSink:      logSink,
 		})
 	}
+	// active superego mode replaces the async shadow review with the blocking
+	// governor; the output evaluator is then built without its shadow trigger.
+	active := seEnabled && seCfg.Mode == config.SuperegoModeActive
 	if evalEnabled {
 		// The superego is built before its trigger (the output evaluator)
 		// so the evaluator can be handed the wired trigger at construction.
@@ -214,14 +223,29 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 		if evalCfg.GateMinInvestment != nil {
 			gateMinInvestment = *evalCfg.GateMinInvestment
 		}
+		// In active mode the governor drives the superego synchronously, so the
+		// evaluator gets no shadow trigger; in shadow mode it keeps firing the
+		// async review on a gate hit.
+		shadowTrigger := built.superego
+		if active {
+			shadowTrigger = nil
+		}
 		built.outputEvaluator = facet.NewOutputEvaluator(facet.OutputEvaluatorParams{
 			Evaluator:         facet.NewAnthropicEvaluator(client, evalCfg.Model),
 			SystemPrompt:      systemPrompt,
 			Timeout:           timeout,
 			Model:             evalCfg.Model,
 			GateMinInvestment: gateMinInvestment,
-			Superego:          built.superego,
+			Superego:          shadowTrigger,
 			LogSink:           logSink,
+		})
+	}
+	if active {
+		built.governor = facet.NewActiveSuperego(facet.ActiveSuperegoParams{
+			Evaluator: built.outputEvaluator,
+			Superego:  built.superego,
+			Model:     resolveSuperegoModel(seCfg.Model),
+			LogSink:   logSink,
 		})
 	}
 	return built, nil
@@ -388,9 +412,17 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	if facets.annotator != nil {
 		annotator = facets.annotator
 	}
+	// The async TurnEvaluator and the active Governor are mutually exclusive: in
+	// active mode the governor evaluates synchronously, so wiring the shadow
+	// evaluator too would re-evaluate every draft for nothing. Governor present
+	// ⇒ leave TurnEvaluator nil.
 	var turnEvaluator session.TurnEvaluator
-	if facets.outputEvaluator != nil {
+	if facets.outputEvaluator != nil && facets.governor == nil {
 		turnEvaluator = facets.outputEvaluator
+	}
+	var governor session.OutputGovernor
+	if facets.governor != nil {
+		governor = facets.governor
 	}
 
 	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
@@ -414,6 +446,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		Diag:          stderr,
 		Annotator:     annotator,
 		TurnEvaluator: turnEvaluator,
+		Governor:      governor,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)

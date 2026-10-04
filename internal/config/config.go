@@ -41,6 +41,14 @@ const DefaultSuperegoModel = "claude-opus-4-8"
 // when the valence is negative or mixed.
 const DefaultGateMinInvestment = 4
 
+// SuperegoModeShadow (the default) runs the superego asynchronously after the
+// turn is delivered: observe-only, log-only. SuperegoModeActive runs it
+// synchronously before delivery, inside the blocking core↔superego loop.
+const (
+	SuperegoModeShadow = "shadow"
+	SuperegoModeActive = "active"
+)
+
 // Config is the root of the kortex config file.
 type Config struct {
 	Facets Facets `json:"facets"`
@@ -114,6 +122,14 @@ type OutputEvaluator struct {
 // the F2e block→revise loop will consume). Nothing ever touches the stream.
 type Superego struct {
 	Enabled bool `json:"enabled"`
+	// Mode selects how the superego acts on a gate hit. "shadow" (the default
+	// when empty) is observe-only: the review runs asynchronously after the
+	// turn's result is already delivered and only annotates the facet log.
+	// "active" is the blocking loop: the review runs synchronously before the
+	// turn is delivered and can revise the draft (core redrafts from the
+	// critique) or hold it for the human. Any active-mode failure falls open to
+	// delivering the original draft, so the mode never holds a reply hostage.
+	Mode string `json:"mode"`
 	// Model is the superego model id; empty means DefaultSuperegoModel. The
 	// definitive model is an activation-time choice.
 	Model string `json:"model"`
@@ -236,6 +252,9 @@ func (s Superego) Validate() error {
 	}
 	if s.MaxHistoryTurns < 0 {
 		return fmt.Errorf("maxHistoryTurns must be >= 0, got %d", s.MaxHistoryTurns)
+	}
+	if s.Mode != "" && s.Mode != SuperegoModeShadow && s.Mode != SuperegoModeActive {
+		return fmt.Errorf("mode must be %q or %q, got %q", SuperegoModeShadow, SuperegoModeActive, s.Mode)
 	}
 	return nil
 }
