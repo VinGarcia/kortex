@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 )
@@ -20,6 +21,12 @@ type LoopRequest struct {
 	System      string
 	MaxTokens   int
 	UserMessage string
+	// History is the prior conversation this turn continues, in the exact
+	// anthropic.Message shape a previous LoopResult returned (assistant turns
+	// echoed verbatim via raw content, user turns carrying tool_result blocks).
+	// Nil for the first turn of a session. RunLoop never mutates it: the new
+	// user message and this turn's exchanges are appended to a clone.
+	History []anthropic.Message
 	// MaxTurns bounds tool_use round trips; 0 means DefaultMaxTurns.
 	MaxTurns int
 	// Emitter, when non-nil, receives the loop's turns as stream-json (NDJSON)
@@ -39,6 +46,12 @@ type LoopResult struct {
 	// Turns is how many request/response round trips the loop made
 	// (always >= 1).
 	Turns int
+	// Messages is the full canonical conversation after this turn: the input
+	// History plus the new user message, every intermediate assistant/tool_result
+	// exchange, and the final assistant turn. Feed it back as the next turn's
+	// History to continue the conversation (in-process or persisted across a
+	// restart).
+	Messages []anthropic.Message
 }
 
 // RunLoop ports the F3a spike's tool_use/tool_result cycle
@@ -56,8 +69,8 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		maxTurns = DefaultMaxTurns
 	}
 
-	messages := []anthropic.Message{{Role: "user", Content: req.UserMessage}}
-	tools := Definitions()
+	messages := append(slices.Clone(req.History), anthropic.Message{Role: "user", Content: req.UserMessage})
+	tools := dispatcher.ToolDefs()
 
 	if err := req.Emitter.systemInit(); err != nil {
 		return LoopResult{}, err
@@ -88,7 +101,8 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		// which we treat as resolved rather than looping forever on the same
 		// state — ends the loop with the terminal result event.
 		if resp.StopReason != "tool_use" || len(toolUses) == 0 {
-			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn}
+			messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
+			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn, Messages: messages}
 			if err := req.Emitter.result(result, totalUsage); err != nil {
 				return LoopResult{}, err
 			}

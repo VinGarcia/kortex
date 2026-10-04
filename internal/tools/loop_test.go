@@ -70,6 +70,64 @@ func TestRunLoop_bashRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRunLoop_historyContinuation proves a follow-up turn sends the prior
+// History ahead of the new user message, and that the returned Messages carry
+// the whole conversation (history + new user turn + final assistant turn) so it
+// can seed the next turn.
+func TestRunLoop_historyContinuation(t *testing.T) {
+	var sentMessages []anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		sentMessages = body.Messages
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"blue"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 3, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	history := []anthropic.Message{
+		{Role: "user", Content: "my favorite color is blue"},
+		{Role: "assistant", Content: "noted"},
+	}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-haiku-4-5-20251001",
+		MaxTokens:   1024,
+		History:     history,
+		UserMessage: "what is my favorite color?",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+
+	// The request must carry the two history messages followed by the new user
+	// turn — in that order.
+	if len(sentMessages) != 3 {
+		t.Fatalf("request carried %d messages, want 3 (2 history + new user)", len(sentMessages))
+	}
+	if sentMessages[0].Content != "my favorite color is blue" || sentMessages[2].Content != "what is my favorite color?" {
+		t.Errorf("messages not in history-then-new order: %+v", sentMessages)
+	}
+	// The returned Messages seed the next turn: 2 history + new user + final
+	// assistant = 4.
+	if len(result.Messages) != 4 {
+		t.Fatalf("result.Messages has %d entries, want 4", len(result.Messages))
+	}
+	if result.Messages[3].Role != "assistant" {
+		t.Errorf("last returned message role = %q, want assistant", result.Messages[3].Role)
+	}
+	// RunLoop must not mutate the caller's History slice.
+	if len(history) != 2 {
+		t.Errorf("input History was mutated to len %d, want 2", len(history))
+	}
+}
+
 // TestRunLoop_maxTurnsExceeded ensures a model that never stops asking for
 // tools fails loudly instead of looping forever.
 func TestRunLoop_maxTurnsExceeded(t *testing.T) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/mcp"
 )
 
 // Definitions returns the ToolDef declarations for every builtin this
@@ -15,15 +17,49 @@ func Definitions() []anthropic.ToolDef {
 	return []anthropic.ToolDef{BashDef, ReadDef, WriteDef, EditDef}
 }
 
-// Dispatcher executes tool_use content blocks by name against the native
-// builtins (bash, read, write, edit) and produces the matching tool_result.
-type Dispatcher struct{}
+// mcpCaller is the slice of the MCP client the dispatcher needs: invoking a
+// tool by its bare (unprefixed) name. The concrete *mcp.Client satisfies it;
+// the interface keeps the dispatcher testable without a live HTTP server.
+type mcpCaller interface {
+	CallTool(ctx context.Context, name string, arguments map[string]any) (mcp.CallToolResult, error)
+}
 
-// NewDispatcher builds a Dispatcher. It holds no state today; builtins read
-// their configuration (cwd, timeout) from the tool_use input itself, not
-// from the Dispatcher.
+// Dispatcher executes tool_use content blocks by name, routing the native
+// builtins (bash, read, write, edit) to their executors and the
+// mcp__openclaw__* tools to the OpenClaw loopback server, producing the
+// matching tool_result either way.
+type Dispatcher struct {
+	// mcp is the loopback client for mcp__openclaw__* tools; nil when kortex
+	// was spawned without an --mcp-config (builtins-only).
+	mcp mcpCaller
+	// mcpTools is the tools/list catalog ToolDefs() declares to the model
+	// alongside the builtins; empty when mcp is nil.
+	mcpTools []mcp.Tool
+}
+
+// NewDispatcher builds a builtins-only Dispatcher. Builtins read their
+// configuration (cwd, timeout) from the tool_use input itself, so it holds no
+// other state.
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{}
+}
+
+// NewDispatcherWithMCP builds a Dispatcher that also exposes and executes the
+// gateway's MCP tools. tools is the tools/list catalog (bare names) the
+// handshake returned; client invokes them. A nil client (or empty catalog)
+// degrades to the builtins-only behavior of NewDispatcher.
+func NewDispatcherWithMCP(client *mcp.Client, tools []mcp.Tool) *Dispatcher {
+	if client == nil {
+		return NewDispatcher()
+	}
+	return &Dispatcher{mcp: client, mcpTools: tools}
+}
+
+// ToolDefs returns every tool the loop declares in a request's "tools" field:
+// the native builtins first, then the gateway's MCP tools (prefixed for the
+// model). Builtins-only when no MCP client is wired.
+func (d *Dispatcher) ToolDefs() []anthropic.ToolDef {
+	return append(Definitions(), MCPToolDefs(d.mcpTools)...)
 }
 
 // Execute runs the builtin named by block.Name with block.Input and returns
@@ -35,6 +71,10 @@ func NewDispatcher() *Dispatcher {
 func (d *Dispatcher) Execute(ctx context.Context, block anthropic.ContentBlock) anthropic.ToolResultBlock {
 	if block.Type != "tool_use" {
 		return anthropic.NewToolResultBlock(block.ID, fmt.Sprintf("error: dispatcher given a %q block, want tool_use", block.Type), true)
+	}
+
+	if strings.HasPrefix(block.Name, MCPToolPrefix) {
+		return d.executeMCP(ctx, block)
 	}
 
 	switch block.Name {
@@ -73,6 +113,31 @@ func (d *Dispatcher) Execute(ctx context.Context, block anthropic.ContentBlock) 
 	default:
 		return anthropic.NewToolResultBlock(block.ID, fmt.Sprintf("error: unknown tool %q", block.Name), true)
 	}
+}
+
+// executeMCP routes an mcp__openclaw__* tool_use to the loopback server: it
+// strips the prefix back to the bare name the server's catalog uses, decodes
+// the input object into the arguments map CallTool expects, and maps the
+// result (or a transport failure) to an is_error tool_result the loop can feed
+// straight back to the model.
+func (d *Dispatcher) executeMCP(ctx context.Context, block anthropic.ContentBlock) anthropic.ToolResultBlock {
+	if d.mcp == nil {
+		return anthropic.NewToolResultBlock(block.ID, fmt.Sprintf("error: MCP tool %q requested but no MCP client is configured", block.Name), true)
+	}
+	// An absent/null input is a valid no-argument call; only a present-but-
+	// malformed input is an error.
+	arguments := map[string]any{}
+	if len(block.Input) > 0 {
+		if err := json.Unmarshal(block.Input, &arguments); err != nil {
+			return errorResult(block.ID, block.Name, err)
+		}
+	}
+	name := strings.TrimPrefix(block.Name, MCPToolPrefix)
+	result, err := d.mcp.CallTool(ctx, name, arguments)
+	if err != nil {
+		return anthropic.NewToolResultBlock(block.ID, fmt.Sprintf("error: calling MCP tool %q: %v", name, err), true)
+	}
+	return MCPToolResultBlock(block.ID, result)
 }
 
 // errorResult builds the tool_result for a tool_use whose input JSON failed
