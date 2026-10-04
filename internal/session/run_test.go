@@ -34,12 +34,18 @@ func textResponder(t *testing.T, reply string) (*httptest.Server, *recorded) {
 	rec := &recorded{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			System   string              `json:"system"`
+			System []struct {
+				Text string `json:"text"`
+			} `json:"system"`
 			Messages []anthropic.Message `json:"messages"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		rec.calls++
-		rec.lastSystem = body.System
+		parts := make([]string, len(body.System))
+		for i, b := range body.System {
+			parts[i] = b.Text
+		}
+		rec.lastSystem = strings.Join(parts, "\n\n")
 		rec.lastMessageCount = len(body.Messages)
 		if n := len(body.Messages); n > 0 {
 			if text, ok := body.Messages[n-1].Content.(string); ok {

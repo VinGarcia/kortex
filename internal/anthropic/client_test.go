@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -55,9 +56,17 @@ func TestCreateMessage_success(t *testing.T) {
 			t.Errorf("header %s = %q, want %q", name, got, want)
 		}
 	}
-	// The caller's system prompt must land AFTER the Claude Code preamble the
-	// subscription tokens require (see claudeCodePreamble).
-	if gotBody["model"] != "claude-haiku-4-5-20251001" || gotBody["system"] != claudeCodePreamble+"\n\nsystem prompt" || gotBody["max_tokens"] != float64(2048) {
+	// The system must be the block-array form with the Claude Code preamble as
+	// its OWN first block (subscription-token abuse check; see systemBlock) and
+	// the caller's prompt as the second.
+	wantSystem := []any{
+		map[string]any{"type": "text", "text": claudeCodePreamble},
+		map[string]any{"type": "text", "text": "system prompt"},
+	}
+	if !reflect.DeepEqual(gotBody["system"], wantSystem) {
+		t.Errorf("system = %v, want %v", gotBody["system"], wantSystem)
+	}
+	if gotBody["model"] != "claude-haiku-4-5-20251001" || gotBody["max_tokens"] != float64(2048) {
 		t.Errorf("unexpected request body: %v", gotBody)
 	}
 	if resp.Text != `[{"investment":0}]` {
