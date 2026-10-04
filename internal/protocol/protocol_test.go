@@ -29,9 +29,9 @@ func TestParse(t *testing.T) {
 		want Event
 	}{
 		{
-			desc: "control_request initialize surfaces the request subtype",
+			desc: "control_request initialize surfaces the subtype and system prompt",
 			line: fixtureInitialize,
-			want: Event{Type: TypeControlRequest, Subtype: "initialize", RequestID: "req-1"},
+			want: Event{Type: TypeControlRequest, Subtype: "initialize", RequestID: "req-1", AppendSystemPrompt: "You are Sylphie."},
 		},
 		{
 			desc: "user prompt with string content",

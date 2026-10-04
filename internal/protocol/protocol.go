@@ -51,6 +51,12 @@ type Event struct {
 	UUID      string
 	// RequestID correlates control_request/control_response/cancel pairs.
 	RequestID string
+	// AppendSystemPrompt carries the system prompt OpenClaw ships inside the
+	// initialize control_request (request.appendSystemPrompt): the real
+	// claude-cli receives the agent's system prompt this way, not via argv (the
+	// --append-system-prompt flag is stripped before spawn). Only populated on
+	// a control_request; empty otherwise.
+	AppendSystemPrompt string
 	// IsReplay marks user messages echoed back on stdout by
 	// --replay-user-messages.
 	IsReplay bool
@@ -169,7 +175,8 @@ type innerType struct {
 }
 
 type controlRequest struct {
-	Subtype string `json:"subtype"`
+	Subtype            string `json:"subtype"`
+	AppendSystemPrompt string `json:"appendSystemPrompt"`
 }
 
 type controlPayload struct {
@@ -233,6 +240,7 @@ func Parse(line []byte) Event {
 	case TypeControlRequest:
 		if w.Request != nil {
 			ev.Subtype = w.Request.Subtype
+			ev.AppendSystemPrompt = w.Request.AppendSystemPrompt
 		}
 	case TypeControlResponse:
 		if w.Response != nil {
