@@ -13,9 +13,14 @@ func TestEmit_golden(t *testing.T) {
 		want string
 	}{
 		{
-			desc: "system/init advertises no capabilities",
-			emit: func() ([]byte, error) { return EmitSystemInit("sess-1") },
-			want: `{"type":"system","subtype":"init","capabilities":[],"session_id":"sess-1"}`,
+			desc: "system/init reports the tool list and no capabilities",
+			emit: func() ([]byte, error) { return EmitSystemInit("sess-1", []string{"bash", "read", "mcp__openclaw__foo"}) },
+			want: `{"type":"system","subtype":"init","tools":["bash","read","mcp__openclaw__foo"],"capabilities":[],"session_id":"sess-1"}`,
+		},
+		{
+			desc: "system/init emits an empty tool array, never null",
+			emit: func() ([]byte, error) { return EmitSystemInit("sess-1", nil) },
+			want: `{"type":"system","subtype":"init","tools":[],"capabilities":[],"session_id":"sess-1"}`,
 		},
 		{
 			desc: "assistant text message",
@@ -93,7 +98,7 @@ func TestEmit_roundTrip(t *testing.T) {
 	}
 
 	t.Run("system/init", func(t *testing.T) {
-		ev := Parse(emit(EmitSystemInit("sess-1")))
+		ev := Parse(emit(EmitSystemInit("sess-1", []string{"bash"})))
 		if ev.Type != TypeSystem || ev.Subtype != "init" || ev.SessionID != "sess-1" {
 			t.Errorf("parsed = %+v", ev)
 		}

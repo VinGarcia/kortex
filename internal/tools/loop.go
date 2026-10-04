@@ -72,7 +72,15 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	messages := append(slices.Clone(req.History), anthropic.Message{Role: "user", Content: req.UserMessage})
 	tools := dispatcher.ToolDefs()
 
-	if err := req.Emitter.systemInit(); err != nil {
+	// OpenClaw's native tool-authority capture reads the tool names kortex
+	// declares to the model from system/init's "tools" field; emit the same
+	// set the loop declares in each request's Tools so the gateway sees the
+	// runtime's real tool list rather than rejecting an absent one.
+	toolNames := make([]string, len(tools))
+	for i, def := range tools {
+		toolNames[i] = def.Name
+	}
+	if err := req.Emitter.systemInit(toolNames); err != nil {
 		return LoopResult{}, err
 	}
 

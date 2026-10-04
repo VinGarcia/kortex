@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,22 @@ func TestRunLoop_emitsStreamJSON(t *testing.T) {
 		}
 		if events[i].SessionID != "" && events[i].SessionID != "sess-1" {
 			t.Errorf("line %d session_id = %q, want sess-1", i, events[i].SessionID)
+		}
+	}
+
+	// The system/init line must carry a "tools" array of strings naming the
+	// builtins the loop declared: OpenClaw's native tool-authority capture reads
+	// this field and fails the round when it is absent or not a string array, so
+	// the live RunLoop path (not just EmitSystemInit in isolation) must emit it.
+	var initEvent struct {
+		Tools []string `json:"tools"`
+	}
+	if err := json.Unmarshal(lines[0], &initEvent); err != nil {
+		t.Fatalf("decoding system/init tools: %v\n%s", err, lines[0])
+	}
+	for _, want := range []string{"bash", "read", "write", "edit"} {
+		if !slices.Contains(initEvent.Tools, want) {
+			t.Errorf("system/init tools = %v, want it to contain %q", initEvent.Tools, want)
 		}
 	}
 

@@ -31,11 +31,16 @@ import (
 // Scope boundary: "structural equivalence" here is bounded by what
 // internal/protocol models. The comparison only sees fields protocol.Event
 // exposes, so a wire field protocol.go does not model is invisible to this
-// test by construction. Concretely, claude's system/init carries tools, model,
-// mcp_servers, slash_commands, etc. that kortex's EmitSystemInit omits; both
-// collapse to {system,init} here. That is correct precisely because OpenClaw
-// (the F0 reader protocol.go mirrors) consumes only the modeled subset — this
-// test proves parity within that contract, not against the full claude payload.
+// test by construction. Concretely, claude's system/init carries model,
+// mcp_servers, slash_commands, etc. that kortex does not reproduce; both
+// collapse to {system,init} here. One modeled-subset gap matters and is NOT
+// optional: OpenClaw's native tool-authority capture reads system/init's
+// "tools" array and fails the round ("Native runtime reported an invalid tool
+// list") when it is absent or not an array of strings, so EmitSystemInit must
+// always emit it (see internal/protocol/emit.go and its emit_test). This parity
+// harness does not assert the "tools" value because protocol.Event does not
+// model it; that field's contract is covered by emit_test, not here. This test
+// proves parity only within the subset protocol.go models.
 //
 // Two documented, deliberate differences are normalized away rather than
 // treated as divergences, because OpenClaw's read side tolerates both:

@@ -23,6 +23,7 @@ type messageEnvelope struct {
 type systemInitEnvelope struct {
 	Type         string   `json:"type"`
 	Subtype      string   `json:"subtype"`
+	Tools        []string `json:"tools"`
 	Capabilities []string `json:"capabilities"`
 	SessionID    string   `json:"session_id"`
 }
@@ -44,13 +45,23 @@ type controlResponseEnvelope struct {
 	Response controlPayload `json:"response"`
 }
 
-// EmitSystemInit builds the system/init line that opens a round. capabilities
-// stays empty: msg_lifecycle_v1 may only be advertised if we also emit
-// command_lifecycle{state:"started"} (F0 §4.1), which this backend does not.
-func EmitSystemInit(sessionID string) ([]byte, error) {
+// EmitSystemInit builds the system/init line that opens a round. tools is the
+// list of tool names the runtime declares to the model this session (the
+// builtins plus any prefixed gateway MCP tools); OpenClaw reads system/init's
+// "tools" to seed its native tool-authority capture and rejects the round with
+// "Native runtime reported an invalid tool list" when the field is absent or
+// not an array of strings, so it is always emitted as a (possibly empty)
+// string array, never null. capabilities stays empty: msg_lifecycle_v1 may
+// only be advertised if we also emit command_lifecycle{state:"started"}
+// (F0 §4.1), which this backend does not.
+func EmitSystemInit(sessionID string, tools []string) ([]byte, error) {
+	if tools == nil {
+		tools = []string{}
+	}
 	return marshalLine(systemInitEnvelope{
 		Type:         TypeSystem,
 		Subtype:      "init",
+		Tools:        tools,
 		Capabilities: []string{},
 		SessionID:    sessionID,
 	})

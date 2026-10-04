@@ -41,11 +41,11 @@ func NewStreamEmitter(w io.Writer, sessionID string, newUUID func() string) *Str
 // emits system/init once per session, not per user turn). A single-turn caller
 // (the -p path, the parity harness) builds a fresh emitter per RunLoop and so
 // still emits exactly one.
-func (e *StreamEmitter) systemInit() error {
+func (e *StreamEmitter) systemInit(toolNames []string) error {
 	if e == nil || e.initSent {
 		return nil
 	}
-	line, err := protocol.EmitSystemInit(e.sessionID)
+	line, err := protocol.EmitSystemInit(e.sessionID, toolNames)
 	if err != nil {
 		return fmt.Errorf("tools: emitting system/init: %w", err)
 	}
