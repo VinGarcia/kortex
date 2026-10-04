@@ -89,6 +89,27 @@ func (e *StreamEmitter) result(res LoopResult, usage anthropic.Usage) error {
 	return e.write(line)
 }
 
+// ErrorResult emits a terminal result marking the round as failed. The native
+// session calls it when RunLoop returns an error instead of a result (e.g. the
+// Messages API call failed), so OpenClaw completes the round on a visible error
+// rather than hanging waiting for a terminal event that will never come. msg is
+// surfaced as the result text; the subtype is "error" (EmitResult derives it
+// from IsError), which is what OpenClaw keys the failure on.
+func (e *StreamEmitter) ErrorResult(msg string) error {
+	if e == nil {
+		return nil
+	}
+	line, err := protocol.EmitResult(e.sessionID, protocol.Result{
+		IsError:  true,
+		Text:     msg,
+		NumTurns: 1,
+	}, protocol.Usage{})
+	if err != nil {
+		return fmt.Errorf("tools: emitting error result: %w", err)
+	}
+	return e.write(line)
+}
+
 func (e *StreamEmitter) write(line []byte) error {
 	if _, err := e.w.Write(line); err != nil {
 		return fmt.Errorf("tools: writing stream-json line: %w", err)

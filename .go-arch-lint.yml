@@ -24,6 +24,12 @@ components:
   # dependency on anthropic or any other component, stdlib only.
   mcp:
     in: internal/mcp
+  # F3d slice-3c: the native session runner. When KORTEX_STREAM_EMITTER is set,
+  # main hands stdin/stdout + wired client/dispatcher/store here instead of
+  # execing the real claude: it reads the NDJSON protocol, drives RunLoop per
+  # turn, persists history for cross-process resume, and emits stream-json.
+  session:
+    in: internal/session
   # Live-smoke driver for RunLoop (F3b caveat): runs the tool-loop against the
   # real Messages API. A hack/ entrypoint, so it wires the client + builtins
   # the same way main does.
@@ -42,6 +48,9 @@ deps:
       # F3d slice-3b: main constructs the stream-json emitter (os.Stdout +
       # injected uuid-v4) in the composition root, dormant behind an env gate.
       - tools
+      # F3d slice-3c: main branches into the native session runner when the
+      # stream-emitter gate is on, wiring it with the client/dispatcher/store.
+      - session
   # proxy calls facets only through its own Interceptor interface (wired by
   # main); it must never import facet — the reverse direction is the rule.
   proxy:
@@ -74,6 +83,11 @@ deps:
       # marshallers. protocol stays a stdlib-only leaf (it never imports back),
       # so this edge keeps the one-way tools -> protocol direction.
       - protocol
+  session:
+    mayDependOn:
+      - protocol
+      - tools
+      - anthropic
   loopsmoke:
     mayDependOn:
       - anthropic
