@@ -188,6 +188,59 @@ func TestRunNative_guardsFailFast(t *testing.T) {
 	}
 }
 
+func TestResolveNativeToken(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("  file-token\n"), 0o600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+
+	tests := []struct {
+		desc    string
+		env     map[string]string
+		want    string
+		wantErr bool
+	}{
+		{
+			desc: "token file trimmed and preferred over env",
+			env:  map[string]string{"KORTEX_TOKEN_FILE": tokenFile, "CODECOMPANION_OAUTH_TOKEN": "env-token"},
+			want: "file-token",
+		},
+		{
+			desc: "env token when no file set",
+			env:  map[string]string{"CODECOMPANION_OAUTH_TOKEN": "env-token"},
+			want: "env-token",
+		},
+		{
+			desc:    "unreadable token file is a hard error",
+			env:     map[string]string{"KORTEX_TOKEN_FILE": filepath.Join(t.TempDir(), "missing"), "CODECOMPANION_OAUTH_TOKEN": "env-token"},
+			wantErr: true,
+		},
+		{
+			desc: "neither set yields empty",
+			env:  map[string]string{},
+			want: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			getenv := func(name string) string { return test.env[name] }
+			got, err := resolveNativeToken(getenv)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("resolveNativeToken err = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveNativeToken: %v", err)
+			}
+			if got != test.want {
+				t.Errorf("resolveNativeToken = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeStateDir(t *testing.T) {
 	tests := []struct {
 		desc string

@@ -304,6 +304,24 @@ func firstArgvValue(argv []string, flag string) string {
 // and large enough for the tool-driving turns the canary targets.
 const defaultMaxTokens = 8192
 
+// resolveNativeToken resolves the OAuth token for the native path from the
+// composition root. KORTEX_TOKEN_FILE, when set, names a file kortex reads and
+// trims itself, and takes precedence over CODECOMPANION_OAUTH_TOKEN: it lets
+// the launcher hand kortex a path instead of injecting the secret into the
+// child's environment. A set-but-unreadable KORTEX_TOKEN_FILE is a hard error
+// (a misconfigured launcher must fail loudly, not silently fall back to a stale
+// env token). Absent KORTEX_TOKEN_FILE falls back to CODECOMPANION_OAUTH_TOKEN.
+func resolveNativeToken(getenv func(string) string) (string, error) {
+	if path := getenv("KORTEX_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("reading KORTEX_TOKEN_FILE %s: %w", path, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	return getenv("CODECOMPANION_OAUTH_TOKEN"), nil
+}
+
 // runNative runs the F3d producer path: kortex speaks the stream-json protocol
 // itself instead of execing the real claude-cli. It wires the composition-root
 // dependencies (Anthropic client from CODECOMPANION_OAUTH_TOKEN, the builtin +
@@ -314,9 +332,13 @@ const defaultMaxTokens = 8192
 // (OpenClaw's declared user-scope hooks simply don't run), and interrupts and
 // permission prompts are not implemented — kortex drives its own tools.
 func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
-	token := getenv("CODECOMPANION_OAUTH_TOKEN")
+	token, err := resolveNativeToken(getenv)
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: %v\n", err)
+		return 1
+	}
 	if token == "" {
-		fmt.Fprintln(stderr, "kortex: native mode needs CODECOMPANION_OAUTH_TOKEN; not set")
+		fmt.Fprintln(stderr, "kortex: native mode needs KORTEX_TOKEN_FILE or CODECOMPANION_OAUTH_TOKEN; not set")
 		return 1
 	}
 	// OpenClaw always passes --model, but guard it up front: an empty model
