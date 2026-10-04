@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,7 +150,7 @@ func TestRun_ActiveGovernorEphemeralTailNotPersisted(t *testing.T) {
 		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
 		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
 		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
-		Governor: gov,
+		RedraftTimeout: time.Second, Governor: gov,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -192,6 +193,81 @@ func TestRun_ActiveGovernorEphemeralTailNotPersisted(t *testing.T) {
 		if content, ok := m.Content.(string); ok && strings.Contains(content, "CRITIQUE-TAIL-TEXT") {
 			t.Errorf("ephemeral critique leaked into canonical history: %+v", m)
 		}
+	}
+}
+
+// TestRun_ActiveGovernorRedraftTimesOutFailsOpen proves a hung redraft call is
+// bounded by Config.RedraftTimeout rather than blocking the turn forever: when
+// the redraft endpoint never responds, the redraft returns (with an error)
+// within roughly the deadline, the governor fails open, and the turn still
+// completes by delivering the raw draft. The client is built with no HTTP
+// timeout (the production wiring from main.go), so the only bound on the hung
+// call is the per-call deadline this test exercises.
+func TestRun_ActiveGovernorRedraftTimesOutFailsOpen(t *testing.T) {
+	const redraftTimeout = 100 * time.Millisecond
+
+	// The first call (the draft) answers normally; the redraft call (the second)
+	// hangs, so the only thing that ends the redraft is RedraftTimeout firing on
+	// the caller side. teardown is closed before server.Close runs (defer beats
+	// t.Cleanup) so the hung handler never blocks the server shutdown even if it
+	// didn't observe the client-side cancellation.
+	teardown := make(chan struct{})
+	defer close(teardown)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"content":[{"type":"text","text":"raw-draft"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-teardown:
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := anthropic.NewClient("secret", server.URL, 0)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-TAIL-TEXT"}},
+	}
+
+	var out strings.Builder
+	start := time.Now()
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: redraftTimeout, Governor: gov,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Bounded: the turn finished far sooner than the hung endpoint would ever
+	// allow. The ceiling is generous versus the 100ms deadline yet nowhere near
+	// the forever a missing bound would produce.
+	if elapsed > 5*time.Second {
+		t.Fatalf("turn took %s, want bounded completion near the %s redraft deadline", elapsed, redraftTimeout)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("core model calls = %d, want 2 (draft + hung redraft)", n)
+	}
+	// Fail-open: the redraft errored (so the governor never recorded a redraft
+	// result) and the raw draft is what reached the wire.
+	if gov.redraftResult != "" {
+		t.Errorf("redraft result = %q, want empty (the hung redraft must have errored)", gov.redraftResult)
+	}
+	var resultText string
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+		}
+	}
+	if resultText != "raw-draft" {
+		t.Errorf("delivered result = %q, want raw-draft (fail-open to the draft)", resultText)
 	}
 }
 

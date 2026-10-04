@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/history"
@@ -82,6 +83,12 @@ type Config struct {
 	Model string
 	// MaxTokens caps each turn's response length.
 	MaxTokens int
+	// RedraftTimeout bounds one redraft call to the core model inside the active
+	// superego loop. The core client carries no HTTP timeout and the redraft is
+	// the one core-model call in the governor loop with no deadline of its own,
+	// so without this bound a hung redraft blocks the whole turn forever; on
+	// timeout the governor fails open to delivering the raw draft.
+	RedraftTimeout time.Duration
 	// NewUUID mints one v4 message uuid per emitted assistant/user event.
 	NewUUID func() string
 	// Diag, when non-nil, receives one-line diagnostics for non-fatal problems
@@ -292,6 +299,8 @@ func governTurn(
 	// full round, not just the first draft.
 	var redraftUsage anthropic.Usage
 	redraft := func(ctx context.Context, tail []anthropic.Message) (string, error) {
+		ctx, cancel := context.WithTimeout(ctx, cfg.RedraftTimeout)
+		defer cancel()
 		messages := append(slices.Clone(res.Messages), tail...)
 		resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
 			Model:     cfg.Model,

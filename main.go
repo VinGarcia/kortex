@@ -328,6 +328,12 @@ func firstArgvValue(argv []string, flag string) string {
 // and large enough for the tool-driving turns the canary targets.
 const defaultMaxTokens = 8192
 
+// defaultRedraftTimeout bounds one redraft call to the core model inside the
+// active superego loop. Fixed in v0: sized to the 60s superego magnitude
+// (config.DefaultSuperegoTimeoutSeconds), since a redraft writes a full prose
+// response rather than a short facet reply.
+const defaultRedraftTimeout = 60 * time.Second
+
 // resolveNativeToken resolves the OAuth token for the native path from the
 // composition root. KORTEX_TOKEN_FILE, when set, names a file kortex reads and
 // trims itself, and takes precedence over CODECOMPANION_OAUTH_TOKEN: it lets
@@ -434,19 +440,20 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
 	err = session.Run(ctx, session.Config{
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Client:        client,
-		Dispatcher:    dispatcher,
-		Store:         session.NewStore(nativeStateDir(getenv)),
-		SessionID:     sessionID,
-		Model:         model,
-		MaxTokens:     defaultMaxTokens,
-		NewUUID:       newUUIDv4,
-		Diag:          stderr,
-		Annotator:     annotator,
-		TurnEvaluator: turnEvaluator,
-		Governor:      governor,
+		Stdin:          stdin,
+		Stdout:         stdout,
+		Client:         client,
+		Dispatcher:     dispatcher,
+		Store:          session.NewStore(nativeStateDir(getenv)),
+		SessionID:      sessionID,
+		Model:          model,
+		MaxTokens:      defaultMaxTokens,
+		RedraftTimeout: defaultRedraftTimeout,
+		NewUUID:        newUUIDv4,
+		Diag:           stderr,
+		Annotator:      annotator,
+		TurnEvaluator:  turnEvaluator,
+		Governor:       governor,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
