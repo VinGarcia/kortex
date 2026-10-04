@@ -351,6 +351,15 @@ func governTurn(
 	// the raw draft content of the last (assistant) message with the governed
 	// text. The ephemeral tail was never in res.Messages, so nothing else needs
 	// stripping.
+	//
+	// The flatten is deliberately unconditional. Preserving the core's original
+	// structured blocks on an approved passthrough looks tempting, but requests
+	// never enable extended thinking (see anthropic.wireRequest — no thinking
+	// field), so a response's final turn carries only text blocks: there is
+	// nothing but text to keep, and flattening loses none of it. Keeping the raw
+	// blocks would also be a resume hazard if thinking were ever enabled, since
+	// persisted thinking blocks replayed into a request with thinking off are
+	// rejected by the API.
 	finalMessages := replaceFinalAssistantText(res.Messages, finalText)
 	return finalText, finalMessages, nil
 }
