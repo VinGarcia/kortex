@@ -333,6 +333,44 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The same composition-root facet wiring the passthrough path uses: a
+	// present KORTEX_CONFIG builds the input annotator, output evaluator and
+	// (gate-triggered) superego; absent/empty builds none. A broken config
+	// fails fast here, before any turn runs — mirroring the passthrough path,
+	// where silently degrading an explicitly-set flag would hide the error.
+	facets, err := buildFacets(getenv("KORTEX_CONFIG"), getenv("KORTEX_LOG"))
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: %v\n", err)
+		return 1
+	}
+	// os.Exit (in main) skips defers; the native path returns its code, so a
+	// defer is safe and drains the facets before the process leaves: wait the
+	// evaluators first, then the superegos they dispatched (same ordering as
+	// the passthrough path), then close the shared facet log.
+	defer func() {
+		if facets.outputEvaluator != nil {
+			facets.outputEvaluator.WaitInFlight()
+		}
+		if facets.superego != nil {
+			facets.superego.WaitInFlight()
+		}
+		if facets.logFile != nil {
+			facets.logFile.Close()
+		}
+	}()
+	// A typed nil (e.g. a nil *facet.InputAnnotator) assigned straight into an
+	// interface field is itself non-nil, so the facet's nil-check would miss
+	// and a nil receiver would panic; guard each the way the passthrough path
+	// does before handing it to the session.
+	var annotator session.Annotator
+	if facets.annotator != nil {
+		annotator = facets.annotator
+	}
+	var turnEvaluator session.TurnEvaluator
+	if facets.outputEvaluator != nil {
+		turnEvaluator = facets.outputEvaluator
+	}
+
 	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
 	// legitimate long generation (a deep tool loop) must not be cut off, and
 	// OpenClaw owns the outer round deadline.
@@ -341,17 +379,19 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
-	err := session.Run(ctx, session.Config{
-		Stdin:      stdin,
-		Stdout:     stdout,
-		Client:     client,
-		Dispatcher: dispatcher,
-		Store:      session.NewStore(nativeStateDir(getenv)),
-		SessionID:  sessionID,
-		Model:      model,
-		MaxTokens:  defaultMaxTokens,
-		NewUUID:    newUUIDv4,
-		Diag:       stderr,
+	err = session.Run(ctx, session.Config{
+		Stdin:         stdin,
+		Stdout:        stdout,
+		Client:        client,
+		Dispatcher:    dispatcher,
+		Store:         session.NewStore(nativeStateDir(getenv)),
+		SessionID:     sessionID,
+		Model:         model,
+		MaxTokens:     defaultMaxTokens,
+		NewUUID:       newUUIDv4,
+		Diag:          stderr,
+		Annotator:     annotator,
+		TurnEvaluator: turnEvaluator,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)

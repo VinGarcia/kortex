@@ -41,6 +41,11 @@ func textResponder(t *testing.T, reply string) (*httptest.Server, *recorded) {
 		rec.calls++
 		rec.lastSystem = body.System
 		rec.lastMessageCount = len(body.Messages)
+		if n := len(body.Messages); n > 0 {
+			if text, ok := body.Messages[n-1].Content.(string); ok {
+				rec.lastUserText = text
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, reply)
 	}))
@@ -52,6 +57,7 @@ type recorded struct {
 	calls            int
 	lastSystem       string
 	lastMessageCount int
+	lastUserText     string
 }
 
 func initializeLine(prompt string) string {

@@ -88,6 +88,11 @@ deps:
       - protocol
       - tools
       - anthropic
+      # F3d facet wiring: session defines its own Annotator/TurnEvaluator ports
+      # (facet satisfies them, never the reverse) and reads the canonical
+      # history read-only to hand the evaluator its per-turn snapshot — the
+      # same inward edge proxy already declares.
+      - history
   loopsmoke:
     mayDependOn:
       - anthropic

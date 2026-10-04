@@ -7,9 +7,29 @@ import (
 	"io"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 	"github.com/vingarcia/kortex/internal/tools"
 )
+
+// Annotator is the facet seam on the incoming side: it may rewrite the user's
+// text before the turn runs (the native-path parallel of the proxy's
+// to-backend Interceptor). Defined here, not imported from the facet package,
+// for the same decoupling reason the proxy defines its own ports. A nil
+// Config.Annotator skips annotation.
+type Annotator interface {
+	Annotate(text string) string
+}
+
+// TurnEvaluator is the facet seam on the completion side: it is notified of
+// each completed turn with the session's accumulated history (the native-path
+// parallel of the proxy's from-backend TurnEvaluator; identical signature, so
+// facet.OutputEvaluator satisfies both). The implementation returns promptly
+// by contract (it dispatches its own goroutine). A nil Config.TurnEvaluator
+// skips evaluation.
+type TurnEvaluator interface {
+	EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot)
+}
 
 // maxLineBytes bounds one NDJSON input line. The default bufio.Scanner cap
 // (64KiB) is far too small for the initialize control_request: it carries the
@@ -45,6 +65,13 @@ type Config struct {
 	// (e.g. a history save that failed after the turn already completed). It is
 	// never the stdout wire. Nil discards them.
 	Diag io.Writer
+	// Annotator, when non-nil, rewrites each real user message before its turn
+	// runs (the input-annotator facet). Nil leaves the user text untouched.
+	Annotator Annotator
+	// TurnEvaluator, when non-nil, is notified of each completed turn over the
+	// session's accumulated history (the output-evaluator facet, which in turn
+	// fires the superego on a gate hit). Nil skips evaluation.
+	TurnEvaluator TurnEvaluator
 }
 
 // Run drives a native kortex session: it reads the OpenClaw NDJSON protocol
@@ -61,7 +88,7 @@ type Config struct {
 // the next turn. Run returns only on stdin EOF, a context cancellation, or a
 // failure writing to stdout (which breaks the wire and cannot be recovered).
 func Run(ctx context.Context, cfg Config) error {
-	history, err := cfg.Store.Load(cfg.SessionID)
+	msgs, err := cfg.Store.Load(cfg.SessionID)
 	if err != nil {
 		// A corrupt persisted history is fatal: continuing with a silently
 		// empty conversation would drop the context OpenClaw assumes is intact.
@@ -70,6 +97,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	emitter := tools.NewStreamEmitter(cfg.Stdout, cfg.SessionID, cfg.NewUUID)
 	var systemPrompt string
+	// turns accumulates one history.Turn per completed turn, feeding the
+	// TurnEvaluator the same per-process view the passthrough recorder gives
+	// it: turns handled by this process, not the cross-resume history on disk.
+	var turns []history.Turn
 
 	scanner := bufio.NewScanner(cfg.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
@@ -102,9 +133,26 @@ func Run(ctx context.Context, cfg Config) error {
 			if ev.IsReplay || ev.Message == nil {
 				continue
 			}
-			history, err = runTurn(ctx, cfg, emitter, systemPrompt, history, ev.Message.TextContent())
+			// The input-annotator facet rewrites the user's text before the
+			// turn runs, so the annotated text is what the core model sees and
+			// what the canonical history persists — exactly the passthrough
+			// behavior, where the annotated line is what reaches the backend.
+			userText := ev.Message.TextContent()
+			if cfg.Annotator != nil {
+				userText = cfg.Annotator.Annotate(userText)
+			}
+			var turn *history.Turn
+			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, userText)
 			if err != nil {
 				return err
+			}
+			// A failed turn (turn == nil) emitted its error result and left
+			// history unchanged; it has no assistant output to evaluate, so the
+			// evaluator fires only on a turn that completed successfully.
+			if turn != nil && cfg.TurnEvaluator != nil {
+				turns = append(turns, *turn)
+				snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: append([]history.Turn(nil), turns...)}
+				cfg.TurnEvaluator.EvaluateCompletedTurn(len(turns)-1, snapshot)
 			}
 		}
 	}
@@ -115,39 +163,52 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 // runTurn runs one user turn through the tool-loop and returns the updated
-// history. A tool-loop failure is reported to OpenClaw as a terminal error
-// result and the previous history is returned unchanged, so the session can
-// carry on with the next turn; only a failure writing that error result (a
-// broken wire) propagates as a fatal error.
+// history plus a history.Turn describing the completed turn (nil when the turn
+// failed). A tool-loop failure is reported to OpenClaw as a terminal error
+// result and the previous history is returned unchanged with a nil turn, so the
+// session can carry on with the next turn; only a failure writing that error
+// result (a broken wire) propagates as a fatal error.
 func runTurn(
 	ctx context.Context,
 	cfg Config,
 	emitter *tools.StreamEmitter,
 	systemPrompt string,
-	history []anthropic.Message,
+	msgs []anthropic.Message,
 	userText string,
-) ([]anthropic.Message, error) {
+) ([]anthropic.Message, *history.Turn, error) {
 	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
 		Model:       cfg.Model,
 		System:      systemPrompt,
 		MaxTokens:   cfg.MaxTokens,
-		History:     history,
+		History:     msgs,
 		UserMessage: userText,
 		Emitter:     emitter,
 	})
 	if err != nil {
 		if emitErr := emitter.ErrorResult(fmt.Sprintf("kortex: %v", err)); emitErr != nil {
-			return nil, fmt.Errorf("session: %w", emitErr)
+			return nil, nil, fmt.Errorf("session: %w", emitErr)
 		}
 		diagf(cfg.Diag, "session: turn failed, round closed with error result: %v", err)
-		return history, nil
+		return msgs, nil, nil
 	}
 	if err := cfg.Store.Save(cfg.SessionID, res.Messages); err != nil {
 		// The turn already succeeded and its result reached OpenClaw; a save
 		// failure only costs cross-process resume, so it must not fail the turn.
 		diagf(cfg.Diag, "session: history not persisted (resume will lose this turn): %v", err)
 	}
-	return res.Messages, nil
+	// The turn's canonical text for the facets: the user message as sent (the
+	// annotator already rewrote it) and the assistant's final text. Unlike the
+	// proxy's event-driven history.Recorder, this native construction leaves
+	// ToolCalls and IsError unset — every current facet consumer reads only the
+	// user/assistant text, so the paths behave identically; a future facet that
+	// needs tool-call context would have to populate them from the LoopResult.
+	turn := history.Turn{
+		UserText:      userText,
+		AssistantText: res.FinalText,
+		StopReason:    res.StopReason,
+		Completed:     true,
+	}
+	return res.Messages, &turn, nil
 }
 
 func diagf(w io.Writer, format string, args ...any) {

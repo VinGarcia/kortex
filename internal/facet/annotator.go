@@ -100,6 +100,27 @@ func (a *InputAnnotator) InterceptToBackend(line []byte, event protocol.Event) [
 	return newLine
 }
 
+// Annotate is the native producer's seam (paralleling InterceptToBackend, the
+// proxy's line-level seam): it runs the facet over an already-parsed user
+// message and returns the text to send to the core model — the annotated text
+// on success, the original text unchanged on any failure or decline
+// (fail-open). A panic degrades to the original text, never a dropped message.
+func (a *InputAnnotator) Annotate(text string) (result string) {
+	result = text
+	defer func() {
+		// A panic in the annotation path must degrade to the original text,
+		// not propagate and abort the turn.
+		if r := recover(); r != nil {
+			a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Err: fmt.Sprintf("panic: %v", r)})
+			result = text
+		}
+	}()
+	if annotated, ok := a.annotateText(text); ok {
+		return annotated
+	}
+	return text
+}
+
 // annotateText runs the evaluator over the message text and interleaves the
 // returned tags. ok=false declines the rewrite (nothing to annotate, or a
 // failure — already logged) and the original line passes through.

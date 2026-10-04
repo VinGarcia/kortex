@@ -150,7 +150,7 @@ func TestNativeSessionID(t *testing.T) {
 }
 
 func TestRunNative_guardsFailFast(t *testing.T) {
-	// Both guards return before any Messages call, so empty stdin is enough.
+	// Each guard returns before any Messages call, so empty stdin is enough.
 	tests := []struct {
 		desc string
 		env  map[string]string
@@ -165,6 +165,16 @@ func TestRunNative_guardsFailFast(t *testing.T) {
 			desc: "missing model",
 			env:  map[string]string{"CODECOMPANION_OAUTH_TOKEN": "secret"},
 			argv: []string{"-p", "hi"},
+		},
+		{
+			// A present-but-broken KORTEX_CONFIG must fail fast the same way the
+			// passthrough path does: buildFacets errors before any turn runs.
+			desc: "broken KORTEX_CONFIG",
+			env: map[string]string{
+				"CODECOMPANION_OAUTH_TOKEN": "secret",
+				"KORTEX_CONFIG":             filepath.Join(t.TempDir(), "does-not-exist.json"),
+			},
+			argv: []string{"--model", "claude-opus-4-8"},
 		},
 	}
 	for _, test := range tests {
