@@ -61,6 +61,13 @@ type OutputGovernor interface {
 // of KiB. 16MiB leaves generous headroom without risking an unbounded read.
 const maxLineBytes = 16 << 20
 
+// DefaultRedraftTimeout is the safe floor Run applies when Config.RedraftTimeout
+// is 0, mirroring tools.DefaultCallTimeout. It guarantees a zero value can never
+// collapse into an already-expired deadline that would make every redraft fail
+// instantly and silently disable the superego (fail open on every turn). 60s
+// matches main.go's defaultRedraftTimeout.
+const DefaultRedraftTimeout = 60 * time.Second
+
 // Config is everything Run needs, supplied by the composition root (main): Run
 // reads no env and resolves no paths of its own. Every field except Diag is
 // required.
@@ -87,7 +94,8 @@ type Config struct {
 	// superego loop. The core client carries no HTTP timeout and the redraft is
 	// the one core-model call in the governor loop with no deadline of its own,
 	// so without this bound a hung redraft blocks the whole turn forever; on
-	// timeout the governor fails open to delivering the raw draft.
+	// timeout the governor fails open to delivering the raw draft. 0 means
+	// DefaultRedraftTimeout.
 	RedraftTimeout time.Duration
 	// LoopCallTimeout bounds each individual core-model call inside the
 	// tool-loop (RunLoop). The core client carries no HTTP timeout and MaxTurns
@@ -307,7 +315,11 @@ func governTurn(
 	// full round, not just the first draft.
 	var redraftUsage anthropic.Usage
 	redraft := func(ctx context.Context, tail []anthropic.Message) (string, error) {
-		ctx, cancel := context.WithTimeout(ctx, cfg.RedraftTimeout)
+		redraftTimeout := cfg.RedraftTimeout
+		if redraftTimeout <= 0 {
+			redraftTimeout = DefaultRedraftTimeout
+		}
+		ctx, cancel := context.WithTimeout(ctx, redraftTimeout)
 		defer cancel()
 		messages := append(slices.Clone(res.Messages), tail...)
 		resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{

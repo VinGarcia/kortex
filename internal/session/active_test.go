@@ -271,6 +271,55 @@ func TestRun_ActiveGovernorRedraftTimesOutFailsOpen(t *testing.T) {
 	}
 }
 
+// TestRun_ActiveGovernorZeroRedraftTimeoutUsesDefault proves that leaving
+// Config.RedraftTimeout at its zero value does NOT silently disable the
+// superego. Before the clamp, context.WithTimeout(ctx, 0) handed the redraft an
+// already-expired deadline, so every redraft errored instantly and the governor
+// failed open to the raw draft on every turn. With the DefaultRedraftTimeout
+// floor the redraft gets a real (non-expired) deadline: it reaches the core
+// model, succeeds, and the revised draft is delivered.
+func TestRun_ActiveGovernorZeroRedraftTimeoutUsesDefault(t *testing.T) {
+	server, calls := sequencedResponder(t, "raw-draft", "revised-draft")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-TAIL-TEXT"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		// RedraftTimeout deliberately omitted (zero): the clamp must supply the
+		// default floor rather than an already-expired deadline.
+		Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Both core calls happened (draft + redraft): the redraft was not instantly
+	// cancelled by a zero deadline.
+	if len(*calls) != 2 {
+		t.Fatalf("core model calls = %d, want 2 (draft + redraft); a zero deadline would have aborted the redraft", len(*calls))
+	}
+	// The redraft resolved against the core model rather than erroring out, so
+	// the governor delivered the revised draft instead of failing open.
+	if gov.redraftResult != "revised-draft" {
+		t.Errorf("redraft result = %q, want revised-draft (a zero deadline would error and leave it empty)", gov.redraftResult)
+	}
+	var resultText string
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+		}
+	}
+	if resultText != "revised-draft" {
+		t.Errorf("delivered result = %q, want revised-draft (superego executed, not a silent fail-open to raw-draft)", resultText)
+	}
+}
+
 // TestRun_ActiveGovernorHoldDeliversHoldMessage proves a held turn delivers the
 // governor's hold-and-ask text instead of the draft, and persists that text.
 func TestRun_ActiveGovernorHoldDeliversHoldMessage(t *testing.T) {
