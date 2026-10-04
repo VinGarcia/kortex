@@ -20,7 +20,7 @@
 # var and only ever sent as an Authorization: Bearer header.
 set -euo pipefail
 
-TOKEN_FILE="/home/vingarcia/.openclaw/secrets/kortex-oauth-token"
+TOKEN_FILE="/home/vingarcia/.openclaw/secrets/kortex-setup-token"
 API="https://api.anthropic.com/v1/messages"
 HAIKU_MODEL="claude-haiku-4-5-20251001"
 FABLE_MODEL="claude-fable-5"

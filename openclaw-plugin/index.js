@@ -18,15 +18,24 @@ const KORTEX_CONFIG_PATH =
   "/home/vingarcia/projects/sylphie/kortex/canary-config.json";
 const KORTEX_LOG_PATH = "/home/vingarcia/.openclaw/kortex/kortex.log";
 const KORTEX_TOKEN_PATH =
-  "/home/vingarcia/.openclaw/secrets/kortex-oauth-token";
+  "/home/vingarcia/.openclaw/secrets/kortex-setup-token";
 
 function kortexEnv() {
+  // kortex now reads the OAuth token itself from the path named by
+  // KORTEX_TOKEN_FILE (precedence over CODECOMPANION_OAUTH_TOKEN), so the secret
+  // never transits this process's environment. The old env injection stays for
+  // one release as a fallback for a kortex binary that predates KORTEX_TOKEN_FILE;
+  // drop the readFileSync + CODECOMPANION_OAUTH_TOKEN pair once the canary binary
+  // is known to resolve the file. Guard on readability so a missing token file
+  // still degrades to pure passthrough.
   try {
     const token = readFileSync(KORTEX_TOKEN_PATH, "utf8").trim();
     if (!token) return {};
     return {
       KORTEX_CONFIG: KORTEX_CONFIG_PATH,
       KORTEX_LOG: KORTEX_LOG_PATH,
+      KORTEX_STREAM_EMITTER: "1",
+      KORTEX_TOKEN_FILE: KORTEX_TOKEN_PATH,
       CODECOMPANION_OAUTH_TOKEN: token,
     };
   } catch {

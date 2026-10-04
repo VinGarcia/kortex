@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	tokenFile = "/home/vingarcia/.openclaw/secrets/kortex-oauth-token"
+	tokenFile = "/home/vingarcia/.openclaw/secrets/kortex-setup-token"
 	// Haiku 4.5: claude-fable-5 is 429-rate-limited on this OAuth (F3a).
 	model = "claude-haiku-4-5-20251001"
 )
