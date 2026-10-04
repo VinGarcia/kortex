@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 )
@@ -14,6 +15,13 @@ import (
 // depth — most tool-loop turns in the workloads F3b targets (crons, git,
 // scripts) resolve in a handful of calls.
 const DefaultMaxTurns = 25
+
+// DefaultCallTimeout is the per-call deadline RunLoop uses when
+// LoopRequest.CallTimeout is 0. The core client carries no HTTP timeout, so a
+// single hung CreateMessage would otherwise block the whole turn forever; this
+// safety net bounds each call generously enough to let normal long generations
+// finish while still catching a truly stuck call.
+const DefaultCallTimeout = 120 * time.Second
 
 // LoopRequest configures one RunLoop call.
 type LoopRequest struct {
@@ -29,6 +37,14 @@ type LoopRequest struct {
 	History []anthropic.Message
 	// MaxTurns bounds tool_use round trips; 0 means DefaultMaxTurns.
 	MaxTurns int
+	// CallTimeout bounds each individual CreateMessage call to the core model
+	// inside the loop; 0 means DefaultCallTimeout. MaxTurns caps how many
+	// round trips run, but a single hung call blocks the turn indefinitely
+	// because the core client has no HTTP timeout, so this per-call deadline is
+	// the only bound on one stuck call. Unlike the superego redraft (which has a
+	// raw draft to fall back to), the loop has no fallback: a timed-out call
+	// surfaces as a fail-closed error return from RunLoop.
+	CallTimeout time.Duration
 	// Emitter, when non-nil, receives the loop's turns as stream-json (NDJSON)
 	// events: system/init, one assistant event per turn, one user event per
 	// tool_result batch, and the terminal result. Nil disables emission, in
@@ -82,6 +98,11 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		maxTurns = DefaultMaxTurns
 	}
 
+	callTimeout := req.CallTimeout
+	if callTimeout <= 0 {
+		callTimeout = DefaultCallTimeout
+	}
+
 	messages := append(slices.Clone(req.History), anthropic.Message{Role: "user", Content: req.UserMessage})
 	tools := dispatcher.ToolDefs()
 
@@ -102,14 +123,26 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	// tool loop that reported only the final turn would under-count the round.
 	var totalUsage anthropic.Usage
 	for turn := 1; turn <= maxTurns; turn++ {
-		resp, err := client.CreateMessage(ctx, anthropic.MessageRequest{
+		// Bound each call with its own deadline (see CallTimeout). cancel() is
+		// called explicitly after the call, not deferred, so the per-turn
+		// contexts do not pile up across loop iterations.
+		cctx, cancel := context.WithTimeout(ctx, callTimeout)
+		resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
 			Model:     req.Model,
 			System:    req.System,
 			MaxTokens: req.MaxTokens,
 			Messages:  messages,
 			Tools:     tools,
 		})
+		cancel()
 		if err != nil {
+			// Fail-closed: the loop has no fallback output, so a call that blew the
+			// per-call deadline surfaces as a clear error naming the bound. A
+			// deadline hit is reported this way; any other call error keeps the
+			// existing turn-scoped wrapping.
+			if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: call exceeded per-call deadline (%s): %w", turn, callTimeout, err)
+			}
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
 		totalUsage = totalUsage.Add(resp.Usage)

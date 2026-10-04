@@ -89,6 +89,13 @@ type Config struct {
 	// so without this bound a hung redraft blocks the whole turn forever; on
 	// timeout the governor fails open to delivering the raw draft.
 	RedraftTimeout time.Duration
+	// LoopCallTimeout bounds each individual core-model call inside the
+	// tool-loop (RunLoop). The core client carries no HTTP timeout and MaxTurns
+	// only caps the number of round trips, so without this a single hung call
+	// blocks the whole turn forever; 0 lets RunLoop apply its safe default. The
+	// tool loop has no fallback output, so a timed-out call fails closed as a
+	// turn error rather than fail-open like the redraft.
+	LoopCallTimeout time.Duration
 	// NewUUID mints one v4 message uuid per emitted assistant/user event.
 	NewUUID func() string
 	// Diag, when non-nil, receives one-line diagnostics for non-fatal problems
@@ -222,6 +229,7 @@ func runTurn(
 		MaxTokens:   cfg.MaxTokens,
 		History:     msgs,
 		UserMessage: userText,
+		CallTimeout: cfg.LoopCallTimeout,
 		Emitter:     emitter,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.

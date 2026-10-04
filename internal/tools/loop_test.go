@@ -154,3 +154,54 @@ func TestRunLoop_maxTurnsExceeded(t *testing.T) {
 		t.Fatal("want error when MaxTurns is exceeded")
 	}
 }
+
+// TestRunLoop_callTimeoutFailsClosed proves a hung CreateMessage is bounded by
+// LoopRequest.CallTimeout rather than blocking the turn forever: when the
+// endpoint never responds, RunLoop returns a deadline error PROMPTLY (bounded
+// completion near the tiny injected timeout) instead of hanging. Fail-closed —
+// the loop has no fallback output, so the timeout surfaces as an error return
+// naming the per-call deadline, not a silent result. The client is built with
+// no HTTP timeout (the production wiring from main.go), so the only bound on
+// the hung call is the per-call deadline this test exercises.
+func TestRunLoop_callTimeoutFailsClosed(t *testing.T) {
+	const callTimeout = 100 * time.Millisecond
+
+	// The handler hangs until the client cancels (the per-call deadline firing)
+	// or teardown closes. teardown is closed before server.Close runs (defer
+	// beats t.Cleanup) so the hung handler never blocks server shutdown even if
+	// it didn't observe the client-side cancellation.
+	teardown := make(chan struct{})
+	defer close(teardown)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-teardown:
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := anthropic.NewClient("secret-token", server.URL, 0)
+
+	start := time.Now()
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "m",
+		MaxTokens:   10,
+		UserMessage: "hang please",
+		CallTimeout: callTimeout,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("want an error when the core-model call exceeds CallTimeout")
+	}
+	// Bounded: RunLoop returned far sooner than the hung endpoint would ever
+	// allow. The ceiling is generous versus the 100ms deadline yet nowhere near
+	// the forever a missing bound would produce.
+	if elapsed > 5*time.Second {
+		t.Fatalf("RunLoop took %s, want bounded completion near the %s call deadline", elapsed, callTimeout)
+	}
+	// Fail-closed: the error names the per-call deadline so the cause is clear.
+	if !strings.Contains(err.Error(), "per-call deadline") {
+		t.Errorf("error = %q, want it to name the per-call deadline", err)
+	}
+}

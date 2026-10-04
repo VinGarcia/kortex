@@ -334,6 +334,14 @@ const defaultMaxTokens = 8192
 // response rather than a short facet reply.
 const defaultRedraftTimeout = 60 * time.Second
 
+// defaultLoopCallTimeout bounds each individual core-model call inside the
+// native tool-loop. This is the PRIMARY turn-generation call (it may
+// legitimately run longer than the quick redraft), so the bound is generous —
+// large enough to let a normal long generation finish, finite enough to catch
+// a truly hung call instead of blocking the turn forever. Unlike the redraft
+// (which fails open to the raw draft), a timed-out loop call fails closed.
+const defaultLoopCallTimeout = 120 * time.Second
+
 // resolveNativeToken resolves the OAuth token for the native path from the
 // composition root. KORTEX_TOKEN_FILE, when set, names a file kortex reads and
 // trims itself, and takes precedence over CODECOMPANION_OAUTH_TOKEN: it lets
@@ -440,20 +448,21 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
 	err = session.Run(ctx, session.Config{
-		Stdin:          stdin,
-		Stdout:         stdout,
-		Client:         client,
-		Dispatcher:     dispatcher,
-		Store:          session.NewStore(nativeStateDir(getenv)),
-		SessionID:      sessionID,
-		Model:          model,
-		MaxTokens:      defaultMaxTokens,
-		RedraftTimeout: defaultRedraftTimeout,
-		NewUUID:        newUUIDv4,
-		Diag:           stderr,
-		Annotator:      annotator,
-		TurnEvaluator:  turnEvaluator,
-		Governor:       governor,
+		Stdin:           stdin,
+		Stdout:          stdout,
+		Client:          client,
+		Dispatcher:      dispatcher,
+		Store:           session.NewStore(nativeStateDir(getenv)),
+		SessionID:       sessionID,
+		Model:           model,
+		MaxTokens:       defaultMaxTokens,
+		RedraftTimeout:  defaultRedraftTimeout,
+		LoopCallTimeout: defaultLoopCallTimeout,
+		NewUUID:         newUUIDv4,
+		Diag:            stderr,
+		Annotator:       annotator,
+		TurnEvaluator:   turnEvaluator,
+		Governor:        governor,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
