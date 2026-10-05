@@ -324,9 +324,15 @@ func firstArgvValue(argv []string, flag string) string {
 }
 
 // defaultMaxTokens caps each native turn's response length. It is fixed in v0
-// (no env override): 8192 is safely within every current model's output ceiling
-// and large enough for the tool-driving turns the canary targets.
-const defaultMaxTokens = 8192
+// (no env override). The canary core model (fable) thinks adaptively, and
+// max_tokens is the shared budget for thinking AND the visible text: at 8192 a
+// deep thinking pass could consume the whole budget and leave zero text, which
+// OpenClaw rejects as an empty turn (observed live 2026-10-04). 16000 gives the
+// text room to land after thinking while staying well within the model's output
+// ceiling; the 120s per-call deadline (defaultLoopCallTimeout) is the real wall
+// on a long generation, not this cap. Effort (see runNative) bounds how much of
+// this budget thinking itself takes.
+const defaultMaxTokens = 16000
 
 // defaultRedraftTimeout bounds one redraft call to the core model inside the
 // active superego loop. Fixed in v0: sized to the 60s superego magnitude
@@ -387,6 +393,11 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		fmt.Fprintln(stderr, "kortex: native mode needs --model in argv; not found")
 		return 1
 	}
+	// OpenClaw passes --effort in argv; forward it to every core-model call as
+	// output_config.effort. Bounding effort keeps a thinking model (fable) from
+	// spending the whole max_tokens budget on thinking and returning no text.
+	// Empty is fine: the API default stands.
+	effort := firstArgvValue(argv, "--effort")
 
 	// SIGINT/SIGTERM cancel the in-flight turn so the process exits promptly
 	// instead of blocking on a long Messages call.
@@ -444,6 +455,24 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// OpenClaw owns the outer round deadline.
 	client := anthropic.NewClient(token, "", 0)
 
+	// When KORTEX_LOG is set, mirror the passthrough path's wire log onto the
+	// native path: the real claude-cli's traffic is captured by trafficLogger,
+	// but the native client talks to the API directly, so its request/response
+	// bodies are logged to a sibling "<KORTEX_LOG>.native" file. This is the only
+	// way to see the core model's raw stop_reason and content blocks for
+	// diagnosis. The OAuth token never reaches this file: it travels in the
+	// Authorization header, which the client logs nothing of (see logWire). A
+	// failed open degrades gracefully — the turn still runs, we just warn once.
+	if logPath := getenv("KORTEX_LOG"); logPath != "" {
+		wireFile, err := os.OpenFile(logPath+".native", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			fmt.Fprintf(stderr, "kortex: native wire log disabled: %v\n", err)
+		} else {
+			defer wireFile.Close()
+			client.SetWireLog(wireFile)
+		}
+	}
+
 	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
@@ -455,6 +484,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		Store:           session.NewStore(nativeStateDir(getenv)),
 		SessionID:       sessionID,
 		Model:           model,
+		Effort:          effort,
 		MaxTokens:       defaultMaxTokens,
 		RedraftTimeout:  defaultRedraftTimeout,
 		LoopCallTimeout: defaultLoopCallTimeout,
