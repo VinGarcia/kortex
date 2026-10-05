@@ -261,6 +261,68 @@ func TestRun_EmptyFinalTurnEmitsErrorNotEmpty(t *testing.T) {
 	}
 }
 
+// TestToolCallsFromMessages_extractsThisTurnOnly pins the #4749 extraction:
+// toolCallsFromMessages must open a ToolCall per tool_use block (preserving
+// order), attach each tool_result to its call by id (success and is_error), and
+// — because runTurn passes res.Messages[len(msgs):] — fold in only the slice it
+// is given, never a prior turn's tool traffic.
+func TestToolCallsFromMessages_extractsThisTurnOnly(t *testing.T) {
+	messages := []anthropic.Message{
+		// --- a PRIOR turn's exchange (index 0-1): must stay out of the result
+		// when runTurn slices it off with res.Messages[len(msgs):]. ---
+		{Role: "assistant", Content: []json.RawMessage{
+			json.RawMessage(`{"type":"tool_use","id":"prior-1","name":"OldTool","input":{"x":1}}`),
+		}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("prior-1", "old result", false),
+		}},
+		// --- THIS turn (index 2 onward): the new user message, an assistant turn
+		// mixing text with two tool_use blocks, then their two results. ---
+		{Role: "user", Content: "check the PR"},
+		{Role: "assistant", Content: []json.RawMessage{
+			json.RawMessage(`{"type":"text","text":"let me look"}`),
+			json.RawMessage(`{"type":"tool_use","id":"call-1","name":"Grep","input":{"pattern":"approved"}}`),
+			json.RawMessage(`{"type":"tool_use","id":"call-2","name":"Bash","input":{"cmd":"ls"}}`),
+		}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("call-1", "match found", false),
+			anthropic.NewToolResultBlock("call-2", "boom", true),
+		}},
+		{Role: "assistant", Content: "done"},
+	}
+
+	// priorLen mirrors runTurn's len(msgs): scan only this turn's appended slice.
+	const priorLen = 2
+	got := toolCallsFromMessages(messages[priorLen:])
+
+	if len(got) != 2 {
+		t.Fatalf("got %d tool calls, want 2 (prior turn must be excluded): %+v", len(got), got)
+	}
+	// Order follows tool_use order: Grep before Bash.
+	if got[0].ID != "call-1" || got[0].Name != "Grep" {
+		t.Errorf("call 0 = %+v, want id call-1 name Grep", got[0])
+	}
+	if got[0].Input != `{"pattern":"approved"}` {
+		t.Errorf("call 0 input = %q, want the verbatim tool_use input JSON", got[0].Input)
+	}
+	if got[0].Result != "match found" || got[0].IsError {
+		t.Errorf("call 0 result = %q isError=%v, want \"match found\" / false", got[0].Result, got[0].IsError)
+	}
+	if got[1].ID != "call-2" || got[1].Name != "Bash" {
+		t.Errorf("call 1 = %+v, want id call-2 name Bash", got[1])
+	}
+	if got[1].Result != "boom" || !got[1].IsError {
+		t.Errorf("call 1 result = %q isError=%v, want \"boom\" / true (is_error propagated)", got[1].Result, got[1].IsError)
+	}
+
+	// Guard the slicing claim directly: the full slice DOES fold the prior call
+	// in, so it is the len(msgs) offset — not toolCallsFromMessages — that scopes
+	// a Turn to its own tool traffic.
+	if full := toolCallsFromMessages(messages); len(full) != 3 {
+		t.Errorf("full-slice extraction got %d calls, want 3 (prior-1 + call-1 + call-2)", len(full))
+	}
+}
+
 func TestRun_TurnErrorEmitsResultAndContinues(t *testing.T) {
 	// A server that 500s fails the Messages call, so RunLoop errors; the session
 	// must still emit a terminal error result and keep reading the next turn.

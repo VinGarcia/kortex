@@ -144,6 +144,88 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 	}
 }
 
+// TestSuperegoMessages_appendsReviewedTurnToolSummary covers #4749: only the
+// reviewed turn's tool calls are summarized into the closing draft-user message
+// (name, bounded input/result snippets, error marker), and the summary rides
+// AFTER the draft, not in place of it.
+func TestSuperegoMessages_appendsReviewedTurnToolSummary(t *testing.T) {
+	snapshot := history.Snapshot{Turns: []history.Turn{
+		{
+			UserText:      "checa o PR #4749",
+			AssistantText: "reviewed",
+			Completed:     true,
+			ToolCalls: []history.ToolCall{
+				{ID: "t1", Name: "Grep", Input: `{"pattern":"approved"}`, Result: "PR #4749 approved"},
+				{ID: "t2", Name: "Bash", Input: `{"cmd":"gh pr view"}`, Result: "boom", IsError: true},
+			},
+		},
+	}}
+	msgs := superegoMessages(snapshot, 0, "DRAFT", 0)
+	final := msgs[len(msgs)-1]
+	if final.Role != "user" {
+		t.Fatalf("closing message role = %q, want user", final.Role)
+	}
+	// The draft is preserved and precedes the tool block.
+	if !strings.HasPrefix(final.Content, "DRAFT\n\n") {
+		t.Errorf("tool summary must be appended after the draft, got:\n%s", final.Content)
+	}
+	for _, want := range []string{
+		"<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_INICIO>>>",
+		"<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_FIM>>>",
+		"Grep",
+		`{"pattern":"approved"}`,
+		"PR #4749 approved",
+		"Bash",
+		"[ERRO]", // t2 failed
+		"boom",
+	} {
+		if !strings.Contains(final.Content, want) {
+			t.Errorf("tool summary missing %q:\n%s", want, final.Content)
+		}
+	}
+}
+
+// TestSuperegoMessages_noToolBlockWhenNoCalls pins the empty case: a reviewed
+// turn that ran no tools appends nothing — the closing message is the bare
+// draft, with no delimiter block.
+func TestSuperegoMessages_noToolBlockWhenNoCalls(t *testing.T) {
+	snapshot := history.Snapshot{Turns: []history.Turn{
+		{UserText: "oi", AssistantText: "reviewed", Completed: true},
+	}}
+	msgs := superegoMessages(snapshot, 0, "DRAFT", 0)
+	final := msgs[len(msgs)-1]
+	if final.Content != "DRAFT" {
+		t.Errorf("closing message = %q, want the bare draft with no tool block", final.Content)
+	}
+	if strings.Contains(final.Content, "FERRAMENTAS_EXECUTADAS") {
+		t.Errorf("no tool block must be emitted when the reviewed turn ran no tools:\n%s", final.Content)
+	}
+}
+
+// TestToolCallsSummary_truncatesAndSkipsEmpty covers the snippet bounds: an
+// input/result longer than the cap is cut to superegoTool*Max runes with an
+// ellipsis, and nil tool calls yield "" (no block).
+func TestToolCallsSummary_truncatesAndSkipsEmpty(t *testing.T) {
+	if s := toolCallsSummary(nil); s != "" {
+		t.Errorf("toolCallsSummary(nil) = %q, want \"\"", s)
+	}
+
+	long := strings.Repeat("a", 500)
+	summary := toolCallsSummary([]history.ToolCall{{Name: "Big", Input: long, Result: long}})
+	if strings.Contains(summary, long) {
+		t.Errorf("summary carried the full 500-rune payload, want it truncated:\n%s", summary)
+	}
+	// Input and result are capped at 200 runes then ellipsized.
+	wantInput := strings.Repeat("a", superegoToolInputMax) + "…"
+	wantResult := strings.Repeat("a", superegoToolResultMax) + "…"
+	if !strings.Contains(summary, wantInput) {
+		t.Errorf("input not truncated to %d runes + ellipsis:\n%s", superegoToolInputMax, summary)
+	}
+	if !strings.Contains(summary, wantResult) {
+		t.Errorf("result not truncated to %d runes + ellipsis:\n%s", superegoToolResultMax, summary)
+	}
+}
+
 func TestDraftUnderReviewMessage_formatsTagsAndAbouts(t *testing.T) {
 	draft := draftUnderReviewMessage(
 		[]string{"vou consertar hoje", "sem falta"},
