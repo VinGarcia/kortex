@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/protocol"
@@ -114,6 +115,15 @@ func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason stri
 		return nil
 	}
 	clean := StripToolMarkup(text)
+	// Never emit an empty assistant turn — OpenClaw rejects it as "CLI backend
+	// returned an empty response". The governed text reaching here should always
+	// be non-empty (RunLoop's guard rejects an empty first draft, and the redraft
+	// seam fails open to the non-empty draft in hand), but this is the single
+	// emission chokepoint for the deferred path, so enforce the invariant here too:
+	// degrade to a visible error result rather than a silent empty turn.
+	if strings.TrimSpace(clean) == "" {
+		return e.ErrorResult(fmt.Sprintf("kortex: governed final turn was empty (stop_reason %q); raise max_tokens or lower effort", stopReason))
+	}
 	assistantLine, err := protocol.EmitAssistant(e.sessionID, e.newUUID(), []protocol.ContentBlock{{Type: "text", Text: clean}}, protocol.Usage(usage))
 	if err != nil {
 		return fmt.Errorf("tools: emitting final assistant turn: %w", err)

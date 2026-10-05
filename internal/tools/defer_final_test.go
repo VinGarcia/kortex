@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,6 +182,43 @@ func TestEmitFinalTurn_emitsGovernedAssistantAndResult(t *testing.T) {
 	}
 	if billed.Usage != (protocol.Usage(usage)) {
 		t.Errorf("result usage = %+v, want %+v", billed.Usage, protocol.Usage(usage))
+	}
+}
+
+// TestEmitFinalTurn_emptyTextDegradesToError proves the emission chokepoint
+// never puts an empty assistant turn on the wire: when the governed text is
+// empty or strips (via StripToolMarkup) to nothing, EmitFinalTurn emits a single
+// terminal is_error result naming the cause instead of an empty assistant+result
+// pair — OpenClaw rejects an empty response, so this is the last backstop.
+func TestEmitFinalTurn_emptyTextDegradesToError(t *testing.T) {
+	cases := map[string]string{
+		"empty string": "",
+		"whitespace":   "   \n\t",
+		"markup only":  `<invoke name="Bash"><parameter name="command">ls</parameter></invoke>`,
+	}
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			emitter := NewStreamEmitter(&out, "sess-e", sequencedUUIDs())
+			if err := emitter.EmitFinalTurn(text, 1, "max_tokens", anthropic.Usage{}); err != nil {
+				t.Fatalf("EmitFinalTurn error: %v", err)
+			}
+
+			lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+			if len(lines) != 1 {
+				t.Fatalf("want exactly 1 line (an error result, no empty assistant turn), got %d:\n%s", len(lines), out.String())
+			}
+			ev := protocol.Parse(lines[0])
+			if ev.ParseErr != nil || ev.Type != protocol.TypeResult || ev.Result == nil {
+				t.Fatalf("line is not a result event: %+v\n%s", ev, lines[0])
+			}
+			if !ev.Result.IsError {
+				t.Errorf("result is not an error (an empty final turn must degrade to an error): %+v", ev.Result)
+			}
+			if !strings.Contains(ev.Result.Text, "max_tokens") {
+				t.Errorf("error result should name the stop_reason, got %q", ev.Result.Text)
+			}
+		})
 	}
 }
 

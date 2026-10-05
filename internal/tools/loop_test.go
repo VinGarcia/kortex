@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,6 +126,125 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 	// RunLoop must not mutate the caller's History slice.
 	if len(history) != 2 {
 		t.Errorf("input History was mutated to len %d, want 2", len(history))
+	}
+}
+
+// TestRunLoop_emptyFinalTurnFailsClosed proves the backstop for the live
+// 2026-10-04 failure: a thinking model that spends its whole MaxTokens budget on
+// thinking returns a final turn (stop_reason "max_tokens") carrying only a
+// thinking block and zero text. OpenClaw rejects an empty assistant turn, and
+// the turn cannot be continued (fable 400s a last-assistant prefill), so RunLoop
+// must fail closed with an error naming the stop_reason — never return an empty
+// FinalText that a caller would emit as an empty turn.
+func TestRunLoop_emptyFinalTurnFailsClosed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// A thinking-only turn: a signature-bearing thinking block, no text block,
+		// stopped because max_tokens was hit mid-thought.
+		w.Write([]byte(`{
+			"content": [{"type":"thinking","thinking":"","signature":"sig-abc"}],
+			"stop_reason": "max_tokens",
+			"usage": {"input_tokens": 10, "output_tokens": 8192}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-fable-5",
+		MaxTokens:   8192,
+		UserMessage: "think hard",
+	})
+	if err == nil {
+		t.Fatal("want a fail-closed error when the final turn has no text")
+	}
+	// The error must name the stop_reason so the cause is diagnosable.
+	if !strings.Contains(err.Error(), "max_tokens") {
+		t.Errorf("error = %q, want it to name the max_tokens stop_reason", err)
+	}
+}
+
+// TestRunLoop_echoesThinkingBlockVerbatim proves the native path preserves a
+// signature-bearing thinking block when it echoes an intermediate tool_use turn
+// back to the API. Anthropic requires thinking blocks replayed WITHIN a tool-use
+// cycle to keep their signature unchanged; RunLoop echoes raw content, so the
+// signature must survive into the follow-up request verbatim.
+func TestRunLoop_echoesThinkingBlockVerbatim(t *testing.T) {
+	call := 0
+	var secondRequestBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			// fable's real shape: a thinking block (carrying a signature) precedes
+			// the tool_use block in the same assistant turn.
+			w.Write([]byte(`{
+				"content": [
+					{"type":"thinking","thinking":"","signature":"sig-xyz-123"},
+					{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo hi"},"caller":{"type":"direct"}}
+				],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 10, "output_tokens": 5}
+			}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		secondRequestBody = string(body)
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"done"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 12, "output_tokens": 6}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-fable-5",
+		MaxTokens:   1024,
+		UserMessage: "run echo hi",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if call != 2 {
+		t.Fatalf("want 2 API calls, got %d", call)
+	}
+	// The echoed assistant turn must carry the thinking block with its signature
+	// byte-for-byte: a dropped or altered signature would 400 the resume.
+	if !strings.Contains(secondRequestBody, `"signature":"sig-xyz-123"`) {
+		t.Errorf("follow-up request dropped the thinking block signature: %s", secondRequestBody)
+	}
+}
+
+// TestRunLoop_forwardsEffort proves LoopRequest.Effort reaches the wire as
+// output_config.effort, so OpenClaw's --effort bounds how much of the token
+// budget a thinking model spends before answering.
+func TestRunLoop_forwardsEffort(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-fable-5",
+		MaxTokens:   1024,
+		Effort:      "medium",
+		UserMessage: "hi",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	oc, ok := gotBody["output_config"].(map[string]any)
+	if !ok {
+		t.Fatalf("request did not carry output_config: %v", gotBody)
+	}
+	if oc["effort"] != "medium" {
+		t.Errorf("output_config.effort = %v, want medium", oc["effort"])
 	}
 }
 

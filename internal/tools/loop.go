@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
@@ -25,9 +26,14 @@ const DefaultCallTimeout = 120 * time.Second
 
 // LoopRequest configures one RunLoop call.
 type LoopRequest struct {
-	Model       string
-	System      string
-	MaxTokens   int
+	Model     string
+	System    string
+	MaxTokens int
+	// Effort is forwarded to each core-model call as output_config.effort (see
+	// anthropic.MessageRequest.Effort); "" lets the API default stand. Bounding
+	// effort keeps a thinking model from spending the whole MaxTokens budget on
+	// thinking and returning no text.
+	Effort      string
 	UserMessage string
 	// History is the prior conversation this turn continues, in the exact
 	// anthropic.Message shape a previous LoopResult returned (assistant turns
@@ -131,6 +137,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			Model:     req.Model,
 			System:    req.System,
 			MaxTokens: req.MaxTokens,
+			Effort:    req.Effort,
 			Messages:  messages,
 			Tools:     tools,
 		})
@@ -152,6 +159,22 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		// which we treat as resolved rather than looping forever on the same
 		// state — ends the loop with the terminal result event.
 		isFinal := resp.StopReason != "tool_use" || len(toolUses) == 0
+
+		// A final turn with no deliverable text cannot be sent: OpenClaw rejects an
+		// empty assistant turn. Two cases produce one. (1) A thinking model spends
+		// its whole MaxTokens budget on thinking and stops with zero text blocks
+		// (stop_reason "max_tokens"); it cannot be continued server-side, since
+		// echoing the partial assistant turn back is a last-assistant prefill, which
+		// fable rejects with a 400. (2) The text is entirely tool-call markup that
+		// StripToolMarkup removes before delivery, leaving nothing — so the check
+		// strips first, matching what result()/EmitFinalTurn actually deliver. Either
+		// way fail closed before any emission with an error naming the stop_reason; it
+		// surfaces as a terminal is_error result in session.runTurn. A larger
+		// MaxTokens and a bounded Effort (see main) keep case (1) rare; the guard is
+		// the backstop for when they are not enough.
+		if isFinal && strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
+			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)
+		}
 
 		// The final turn's assistant event is deferred when DeferFinal is set (the
 		// caller re-emits the governed text); every intermediate tool_use assistant
