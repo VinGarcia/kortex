@@ -533,6 +533,17 @@ func governTurn(
 				// events never reach the wire — only the governed final text does
 				// (EmitFinalTurn). The tools' real side effects still run; that is
 				// the point of letting the redraft act.
+				//
+				// EphemeralContext deliberately unset (unlike the main turn above,
+				// which passes toneDigest). The digest is a tone-SHAPING input; this
+				// redraft's mandate is the opposite — minimally resolve the specific
+				// problem the superego flagged (redraftActionInstruction), not re-tone
+				// the text. Tone already carries transitively: loopHistory includes
+				// res.Messages, whose draft was produced with the digest. And threading
+				// it here would backfire — withEphemeralContext appends the digest as
+				// the LAST user message on every call, which would land AFTER the
+				// critique this redraft must answer, burying the correctness
+				// instruction. So the redraft stays tone-neutral by design.
 			})
 			if err == nil {
 				redraftUsage = redraftUsage.Add(loopRes.Usage)
