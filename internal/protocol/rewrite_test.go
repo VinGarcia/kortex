@@ -123,6 +123,43 @@ func TestRewriteUserText_preservesUnknownEnvelopeFields(t *testing.T) {
 	}
 }
 
+func TestNewMessageSegment(t *testing.T) {
+	tests := []struct {
+		desc string
+		text string
+		want string
+	}{
+		{
+			desc: "no context echo returns text unchanged",
+			text: "oi tudo\n\nroda o script",
+			want: "oi tudo\n\nroda o script",
+		},
+		{
+			desc: "echoed context block then new message returns only the new segment",
+			text: "Recent conversation ⟦openclaw:ctx⟧\n[Sun 2026-10-04 20:33] user: contei uma novidade ontem\n" +
+				"[emoções p1: investment=2 valence=positiva emotions=alegria(2)]\n\nroda o script de novo",
+			want: "roda o script de novo",
+		},
+		{
+			desc: "multiple context blocks returns text after the last",
+			text: "a ⟦openclaw:ctx⟧ turn one\n\nb ⟦openclaw:ctx⟧ turn two\n\nmensagem nova",
+			want: "mensagem nova",
+		},
+		{
+			desc: "new message spanning paragraphs is kept whole",
+			text: "ctx ⟦openclaw:ctx⟧ old turn\n\npar um\n\npar dois",
+			want: "par um\n\npar dois",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := NewMessageSegment(test.text); got != test.want {
+				t.Errorf("NewMessageSegment = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 // canon re-marshals raw JSON into a canonical string for comparison.
 func canon(t *testing.T, raw json.RawMessage) string {
 	t.Helper()

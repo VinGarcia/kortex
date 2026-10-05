@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrUnsupportedContent marks a message whose content shape cannot be
@@ -61,6 +62,39 @@ func RewriteUserText(line []byte, rewrite func(text string) (newText string, ok 
 		return nil, fmt.Errorf("re-encoding envelope: %w", err)
 	}
 	return append(newLine, '\n'), nil
+}
+
+// inboundContextMarker is the provenance sentinel OpenClaw appends to the header
+// line of every inbound-context block it injects ahead of the real user message
+// (its INBOUND_CONTEXT_MARKER; the gateway keys its own strippers on this same
+// value — openclaw dist/strip-inbound-meta). Context blocks are joined with a
+// blank line and the genuinely new message is appended last, so the text after
+// the final marker-bearing block is the new message. OpenClaw collapses each
+// echoed turn's body to a single line (sanitizeTranscriptBody: \s+ -> " "), so a
+// context block never carries an internal blank line — that is what makes the
+// blank-line split below unambiguous; only the real new message spans paragraphs.
+const inboundContextMarker = "⟦openclaw:ctx⟧"
+
+// NewMessageSegment returns the genuinely new user message within text: the part
+// after the last OpenClaw inbound-context block. When no context echo is present
+// the whole text is returned unchanged. OpenClaw prepends a "Conversation
+// context" echo of prior turns ahead of each real user message; a caller that
+// must inspect only the new turn (e.g. a facet's idempotency guard) scopes to
+// this segment, or echoed content from prior turns is mistaken for the new one.
+// Wire-format knowledge of the marker lives here because protocol is the only
+// package that owns the claude-cli/OpenClaw wire format.
+func NewMessageSegment(text string) string {
+	if !strings.Contains(text, inboundContextMarker) {
+		return text
+	}
+	blocks := strings.Split(text, "\n\n")
+	lastContext := -1
+	for i, block := range blocks {
+		if strings.Contains(block, inboundContextMarker) {
+			lastContext = i
+		}
+	}
+	return strings.Join(blocks[lastContext+1:], "\n\n")
 }
 
 // contentText extracts the rewritable text from a message content value and

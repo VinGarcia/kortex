@@ -60,41 +60,12 @@ const inputAnnotatorFacet = "input_annotator"
 // annotationMarker opens every annotation line this facet injects. The
 // idempotency guard trips when the GENUINELY NEW message already carries it —
 // a resend/resume of an already-annotated turn — so annotations are never
-// stacked nor re-billed. The guard is scoped to the new message (see
-// newMessageSegment): OpenClaw prepends a "Conversation context" echo of prior
-// turns whose bodies still carry this marker from when they were annotated, and
-// matching that echoed history would wrongly skip every message after the first
-// in a session.
+// stacked nor re-billed. The guard is scoped to the new message (via
+// protocol.NewMessageSegment): OpenClaw prepends a "Conversation context" echo of
+// prior turns whose bodies still carry this marker from when they were annotated,
+// and matching that echoed history would wrongly skip every message after the
+// first in a session.
 const annotationMarker = "[emoções p"
-
-// inboundContextMarker is the provenance sentinel OpenClaw appends to the header
-// line of every inbound-context block it injects ahead of the real user message
-// (its INBOUND_CONTEXT_MARKER; the gateway keys its own strippers on this same
-// value — openclaw dist/strip-inbound-meta). Context blocks are joined with a
-// blank line and the genuinely new message is appended last, so the text after
-// the final marker-bearing block is the new message. OpenClaw collapses each
-// echoed turn's body to a single line (sanitizeTranscriptBody: \s+ -> " "), so a
-// context block never carries an internal blank line — that is what makes the
-// blank-line split below unambiguous; only the real new message spans paragraphs.
-const inboundContextMarker = "⟦openclaw:ctx⟧"
-
-// newMessageSegment returns the genuinely new user message: the text after the
-// last OpenClaw inbound-context block. When no context echo is present the whole
-// text is the new message. Scoping the idempotency guard to this segment keeps
-// echoed annotations from prior turns from suppressing the new turn's annotation.
-func newMessageSegment(text string) string {
-	if !strings.Contains(text, inboundContextMarker) {
-		return text
-	}
-	blocks := strings.Split(text, "\n\n")
-	lastContext := -1
-	for i, block := range blocks {
-		if strings.Contains(block, inboundContextMarker) {
-			lastContext = i
-		}
-	}
-	return strings.Join(blocks[lastContext+1:], "\n\n")
-}
 
 // InterceptToBackend inspects one stdin protocol line and returns the
 // replacement line to forward, or nil to forward the original untouched.
@@ -159,7 +130,7 @@ func (a *InputAnnotator) Annotate(text string) (result string) {
 // returned tags. ok=false declines the rewrite (nothing to annotate, or a
 // failure — already logged) and the original line passes through.
 func (a *InputAnnotator) annotateText(text string) (string, bool) {
-	if strings.Contains(newMessageSegment(text), annotationMarker) {
+	if strings.Contains(protocol.NewMessageSegment(text), annotationMarker) {
 		a.log.record(callLog{Facet: inputAnnotatorFacet, Model: a.model, Skipped: "text already carries annotations"})
 		return "", false
 	}
