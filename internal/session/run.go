@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
@@ -90,6 +91,12 @@ type Config struct {
 	Model string
 	// MaxTokens caps each turn's response length.
 	MaxTokens int
+	// Effort is the output_config.effort forwarded to every core-model call (the
+	// tool-loop and the governor's redraft), wired from the spawn's --effort. ""
+	// lets the API default stand. It bounds how much of MaxTokens a thinking
+	// model spends on thinking, so text always has room (see the empty-final-turn
+	// guard in tools.RunLoop).
+	Effort string
 	// RedraftTimeout bounds one redraft call to the core model inside the active
 	// superego loop. The core client carries no HTTP timeout and the redraft is
 	// the one core-model call in the governor loop with no deadline of its own,
@@ -235,6 +242,7 @@ func runTurn(
 		Model:       cfg.Model,
 		System:      systemPrompt,
 		MaxTokens:   cfg.MaxTokens,
+		Effort:      cfg.Effort,
 		History:     msgs,
 		UserMessage: userText,
 		CallTimeout: cfg.LoopCallTimeout,
@@ -326,12 +334,21 @@ func governTurn(
 			Model:     cfg.Model,
 			System:    systemPrompt,
 			MaxTokens: cfg.MaxTokens,
+			Effort:    cfg.Effort,
 			Messages:  messages,
 		})
 		if err != nil {
 			return "", err
 		}
 		redraftUsage = redraftUsage.Add(resp.Usage)
+		// A redraft that strips to nothing (the thinking model spent its budget on
+		// thinking, or emitted only tool-call markup) is not a deliverable draft.
+		// Report it as a failure so GovernOutput fails open to the non-empty draft
+		// in hand — the first draft RunLoop already guaranteed is non-empty — rather
+		// than delivering an empty turn OpenClaw would reject.
+		if strings.TrimSpace(tools.StripToolMarkup(resp.Text)) == "" {
+			return "", fmt.Errorf("redraft returned no deliverable text (stop_reason %q)", resp.StopReason)
+		}
 		return resp.Text, nil
 	}
 
@@ -352,14 +369,18 @@ func governTurn(
 	// text. The ephemeral tail was never in res.Messages, so nothing else needs
 	// stripping.
 	//
-	// The flatten is deliberately unconditional. Preserving the core's original
-	// structured blocks on an approved passthrough looks tempting, but requests
-	// never enable extended thinking (see anthropic.wireRequest — no thinking
-	// field), so a response's final turn carries only text blocks: there is
-	// nothing but text to keep, and flattening loses none of it. Keeping the raw
-	// blocks would also be a resume hazard if thinking were ever enabled, since
-	// persisted thinking blocks replayed into a request with thinking off are
-	// rejected by the API.
+	// The flatten is deliberately unconditional, even though the canary core model
+	// (fable) returns signature-bearing thinking blocks on every turn. Two reasons:
+	//   1. The governor substitutes its own delivered text for the core's draft, so
+	//      persisting the draft's structured blocks beside a different delivered
+	//      text would record a turn that never happened. Only the delivered text
+	//      belongs here.
+	//   2. Dropping a terminal turn's thinking blocks does not break resume:
+	//      Anthropic requires thinking blocks preserved only WITHIN a tool-use cycle
+	//      (a thinking+tool_use turn answered by a tool_result in the same request),
+	//      and a terminal turn is followed on resume by a fresh user turn. Confirmed
+	//      live 2026-10-04. (Intermediate tool_use turns differ — RunLoop echoes
+	//      those verbatim via RawContent, signatures intact.)
 	finalMessages := replaceFinalAssistantText(res.Messages, finalText)
 	return finalText, finalMessages, nil
 }

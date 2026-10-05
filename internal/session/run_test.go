@@ -219,6 +219,48 @@ func TestRun_CrossProcessResume(t *testing.T) {
 	}
 }
 
+// TestRun_EmptyFinalTurnEmitsErrorNotEmpty reproduces the live 2026-10-04
+// failure end-to-end: the core model returns a final turn with only a thinking
+// block and no text (stop_reason "max_tokens"). The session must emit a terminal
+// is_error result naming the cause — never an empty assistant turn, which
+// OpenClaw rejects as "CLI backend returned an empty response".
+func TestRun_EmptyFinalTurnEmitsErrorNotEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"thinking","thinking":"","signature":"sig"}],"stop_reason":"max_tokens","usage":{"input_tokens":1,"output_tokens":8192}}`))
+	}))
+	defer server.Close()
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("s", "think hard") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "s", Model: "claude-fable-5", MaxTokens: 8192, NewUUID: seqUUID(),
+	})
+	if err != nil {
+		t.Fatalf("Run must not propagate the empty-final error: %v", err)
+	}
+
+	var result *protocol.Result
+	for _, ev := range parseLines(t, out.String()) {
+		switch ev.Type {
+		case protocol.TypeResult:
+			result = ev.Result
+		case protocol.TypeAssistant:
+			// The guard fires before any final assistant emission, so no empty
+			// assistant turn must ever reach the wire.
+			t.Errorf("an assistant event was emitted for an empty final turn: %q", out.String())
+		}
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("want a terminal error result for an empty final turn, got %+v", result)
+	}
+	if !strings.Contains(result.Text, "max_tokens") {
+		t.Errorf("error result should name the stop_reason, got %q", result.Text)
+	}
+}
+
 func TestRun_TurnErrorEmitsResultAndContinues(t *testing.T) {
 	// A server that 500s fails the Messages call, so RunLoop errors; the session
 	// must still emit a terminal error result and keep reading the next turn.

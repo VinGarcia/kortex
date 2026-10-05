@@ -320,6 +320,60 @@ func TestRun_ActiveGovernorZeroRedraftTimeoutUsesDefault(t *testing.T) {
 	}
 }
 
+// TestRun_ActiveGovernorEmptyRedraftFailsOpen proves the governor-path backstop
+// for the live 2026-10-04 failure class: a redraft that comes back empty (the
+// thinking model spent its whole budget on thinking) must NOT be delivered as an
+// empty turn. The redraft closure reports it as a failure, the governor fails
+// open to the non-empty first draft, and that draft is what reaches the wire —
+// never an empty assistant turn OpenClaw would reject.
+func TestRun_ActiveGovernorEmptyRedraftFailsOpen(t *testing.T) {
+	// First call (draft) is non-empty; the redraft (second call) returns empty.
+	server, _ := sequencedResponder(t, "raw-draft", "")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-TAIL-TEXT"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: time.Second, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The empty redraft must have been reported as a failure, so the governor
+	// never recorded a redraft result and fell back to the draft.
+	if gov.redraftResult != "" {
+		t.Errorf("redraft result = %q, want empty (an empty redraft must error, not deliver)", gov.redraftResult)
+	}
+	var assistantText, resultText string
+	sawError := false
+	for _, ev := range parseLines(t, out.String()) {
+		switch ev.Type {
+		case protocol.TypeAssistant:
+			if ev.Message != nil {
+				assistantText = ev.Message.TextContent()
+			}
+		case protocol.TypeResult:
+			resultText = ev.Result.Text
+			if ev.Result.IsError {
+				sawError = true
+			}
+		}
+	}
+	if sawError {
+		t.Errorf("turn surfaced an error result; fail-open to the non-empty draft should have delivered cleanly:\n%s", out.String())
+	}
+	if assistantText != "raw-draft" || resultText != "raw-draft" {
+		t.Errorf("delivered assistant=%q result=%q, want raw-draft (fail-open to the non-empty first draft)", assistantText, resultText)
+	}
+}
+
 // TestRun_ActiveGovernorHoldDeliversHoldMessage proves a held turn delivers the
 // governor's hold-and-ask text instead of the draft, and persists that text.
 func TestRun_ActiveGovernorHoldDeliversHoldMessage(t *testing.T) {
