@@ -41,15 +41,6 @@ const DefaultSuperegoModel = "claude-opus-4-8"
 // when the valence is negative or mixed.
 const DefaultGateMinInvestment = 4
 
-// DefaultRedraftToolBudget is the per-redraft tool-use round budget when the
-// config leaves redraftToolBudget unset (0). A superego-triggered redraft in
-// active mode may run the tool loop to ACT on the critique (e.g. actually run
-// the verification the superego flagged as missing) instead of merely rewording;
-// this budget caps how many tool-use round trips that single redraft may make
-// before it must finalize with a text answer. It is deliberately small: a
-// redraft should resolve the specific finding, not open an unbounded tool loop.
-const DefaultRedraftToolBudget = 3
-
 // SuperegoModeShadow (the default) runs the superego asynchronously after the
 // turn is delivered: observe-only, log-only. SuperegoModeActive runs it
 // synchronously before delivery, inside the blocking core↔superego loop.
@@ -162,9 +153,10 @@ type Superego struct {
 	// mode "active": when the superego flags a finding that needs ACTION (for
 	// example "you did not actually verify X"), the redraft drives the same
 	// tool loop the turn uses so the core can run the check and answer with
-	// evidence, instead of rewording the problem away. 0 means
-	// DefaultRedraftToolBudget. Keep it small: the redraft should resolve the
-	// specific finding, never open an unbounded tool loop.
+	// evidence, instead of rewording the problem away. Unset (0) defaults to 3
+	// tool-use rounds, resolved and clamped by session.DefaultRedraftToolBudget
+	// (the single operational source). Keep it small: the redraft should resolve
+	// the specific finding, never open an unbounded tool loop.
 	RedraftToolBudget int `json:"redraftToolBudget"`
 }
 

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -283,6 +284,84 @@ func TestRun_ActiveGovernorRedraftToolBudgetEnforced(t *testing.T) {
 	// not enforced the server would keep handing back tool_use forever.
 	if len(*reqs) != 4 {
 		t.Fatalf("core model calls = %d, want 4 (draft + 2 tool rounds + finalize)", len(*reqs))
+	}
+	if gov.redraftResult != "budget-finalized" {
+		t.Errorf("redraft result = %q, want the finalized answer", gov.redraftResult)
+	}
+	var resultText string
+	sawError := false
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+			sawError = ev.Result.IsError
+		}
+	}
+	if sawError {
+		t.Errorf("budget exhaustion surfaced an error result; it must end gracefully:\n%s", out.String())
+	}
+	if resultText != "budget-finalized" {
+		t.Errorf("delivered result = %q, want budget-finalized (graceful finalize)", resultText)
+	}
+}
+
+// TestRun_ActiveGovernorZeroRedraftToolBudgetUsesDefault proves that leaving
+// Config.RedraftToolBudget at its zero value runs EXACTLY the default
+// (DefaultRedraftToolBudget = 3) tool-use rounds, not RunLoop's far larger
+// DefaultMaxTurns (25). Before the clamp a 0 budget was handed straight to
+// RunLoop as MaxTurns 0, which silently resolved to 25 — an 8x-larger safety
+// budget that only main's resolution masked. The clamp at the consumption point
+// (mirroring the RedraftTimeout floor) makes a 0-budget Config honor 3 rounds
+// regardless of how it was built. The server keeps offering tools on every
+// redraft round, so an unclamped budget would run all 25; it finalizes with
+// text only on the toolless FinalizeOnBudget call.
+func TestRun_ActiveGovernorZeroRedraftToolBudgetUsesDefault(t *testing.T) {
+	var reqN, toolRounds atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		n := reqN.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case n == 1:
+			// The initial draft turn: stop immediately so only the redraft drives
+			// the tool loop that this test counts.
+			fmt.Fprint(w, endTurnDraftBody)
+		case bytes.Contains(raw, []byte(`"tools":[`)):
+			// A redraft tool-loop round (tools offered): keep asking for a tool so
+			// an unclamped 25-round budget would run every round, not stop early.
+			toolRounds.Add(1)
+			fmt.Fprint(w, toolUseBody("echo loop"))
+		default:
+			// The toolless FinalizeOnBudget call: the budget is spent, so close the
+			// round with a deliverable text answer.
+			fmt.Fprint(w, endTurnTextBody("budget-finalized"))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		// RedraftTimeout is a real value so only the budget is under test;
+		// RedraftToolBudget deliberately omitted (zero): the clamp must supply the
+		// DefaultRedraftToolBudget floor rather than RunLoop's DefaultMaxTurns.
+		RedraftTimeout: 5 * time.Second, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The redraft ran exactly DefaultRedraftToolBudget rounds. Without the clamp
+	// this is RunLoop's DefaultMaxTurns (25) — the silent 8x drift under test.
+	if got := int(toolRounds.Load()); got != DefaultRedraftToolBudget {
+		t.Fatalf("redraft tool rounds = %d, want %d (a 0 budget must clamp to the default, not RunLoop's 25)", got, DefaultRedraftToolBudget)
 	}
 	if gov.redraftResult != "budget-finalized" {
 		t.Errorf("redraft result = %q, want the finalized answer", gov.redraftResult)

@@ -85,6 +85,18 @@ const maxLineBytes = 16 << 20
 // matches main.go's defaultRedraftTimeout.
 const DefaultRedraftTimeout = 60 * time.Second
 
+// DefaultRedraftToolBudget is the safe floor Run applies when
+// Config.RedraftToolBudget is 0, mirroring DefaultRedraftTimeout above. It is
+// the SINGLE source of truth for the redraft tool-use round budget: session
+// cannot import config (see .go-arch-lint.yml — config is not in session's
+// mayDependOn list), so the const lives here and main references
+// session.DefaultRedraftToolBudget. Clamping here guarantees that any caller
+// that builds a Config with RedraftToolBudget 0 WITHOUT main's resolution (a
+// test, the native path, a future refactor) still gets this 3-round budget,
+// never RunLoop's much larger DefaultMaxTurns (25) — the silent 8x
+// safety-budget drift this clamp exists to prevent.
+const DefaultRedraftToolBudget = 3
+
 // redraftActionInstruction is the deterministic guard-rail appended to the tail
 // of an active-mode redraft prompt. It is read by the CORE model, so it is
 // written as explicit, full-sentence Portuguese (the language the core and
@@ -145,9 +157,11 @@ type Config struct {
 	// superego flagged as missing) and answer with evidence instead of rewording
 	// the problem away; this budget bounds that loop so a redraft can never open
 	// an unbounded tool run. The composition root resolves the configured value
-	// (falling back to config.DefaultRedraftToolBudget) and passes the concrete
-	// budget in; 0 is handed straight to RunLoop, which applies its own MaxTurns
-	// default. Only consulted on the active (Governor) path.
+	// (falling back to session.DefaultRedraftToolBudget) and passes the concrete
+	// budget in; a 0 here is clamped to DefaultRedraftToolBudget at the
+	// consumption point (never handed to RunLoop as 0, which would inherit its
+	// far larger MaxTurns default), so the contract holds for any caller.
+	// Only consulted on the active (Governor) path.
 	RedraftToolBudget int
 	// NewUUID mints one v4 message uuid per emitted assistant/user event.
 	NewUUID func() string
@@ -490,6 +504,13 @@ func governTurn(
 		ctx, cancel := context.WithTimeout(ctx, redraftTimeout)
 		defer cancel()
 
+		// Clamp at the consumption point, like the RedraftTimeout floor above
+		// (see DefaultRedraftToolBudget for why 0 must not reach RunLoop).
+		redraftToolBudget := cfg.RedraftToolBudget
+		if redraftToolBudget <= 0 {
+			redraftToolBudget = DefaultRedraftToolBudget
+		}
+
 		// A nil/empty tail carries no critique to answer, so it cannot drive the
 		// tool loop; it falls straight to the text-only path, preserving the
 		// pre-#4753 behavior exactly for that (never-reached-in-practice) case.
@@ -502,7 +523,7 @@ func governTurn(
 				Effort:      cfg.Effort,
 				History:     loopHistory,
 				UserMessage: redraftToolUserMessage(tail[len(tail)-1]),
-				MaxTurns:    cfg.RedraftToolBudget,
+				MaxTurns:    redraftToolBudget,
 				CallTimeout: cfg.LoopCallTimeout,
 				// Budget exhausted ends the round with a text answer that still sees
 				// the tool_results gathered, not a turn error.

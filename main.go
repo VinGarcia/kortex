@@ -255,10 +255,12 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 			LogSink:   logSink,
 		})
 		// The redraft's bounded tool loop runs in the session (it owns the
-		// dispatcher/RunLoop); resolve the budget here — the composition root owns
-		// config defaults, keeping config.DefaultRedraftToolBudget the single
-		// source of truth — and carry the concrete value to the session wiring.
-		budget := config.DefaultRedraftToolBudget
+		// dispatcher/RunLoop); resolve the budget here and carry the concrete value
+		// to the session wiring. The default is session.DefaultRedraftToolBudget —
+		// the single source of truth session also clamps against — mirrored the
+		// same way main mirrors session.DefaultRedraftTimeout, since session cannot
+		// import config (arch-lint: config is not in session's mayDependOn).
+		budget := session.DefaultRedraftToolBudget
 		if seCfg.RedraftToolBudget > 0 {
 			budget = seCfg.RedraftToolBudget
 		}
