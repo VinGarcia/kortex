@@ -633,9 +633,10 @@ func governTurn(
 
 	// The ladder below is the turn's one long silent span (model call after
 	// model call, nothing emitted), so a keepalive ticker brackets exactly it.
-	// stopKeepalive waits for the goroutine to exit before returning, so the
-	// keepalive writer can never interleave with EmitFinalTurn below — the
-	// emitter's writes are not synchronized and rely on one writer at a time.
+	// stopKeepalive waits for the goroutine to exit before returning: the line
+	// ORDER on the wire must stay deterministic — no keepalive may land after
+	// the terminal result. (The emitter serializes its own writes; data-race
+	// safety is its contract, not this caller's.)
 	stopKeepalive := startGovernorKeepalive(cfg, emitter)
 	// The held bool is intentionally not consumed here: when a turn is held,
 	// GovernOutput already returns the hold-and-ask text as finalText, which this

@@ -366,6 +366,15 @@ const defaultRedraftTimeout = 60 * time.Second
 // (which fails open to the raw draft), a timed-out loop call fails closed.
 const defaultLoopCallTimeout = 120 * time.Second
 
+// defaultGovernKeepaliveInterval is how often the governor seam emits its
+// benign keepalive line while the superego ladder deliberates. It exists to
+// outpace OpenClaw's 180s no-output watchdog (the 2026-10-05 canary kill);
+// wired explicitly here — like every other duration knob — so the value
+// guarding against that kill is visible at the composition root rather than
+// falling through to the package clamp (session.DefaultGovernKeepaliveInterval,
+// same value).
+const defaultGovernKeepaliveInterval = session.DefaultGovernKeepaliveInterval
+
 // resolveNativeToken resolves the OAuth token for the native path from the
 // composition root. KORTEX_TOKEN_FILE, when set, names a file kortex reads and
 // trims itself, and takes precedence over CODECOMPANION_OAUTH_TOKEN: it lets
@@ -512,24 +521,25 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
 	err = session.Run(ctx, session.Config{
-		Stdin:             stdin,
-		Stdout:            stdout,
-		Client:            client,
-		Dispatcher:        dispatcher,
-		Store:             session.NewStore(nativeStateDir(getenv)),
-		SessionID:         sessionID,
-		Model:             model,
-		Effort:            effort,
-		MaxTokens:         defaultMaxTokens,
-		RedraftTimeout:    defaultRedraftTimeout,
-		RedraftToolBudget: facets.redraftToolBudget,
-		LoopCallTimeout:   defaultLoopCallTimeout,
-		NewUUID:           newUUIDv4,
-		Diag:              stderr,
-		Annotator:         annotator,
-		TurnEvaluator:     turnEvaluator,
-		Governor:          governor,
-		ToneDigester:      toneDigester,
+		Stdin:                   stdin,
+		Stdout:                  stdout,
+		Client:                  client,
+		Dispatcher:              dispatcher,
+		Store:                   session.NewStore(nativeStateDir(getenv)),
+		SessionID:               sessionID,
+		Model:                   model,
+		Effort:                  effort,
+		MaxTokens:               defaultMaxTokens,
+		RedraftTimeout:          defaultRedraftTimeout,
+		RedraftToolBudget:       facets.redraftToolBudget,
+		LoopCallTimeout:         defaultLoopCallTimeout,
+		GovernKeepaliveInterval: defaultGovernKeepaliveInterval,
+		NewUUID:                 newUUIDv4,
+		Diag:                    stderr,
+		Annotator:               annotator,
+		TurnEvaluator:           turnEvaluator,
+		Governor:                governor,
+		ToneDigester:            toneDigester,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
