@@ -111,6 +111,33 @@ func TestInterceptToBackend_annotatesStringContent(t *testing.T) {
 	}
 }
 
+func TestInterceptToBackend_annotatesNewMessageDespiteEchoedContext(t *testing.T) {
+	// Regression: OpenClaw prepends a "Conversation context" echo of prior turns
+	// whose bodies still carry [emoções ...] tags from when they were annotated.
+	// The idempotency guard must inspect only the genuinely new message (the tail
+	// after the last ⟦openclaw:ctx⟧ block), or it skips every message after the
+	// first in a session. The full text still annotates (the echo block becomes a
+	// neutral paragraph), so the evaluator returns one annotation per paragraph.
+	evaluator := &fakeEvaluator{response: evalText(`[
+		{"investment":0,"valence":"neutra","emotions":[]},
+		{"investment":3,"valence":"neutra","emotions":[{"emotion":"expectativa","level":2,"about":"rodar o script"}]}
+	]`)}
+	a := newTestAnnotator(evaluator)
+	line := `{"type":"user","message":{"role":"user","content":"Recent conversation ⟦openclaw:ctx⟧\n[Sun 2026-10-04 20:33] user: contei uma novidade ontem\n[emoções p1: investment=2 valence=positiva emotions=alegria(2)]\n\nroda o script de novo"},"uuid":"u-echo"}`
+
+	got := intercept(t, a, line)
+
+	if evaluator.calls != 1 {
+		t.Fatalf("new message was skipped: evaluator calls = %d, want 1", evaluator.calls)
+	}
+	if got == nil {
+		t.Fatal("expected the new message to be annotated, got passthrough")
+	}
+	if !strings.Contains(string(got), `roda o script de novo\n[emoções p2:`) {
+		t.Errorf("new message not annotated:\n%s", got)
+	}
+}
+
 func TestInterceptToBackend_annotatesSingleTextBlockPreservingOthers(t *testing.T) {
 	a := newTestAnnotator(&fakeEvaluator{response: oneParagraphEval()})
 	line := `{"type":"user","message":{"role":"user","content":[` +
@@ -185,6 +212,10 @@ func TestInterceptToBackend_passthroughCases(t *testing.T) {
 		{
 			desc: "already-annotated text untouched (resume idempotence)",
 			line: `{"type":"user","message":{"role":"user","content":"oi\n[emoções p1: investment=0 valence=neutra emotions=nenhuma]"}}`,
+		},
+		{
+			desc: "echoed context + already-annotated new message untouched (true idempotence survives echo)",
+			line: `{"type":"user","message":{"role":"user","content":"Recent conversation ⟦openclaw:ctx⟧\n[Sun 2026-10-04 20:33] user: oi\n[emoções p1: investment=0 valence=neutra emotions=nenhuma]\n\nbeleza\n[emoções p1: investment=0 valence=neutra emotions=nenhuma]"}}`,
 		},
 		{
 			desc: "two text blocks untouched (index desync risk)",
