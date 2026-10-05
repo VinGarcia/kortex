@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,11 @@ type Client struct {
 	baseURL    string
 	token      string
 	httpClient *http.Client
+	// wireLog, when non-nil, receives a line-oriented copy of every request and
+	// response body for debugging (see SetWireLog). wireMu serializes those
+	// writes so concurrent callers never interleave a line.
+	wireLog io.Writer
+	wireMu  sync.Mutex
 }
 
 // NewClient builds a client holding the OAuth token. baseURL "" means the
@@ -44,6 +50,31 @@ func NewClient(token string, baseURL string, timeout time.Duration) *Client {
 		token:      token,
 		httpClient: &http.Client{Timeout: timeout},
 	}
+}
+
+// SetWireLog routes a line-oriented copy of every request and response body to
+// w — the native path's equivalent of the passthrough's trafficLogger, which
+// never logged anything on this path and left tonight's diagnosis blind. The
+// OAuth token lives in the Authorization header, which is never part of the
+// body, so nothing secret is written. A nil w (the default) disables logging.
+// Wire it once at construction (before any request); it is not meant to be
+// swapped while calls are in flight.
+func (c *Client) SetWireLog(w io.Writer) {
+	c.wireLog = w
+}
+
+// logWire appends one request/response line to the wire log when enabled. The
+// body is written verbatim (it carries no credential) with a timestamp and
+// direction prefix, matching proxy.trafficLogger's line shape.
+func (c *Client) logWire(direction string, body []byte) {
+	if c.wireLog == nil {
+		return
+	}
+	c.wireMu.Lock()
+	defer c.wireMu.Unlock()
+	fmt.Fprintf(c.wireLog, "%s %s ", time.Now().Format(time.RFC3339Nano), direction)
+	c.wireLog.Write(body)
+	c.wireLog.Write([]byte("\n"))
 }
 
 // Message is one conversation message of a request. Content is either a
@@ -91,6 +122,13 @@ type MessageRequest struct {
 	MaxTokens int
 	Messages  []Message
 	Tools     []ToolDef
+	// Effort selects output_config.effort ("low".."max"), which bounds how deeply
+	// a thinking model reasons before it answers. "" omits output_config so the
+	// API applies its default ("high"). It matters for the canary core model
+	// (fable): thinking is always on there, so at high effort a small MaxTokens
+	// can be spent entirely on thinking, leaving zero text — the empty-final-turn
+	// failure this field (wired from the spawn's --effort) guards against.
+	Effort string
 }
 
 // Usage carries the token counters of a response.
@@ -176,11 +214,19 @@ func (e *APIError) Error() string {
 }
 
 type wireRequest struct {
-	Model     string        `json:"model"`
-	System    []systemBlock `json:"system,omitempty"`
-	MaxTokens int           `json:"max_tokens"`
-	Messages  []Message     `json:"messages"`
-	Tools     []ToolDef     `json:"tools,omitempty"`
+	Model        string        `json:"model"`
+	System       []systemBlock `json:"system,omitempty"`
+	MaxTokens    int           `json:"max_tokens"`
+	Messages     []Message     `json:"messages"`
+	Tools        []ToolDef     `json:"tools,omitempty"`
+	OutputConfig *outputConfig `json:"output_config,omitempty"`
+}
+
+// outputConfig carries the GA output_config.effort knob (no beta header). A nil
+// pointer omits the field entirely so the API applies its default; it is set
+// only when a caller supplies MessageRequest.Effort.
+type outputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // systemBlock is one element of the system-as-array form of the Messages API.
@@ -233,16 +279,21 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 	if req.System != "" {
 		system = append(system, systemBlock{Type: "text", Text: req.System})
 	}
-	body, err := json.Marshal(wireRequest{
+	wire := wireRequest{
 		Model:     req.Model,
 		System:    system,
 		MaxTokens: req.MaxTokens,
 		Messages:  req.Messages,
 		Tools:     req.Tools,
-	})
+	}
+	if req.Effort != "" {
+		wire.OutputConfig = &outputConfig{Effort: req.Effort}
+	}
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return MessageResponse{}, fmt.Errorf("anthropic: encoding request: %w", err)
 	}
+	c.logWire("request", body)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+messagesPath, bytes.NewReader(body))
 	if err != nil {
@@ -265,6 +316,7 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 	if err != nil {
 		return MessageResponse{}, fmt.Errorf("anthropic: reading response: %w", err)
 	}
+	c.logWire("response", respBody)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		apiErr := &APIError{Status: resp.StatusCode}

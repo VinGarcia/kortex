@@ -154,6 +154,49 @@ func TestCreateMessage_toolUse(t *testing.T) {
 	}
 }
 
+// TestCreateMessage_wireLog proves SetWireLog captures both the request and the
+// response body for diagnosis — the native-path equivalent of the passthrough's
+// trafficLogger — while never writing the OAuth token, which lives only in the
+// Authorization header and never in a logged body.
+func TestCreateMessage_wireLog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	var log strings.Builder
+	client := NewClient("super-secret-token", server.URL, time.Second)
+	client.SetWireLog(&log)
+	_, err := client.CreateMessage(context.Background(), MessageRequest{
+		Model:     "claude-fable-5",
+		MaxTokens: 1024,
+		Messages:  []Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logged := log.String()
+	// Both directions must be present, each tagged so the two bodies are
+	// distinguishable in the file.
+	if !strings.Contains(logged, "request ") || !strings.Contains(logged, `"model":"claude-fable-5"`) {
+		t.Errorf("wire log missing the request line: %q", logged)
+	}
+	if !strings.Contains(logged, "response ") || !strings.Contains(logged, `"stop_reason":"end_turn"`) {
+		t.Errorf("wire log missing the response line: %q", logged)
+	}
+	// The token must never reach the log: it travels in the Authorization header,
+	// which is not part of any logged body.
+	if strings.Contains(logged, "super-secret-token") {
+		t.Errorf("wire log leaked the OAuth token: %q", logged)
+	}
+	// Two lines, one per direction.
+	if n := strings.Count(strings.TrimSpace(logged), "\n"); n != 1 {
+		t.Errorf("wire log has %d newlines, want 1 (two lines: request + response)", n)
+	}
+}
+
 func TestCreateMessage_errors(t *testing.T) {
 	tests := []struct {
 		desc        string
