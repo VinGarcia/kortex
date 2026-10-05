@@ -100,7 +100,7 @@ func (a *ActiveSuperego) GovernOutput(
 	turnIndex int,
 	snapshot history.Snapshot,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
 ) (text string, held bool) {
 	// Fail-open umbrella: a panic anywhere in the loop degrades to delivering
 	// the original draft, never a crashed wire or a swallowed reply.
@@ -156,11 +156,16 @@ func (a *ActiveSuperego) GovernOutput(
 				return current, false
 			}
 			critiques = append(critiques, crit)
-			newDraft, err := redraft(ctx, revisionTail(critiques, redrafts))
+			newDraft, newCalls, err := redraft(ctx, revisionTail(critiques, redrafts))
 			if err != nil {
 				// A redraft failure fails open to the best draft in hand.
 				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error()})
 				return current, false
+			}
+			// Fold the redraft's own tool calls (#4753) into the reviewed turn —
+			// see appendReviewedToolCalls for why the next round must see them.
+			if len(newCalls) > 0 {
+				snapshot = appendReviewedToolCalls(snapshot, turnIndex, newCalls)
 			}
 			if newDraft == current {
 				// Exact-identity anti-cycle guard (ratified option (b)): the core
@@ -206,6 +211,23 @@ func gateDecision(fire bool) string {
 		return "revise"
 	}
 	return "deliver"
+}
+
+// appendReviewedToolCalls returns a copy of snapshot whose turn at turnIndex
+// carries calls appended to its ToolCalls, so each ladder round's provenance
+// block (FERRAMENTAS_EXECUTADAS, #4749) reflects every tool the turn has run so
+// far — original turn plus all redrafts; without the fold the superego keeps
+// rejecting a redraft for the very facts it just verified. The turns slice and
+// the reviewed turn's ToolCalls are cloned, so the snapshot the session handed
+// to GovernOutput is never mutated. turnIndex is not re-guarded here: the
+// ladder only reaches a redraft after round 1's ReviewDraft validated the same
+// index against the same snapshot.
+func appendReviewedToolCalls(snapshot history.Snapshot, turnIndex int, calls []history.ToolCall) history.Snapshot {
+	turns := append([]history.Turn(nil), snapshot.Turns...)
+	reviewed := &turns[turnIndex]
+	reviewed.ToolCalls = append(append([]history.ToolCall(nil), reviewed.ToolCalls...), calls...)
+	snapshot.Turns = turns
+	return snapshot
 }
 
 // revisionTail builds the ephemeral message tail handed to the CORE redraft

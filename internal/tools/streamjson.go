@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/protocol"
@@ -24,6 +25,11 @@ type StreamEmitter struct {
 	w         io.Writer
 	sessionID string
 	newUUID   func() string
+	// writeMu serializes line writes: the emitter is the single owner of the
+	// stream-json stdout, and with the governor keepalive a second goroutine now
+	// writes through it, so exclusion must live HERE — a half-interleaved NDJSON
+	// line is an unparseable wire — not in caller choreography.
+	writeMu sync.Mutex
 	// initSent guards systemInit so a session that reuses one emitter across
 	// several RunLoop turns emits exactly one system/init — matching the real
 	// claude-cli, which announces the session once at startup, not per turn.
@@ -142,6 +148,23 @@ func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason stri
 	return e.write(resultLine)
 }
 
+// Keepalive emits one benign system/keepalive line. The session's governor
+// seam calls it on a timer while the active superego ladder runs: the ladder
+// is minutes of model calls with nothing on the wire, and OpenClaw kills a CLI
+// that stays silent past its no-output watchdog. OpenClaw ignores the event
+// itself (unknown system subtype) — only the watchdog reset matters. Nil-safe
+// like every emitter method.
+func (e *StreamEmitter) Keepalive() error {
+	if e == nil {
+		return nil
+	}
+	line, err := protocol.EmitSystemKeepalive(e.sessionID)
+	if err != nil {
+		return fmt.Errorf("tools: emitting system/keepalive: %w", err)
+	}
+	return e.write(line)
+}
+
 // ErrorResult emits a terminal result marking the round as failed. The native
 // session calls it when RunLoop returns an error instead of a result (e.g. the
 // Messages API call failed), so OpenClaw completes the round on a visible error
@@ -164,6 +187,8 @@ func (e *StreamEmitter) ErrorResult(msg string) error {
 }
 
 func (e *StreamEmitter) write(line []byte) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	if _, err := e.w.Write(line); err != nil {
 		return fmt.Errorf("tools: writing stream-json line: %w", err)
 	}

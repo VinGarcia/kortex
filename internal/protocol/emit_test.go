@@ -23,6 +23,11 @@ func TestEmit_golden(t *testing.T) {
 			want: `{"type":"system","subtype":"init","tools":[],"capabilities":[],"session_id":"sess-1"}`,
 		},
 		{
+			desc: "system/keepalive carries only identity",
+			emit: func() ([]byte, error) { return EmitSystemKeepalive("sess-1") },
+			want: `{"type":"system","subtype":"keepalive","session_id":"sess-1"}`,
+		},
+		{
 			desc: "assistant text message",
 			emit: func() ([]byte, error) {
 				return EmitAssistant("sess-1", "uuid-out-1",
@@ -100,6 +105,13 @@ func TestEmit_roundTrip(t *testing.T) {
 	t.Run("system/init", func(t *testing.T) {
 		ev := Parse(emit(EmitSystemInit("sess-1", []string{"bash"})))
 		if ev.Type != TypeSystem || ev.Subtype != "init" || ev.SessionID != "sess-1" {
+			t.Errorf("parsed = %+v", ev)
+		}
+	})
+
+	t.Run("system/keepalive", func(t *testing.T) {
+		ev := Parse(emit(EmitSystemKeepalive("sess-1")))
+		if ev.Type != TypeSystem || ev.Subtype != "keepalive" || ev.SessionID != "sess-1" {
 			t.Errorf("parsed = %+v", ev)
 		}
 	})

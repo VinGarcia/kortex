@@ -58,9 +58,13 @@ type ToneDigester interface {
 // delivered instead of the draft). redraft lets the governor ask the CORE model
 // for a new draft, given an ephemeral message tail (the rejected drafts and the
 // superego critiques) appended to the turn's canonical messages; that tail is
-// never persisted and never emitted. This interface is defined here with an
-// inline func type and only shared types (context/history/anthropic), so
-// facet.ActiveSuperego satisfies it structurally without session importing
+// never persisted and never emitted. Alongside the new text, redraft returns
+// the tool calls the redraft itself executed (#4753 lets a redraft act), so the
+// governor can extend the reviewed turn's provenance before re-reviewing — the
+// superego must see the evidence a redraft gathered, or it keeps rejecting the
+// redraft for the very facts it just verified. This interface is defined here
+// with an inline func type and only shared types (context/history/anthropic),
+// so facet.ActiveSuperego satisfies it structurally without session importing
 // facet. A nil Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
 type OutputGovernor interface {
 	GovernOutput(
@@ -68,7 +72,7 @@ type OutputGovernor interface {
 		turnIndex int,
 		snapshot history.Snapshot,
 		draft string,
-		redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+		redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
 	) (text string, held bool)
 }
 
@@ -96,6 +100,14 @@ const DefaultRedraftTimeout = 60 * time.Second
 // never RunLoop's much larger DefaultMaxTurns (25) — the silent 8x
 // safety-budget drift this clamp exists to prevent.
 const DefaultRedraftToolBudget = 3
+
+// DefaultGovernKeepaliveInterval is the safe floor Run applies when
+// Config.GovernKeepaliveInterval is 0 (same clamp pattern as
+// DefaultRedraftTimeout). 45s keeps the wire's silent spans well under
+// OpenClaw's tightest observed no-output watchdog (180s on the chat path)
+// while adding only a handful of ~70-byte lines per governed turn —
+// negligible against OpenClaw's 8MB JSONL output budget.
+const DefaultGovernKeepaliveInterval = 45 * time.Second
 
 // redraftActionInstruction is the deterministic guard-rail appended to the tail
 // of an active-mode redraft prompt. It is read by the CORE model, so it is
@@ -143,6 +155,19 @@ type Config struct {
 	// timeout the governor fails open to delivering the raw draft. 0 means
 	// DefaultRedraftTimeout.
 	RedraftTimeout time.Duration
+	// GovernKeepaliveInterval is how often the governor seam emits a benign
+	// system/keepalive line while the active superego ladder runs. The ladder
+	// (up to 4 superego rounds plus acting redrafts) can spend several minutes
+	// in model calls with nothing on the wire, and OpenClaw kills a CLI that
+	// stays silent past its no-output watchdog (observed live 2026-10-05: the
+	// canary was terminated mid-ladder at 180s of silence). 0 means
+	// DefaultGovernKeepaliveInterval. Only the active (Governor) path emits
+	// keepalives: outside the ladder each core call is bounded by
+	// LoopCallTimeout and followed by an emitted assistant event, so the wire's
+	// silent spans stay under the watchdog without help. (Long-running TOOL
+	// executions remain an uncovered silent span on both paths — a known gap,
+	// not this field's job.)
+	GovernKeepaliveInterval time.Duration
 	// LoopCallTimeout bounds each individual core-model call inside the
 	// tool-loop (RunLoop). The core client carries no HTTP timeout and MaxTurns
 	// only caps the number of round trips, so without this a single hung call
@@ -342,13 +367,28 @@ func runTurn(
 		return msgs, nil, nil
 	}
 
+	// This turn's tool calls, derived once from the messages RunLoop appended for
+	// the turn (res.Messages is the whole conversation; the prior history is
+	// msgs). The same value feeds both the governor's reviewed turn — so the
+	// superego's FERRAMENTAS_EXECUTADAS provenance block (#4749) sees what the
+	// core actually ran this turn — and the canonical Turn returned below.
+	turnToolCalls := toolCallsFromMessages(res.Messages[len(msgs):])
+
 	finalText := res.FinalText
 	finalMessages := res.Messages
 	if cfg.Governor != nil {
-		var govErr error
-		finalText, finalMessages, govErr = governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, userText, res)
+		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, userText, turnToolCalls, res)
 		if govErr != nil {
 			return nil, nil, govErr
+		}
+		finalText, finalMessages = governedText, governedMessages
+		// Redrafts run tools with real side effects (#4753); those calls are part
+		// of what the assistant actually ran this turn, so the canonical Turn
+		// records them alongside the original loop's calls — otherwise history
+		// lists a delivered text whose evidence it omits. Combined on a fresh
+		// slice: turnToolCalls also backs the governor's reviewed turn above.
+		if len(redraftCalls) > 0 {
+			turnToolCalls = append(append([]history.ToolCall(nil), turnToolCalls...), redraftCalls...)
 		}
 	}
 
@@ -360,19 +400,16 @@ func runTurn(
 	// The turn's canonical text for the facets: the user message as sent (the
 	// annotator already rewrote it) and the assistant's DELIVERED text (the
 	// governed text on the active path, the raw draft otherwise). ToolCalls is
-	// populated from this turn's exchanges so the superego can verify provenance
-	// (what the assistant actually ran this turn), mirroring the proxy's
-	// event-driven history.Recorder. Only the messages appended for THIS turn are
-	// scanned (res.Messages is the whole conversation; the prior history is
-	// msgs), so each Turn carries only its own tool calls, exactly as the proxy
-	// Recorder attaches them to the open turn. IsError is left false: a Turn is
-	// built only on the success path here (RunLoop failures emit an error result
-	// and return a nil turn above), which matches the proxy's non-error terminal
-	// result.
+	// this turn's calls (turnToolCalls above), mirroring the proxy's
+	// event-driven history.Recorder: each Turn carries only its own tool calls,
+	// exactly as the proxy Recorder attaches them to the open turn. IsError is
+	// left false: a Turn is built only on the success path here (RunLoop failures
+	// emit an error result and return a nil turn above), which matches the
+	// proxy's non-error terminal result.
 	turn := history.Turn{
 		UserText:      userText,
 		AssistantText: finalText,
-		ToolCalls:     toolCallsFromMessages(res.Messages[len(msgs):]),
+		ToolCalls:     turnToolCalls,
 		StopReason:    res.StopReason,
 		Completed:     true,
 	}
@@ -451,8 +488,9 @@ func toolCallsFromMessages(messages []anthropic.Message) []history.ToolCall {
 }
 
 // governTurn runs the active superego loop over the deferred final draft and
-// emits the delivered turn. It returns the delivered text and the canonical
-// messages to persist: the loop's rejected drafts and critiques live only in an
+// emits the delivered turn. It returns the delivered text, the canonical
+// messages to persist, and the tool calls the loop's redrafts executed (for the
+// caller to fold into the canonical Turn): the loop's rejected drafts and critiques live only in an
 // ephemeral tail passed to the redraft callback, so the persisted messages carry
 // only the single delivered assistant turn (its content replaced with the
 // governed text), never the tail. A failure emitting the final turn (a broken
@@ -464,12 +502,18 @@ func governTurn(
 	systemPrompt string,
 	priorTurns []history.Turn,
 	userText string,
+	turnToolCalls []history.ToolCall,
 	res tools.LoopResult,
-) (string, []anthropic.Message, error) {
+) (string, []anthropic.Message, []history.ToolCall, error) {
 	turnIndex := len(priorTurns)
+	// ToolCalls on the reviewed turn is what feeds the superego's
+	// FERRAMENTAS_EXECUTADAS provenance block (#4749): without it the superego
+	// cannot distinguish a fact the core actually fetched this turn from a
+	// fabricated one, and it rejects well-sourced drafts as unverifiable.
 	reviewTurns := append(append([]history.Turn(nil), priorTurns...), history.Turn{
 		UserText:      userText,
 		AssistantText: res.FinalText,
+		ToolCalls:     turnToolCalls,
 		StopReason:    res.StopReason,
 		Completed:     true,
 	})
@@ -496,7 +540,8 @@ func governTurn(
 	// revision; and GovernOutput itself fails open to the best draft in hand if
 	// the redraft returns an error, so acting can never break the turn.
 	var redraftUsage anthropic.Usage
-	redraft := func(ctx context.Context, tail []anthropic.Message) (string, error) {
+	var allRedraftCalls []history.ToolCall
+	redraft := func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error) {
 		redraftTimeout := cfg.RedraftTimeout
 		if redraftTimeout <= 0 {
 			redraftTimeout = DefaultRedraftTimeout
@@ -547,13 +592,18 @@ func governTurn(
 			})
 			if err == nil {
 				redraftUsage = redraftUsage.Add(loopRes.Usage)
-				// A redraft can now run tools with real side effects whose events
-				// never reach the wire (Emitter is nil above), so leave a bounded
-				// audit trail of what it did. Only the messages this redraft appended
-				// (everything past loopHistory) are inspected, so the original turn's
-				// tool calls are never re-logged; each line carries the tool id, name,
-				// error flag, and a length-capped result marker, never full output.
-				for _, call := range toolCallsFromMessages(loopRes.Messages[len(loopHistory):]) {
+				// The redraft's own tool calls, derived from only the messages this
+				// redraft appended (everything past loopHistory) so the original
+				// turn's calls are never double-counted. They are returned to the
+				// governor so the NEXT review round's provenance block covers the
+				// evidence this redraft just gathered, and they feed the bounded
+				// audit trail below: a redraft runs tools with real side effects
+				// whose events never reach the wire (Emitter is nil above). Each
+				// audit line carries the tool id, name, error flag, and a
+				// length-capped result marker, never full output.
+				redraftCalls := toolCallsFromMessages(loopRes.Messages[len(loopHistory):])
+				allRedraftCalls = append(allRedraftCalls, redraftCalls...)
+				for _, call := range redraftCalls {
 					diagf(cfg.Diag, "session: redraft tool call id=%s name=%s is_error=%t result=%q",
 						call.ID, call.Name, call.IsError, auditResultMarker(call.Result))
 				}
@@ -561,24 +611,32 @@ func governTurn(
 				// it as a failure so GovernOutput fails open to the non-empty draft in
 				// hand rather than delivering an empty turn OpenClaw would reject.
 				if strings.TrimSpace(tools.StripToolMarkup(loopRes.FinalText)) == "" {
-					return "", fmt.Errorf("redraft tool loop returned no deliverable text (stop_reason %q)", loopRes.StopReason)
+					return "", nil, fmt.Errorf("redraft tool loop returned no deliverable text (stop_reason %q)", loopRes.StopReason)
 				}
-				return loopRes.FinalText, nil
+				return loopRes.FinalText, redraftCalls, nil
 			}
 			// The overall redraft deadline already fired: the text-only fallback
 			// cannot succeed on a dead context and would only burn another blocked
 			// call, so surface the error and let GovernOutput fail open.
 			if ctx.Err() != nil {
-				return "", err
+				return "", nil, err
 			}
 			// Fail-safe: the bounded tool loop errored for another reason. Degrade to
 			// the pre-#4753 text-only redraft — a reword is worse than acting, but far
 			// better than breaking the turn.
 			diagf(cfg.Diag, "session: redraft tool loop failed, falling back to text-only redraft: %v", err)
 		}
-		return textOnlyRedraft(ctx, cfg, systemPrompt, res.Messages, tail, &redraftUsage)
+		// The text-only path runs no tools, so it contributes no new tool calls.
+		text, err := textOnlyRedraft(ctx, cfg, systemPrompt, res.Messages, tail, &redraftUsage)
+		return text, nil, err
 	}
 
+	// The ladder below is the turn's one long silent span (model call after
+	// model call, nothing emitted), so a keepalive ticker brackets exactly it.
+	// stopKeepalive waits for the goroutine to exit before returning, so the
+	// keepalive writer can never interleave with EmitFinalTurn below — the
+	// emitter's writes are not synchronized and rely on one writer at a time.
+	stopKeepalive := startGovernorKeepalive(cfg, emitter)
 	// The held bool is intentionally not consumed here: when a turn is held,
 	// GovernOutput already returns the hold-and-ask text as finalText, which this
 	// seam delivers and persists like any other assistant turn (the facet log is
@@ -586,9 +644,10 @@ func governTurn(
 	// callers that may want to signal a held turn differently; the native path
 	// does not.
 	finalText, _ := cfg.Governor.GovernOutput(ctx, turnIndex, snapshot, res.FinalText, redraft)
+	stopKeepalive()
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
-		return "", nil, fmt.Errorf("session: %w", err)
+		return "", nil, nil, fmt.Errorf("session: %w", err)
 	}
 
 	// Persist only the clean delivered text as the final assistant turn: replace
@@ -609,7 +668,54 @@ func governTurn(
 	//      live 2026-10-04. (Intermediate tool_use turns differ — RunLoop echoes
 	//      those verbatim via RawContent, signatures intact.)
 	finalMessages := replaceFinalAssistantText(res.Messages, finalText)
-	return finalText, finalMessages, nil
+	return finalText, finalMessages, allRedraftCalls, nil
+}
+
+// startGovernorKeepalive starts the goroutine that emits a system/keepalive
+// line every GovernKeepaliveInterval while the active superego ladder runs, so
+// OpenClaw's no-output watchdog never kills the CLI mid-ladder (see the Config
+// field for the incident). The returned stop function ends the ticker AND
+// waits for the goroutine to exit, guaranteeing no keepalive write can race
+// the final-turn emission that follows. An emit failure (a broken wire) stops
+// the keepalives but is only logged — the ladder's own final emission will
+// surface the broken wire as the turn's error.
+func startGovernorKeepalive(cfg Config, emitter *tools.StreamEmitter) (stop func()) {
+	interval := cfg.GovernKeepaliveInterval
+	if interval <= 0 {
+		interval = DefaultGovernKeepaliveInterval
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		// A panic here (a broken writer, a future emitter bug) must stop the
+		// keepalives, never the CLI: this goroutine has no caller to recover it,
+		// so an unrecovered panic kills the whole process mid-turn — the exact
+		// outage the keepalive exists to prevent. Same umbrella the facet
+		// goroutines carry (facet.Superego.review).
+		defer func() {
+			if r := recover(); r != nil {
+				diagf(cfg.Diag, "session: governor keepalive panic: %v", r)
+			}
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := emitter.Keepalive(); err != nil {
+					diagf(cfg.Diag, "session: governor keepalive emit failed: %v", err)
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 // replaceFinalAssistantText returns a copy of messages with the last message's

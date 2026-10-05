@@ -51,21 +51,28 @@ func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []Re
 
 // redrafter is the core redraft callback double: it returns a fixed sequence of
 // redrafts (or errors) and records every ephemeral tail it was handed.
+// toolCalls, when set, is returned alongside the matching redraft, simulating a
+// redraft that ran its own tools (#4753).
 type redrafter struct {
-	drafts []string
-	errs   []error
-	calls  int
-	tails  [][]anthropic.Message
+	drafts    []string
+	errs      []error
+	toolCalls [][]history.ToolCall
+	calls     int
+	tails     [][]anthropic.Message
 }
 
-func (r *redrafter) fn(_ context.Context, tail []anthropic.Message) (string, error) {
+func (r *redrafter) fn(_ context.Context, tail []anthropic.Message) (string, []history.ToolCall, error) {
 	r.tails = append(r.tails, tail)
 	i := r.calls
 	r.calls++
 	if i < len(r.errs) && r.errs[i] != nil {
-		return "", r.errs[i]
+		return "", nil, r.errs[i]
 	}
-	return r.drafts[min(i, len(r.drafts)-1)], nil
+	var calls []history.ToolCall
+	if i < len(r.toolCalls) {
+		calls = r.toolCalls[i]
+	}
+	return r.drafts[min(i, len(r.drafts)-1)], calls, nil
 }
 
 // gateFires / gateQuiet are single-paragraph evaluator replies whose aggregate
@@ -276,6 +283,59 @@ func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 	}
 	if second[1].Role != "assistant" || second[1].Content.(string) != "rev2" {
 		t.Errorf("tail 1 position 1 should be the first redraft rev2: %+v", second[1])
+	}
+}
+
+// TestActiveSuperego_redraftToolCallsReachNextReview locks in the provenance
+// fix for acting redrafts (#4753 + #4749): when a redraft runs its own tools,
+// the NEXT review round's reviewed-turn message must carry those calls in the
+// FERRAMENTAS_EXECUTADAS block — alongside the original turn's calls — so the
+// superego judges the redraft against the evidence it just gathered. The
+// caller's snapshot must stay untouched (the fold clones before mutating).
+func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
+	const draft = "rascunho original"
+	gov, _, co := newTestGovernor(
+		[]scriptStep{gateFires(), gateFires()},
+		[]scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("approve")},
+		nil,
+	)
+	rd := &redrafter{
+		drafts: []string{"rev2 com evidência"},
+		toolCalls: [][]history.ToolCall{{
+			{ID: "t-redraft", Name: "web_fetch", Input: `{"url":"https://arxiv.org/abs/2604.14228"}`, Result: "HTTP 200: título real"},
+		}},
+	}
+	snapshot := history.Snapshot{Turns: []history.Turn{{
+		UserText:      "oi",
+		AssistantText: draft,
+		ToolCalls:     []history.ToolCall{{ID: "t-orig", Name: "web_search", Input: `{"query":"arxiv"}`, Result: "resultados"}},
+		Completed:     true,
+	}}}
+
+	text, held := gov.GovernOutput(context.Background(), 0, snapshot, draft, rd.fn)
+
+	if held || text != "rev2 com evidência" {
+		t.Fatalf("GovernOutput = (%q, %v), want the approved redraft", text, held)
+	}
+	if len(co.gotMessages) != 2 {
+		t.Fatalf("superego reviewed %d times, want 2", len(co.gotMessages))
+	}
+	round1 := co.gotMessages[0][len(co.gotMessages[0])-1].Content
+	round2 := co.gotMessages[1][len(co.gotMessages[1])-1].Content
+	// Round 1 sees the original turn's provenance only.
+	if !strings.Contains(round1, "FERRAMENTAS_EXECUTADAS") || !strings.Contains(round1, "web_search") {
+		t.Errorf("round 1 missing the original turn's tool provenance:\n%s", round1)
+	}
+	if strings.Contains(round1, "web_fetch") {
+		t.Errorf("round 1 must not see the not-yet-run redraft tool:\n%s", round1)
+	}
+	// Round 2 sees the original calls PLUS the redraft's new evidence.
+	if !strings.Contains(round2, "web_search") || !strings.Contains(round2, "web_fetch") {
+		t.Errorf("round 2 missing original or redraft tool provenance:\n%s", round2)
+	}
+	// The caller's snapshot was never mutated by the fold.
+	if got := len(snapshot.Turns[0].ToolCalls); got != 1 {
+		t.Errorf("caller snapshot mutated: reviewed turn now has %d tool calls, want 1", got)
 	}
 }
 

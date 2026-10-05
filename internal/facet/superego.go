@@ -32,6 +32,7 @@ type Superego struct {
 	timeout         time.Duration
 	model           string // logged with each call; the conversant owns the actual routing
 	maxHistoryTurns int
+	now             func() time.Time // injectable clock for the dated system prompt; time.Now in production
 	log             *facetLogger
 
 	inFlight sync.WaitGroup
@@ -39,26 +40,33 @@ type Superego struct {
 	turns    map[int]SuperegoCritique
 }
 
-// SuperegoParams wires a Superego. All fields except LogSink are required; a
-// nil LogSink disables the structured facet log (the facet still runs). The
-// composition root owns opening/closing the sink. MaxHistoryTurns 0 means
-// the whole history.
+// SuperegoParams wires a Superego. All fields except LogSink and Now are
+// required; a nil LogSink disables the structured facet log (the facet still
+// runs). The composition root owns opening/closing the sink. MaxHistoryTurns 0
+// means the whole history. Now is the clock behind the dated system prompt
+// (datedSystemPrompt); nil means time.Now — only tests set it.
 type SuperegoParams struct {
 	Conversant      Conversant
 	SystemPrompt    string
 	Timeout         time.Duration
 	Model           string
 	MaxHistoryTurns int
+	Now             func() time.Time
 	LogSink         io.Writer
 }
 
 func NewSuperego(params SuperegoParams) *Superego {
+	now := params.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Superego{
 		conversant:      params.Conversant,
 		systemPrompt:    params.SystemPrompt,
 		timeout:         params.Timeout,
 		model:           params.Model,
 		maxHistoryTurns: params.MaxHistoryTurns,
+		now:             now,
 		log:             &facetLogger{sink: params.LogSink},
 		turns:           map[int]SuperegoCritique{},
 	}
@@ -257,7 +265,7 @@ func (s *Superego) ReviewDraft(
 // else to do with the result. round 0 means the shadow path (no ladder round).
 func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messages []ReviewMessage) (SuperegoCritique, callLog, error) {
 	start := time.Now()
-	eval, err := s.conversant.Converse(ctx, s.systemPrompt, messages)
+	eval, err := s.conversant.Converse(ctx, s.datedSystemPrompt(), messages)
 	entry := callLog{
 		Facet:           superegoFacet,
 		Model:           s.model,
@@ -285,6 +293,21 @@ func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messa
 	entry.SuperegoAnnotations = critique.Annotations
 	entry.SuperegoWhy = critique.Why
 	return critique, entry, nil
+}
+
+// datedSystemPrompt returns the superego system prompt with today's date
+// appended as one deterministic line (fixed formatting, never
+// model-generated). The superego judges temporal claims in the reviewed draft
+// — publication dates, identifiers that encode a date (e.g. arXiv YYMM) — and
+// without an anchored "today" it falls back to its own training cutoff,
+// misjudging genuinely recent facts as impossible futures. The date is
+// rendered per call, so a long-lived session never carries a stale day, and
+// deliberately in the process's LOCAL zone: kortex runs on the user's own
+// machine, so local time IS the user's "today" — the day the superego must
+// judge temporal claims against (a fixed UTC would be a day behind the user
+// every evening west of it).
+func (s *Superego) datedSystemPrompt() string {
+	return s.systemPrompt + "\n\nData de hoje: " + s.now().Format("2006-01-02") + "."
 }
 
 // superegoVerdict is the JSON object of the superego prompt contract.

@@ -67,6 +67,30 @@ func EmitSystemInit(sessionID string, tools []string) ([]byte, error) {
 	})
 }
 
+// systemKeepaliveEnvelope is the minimal system/keepalive line: no tools, no
+// capabilities — only identity. See EmitSystemKeepalive for the contract.
+type systemKeepaliveEnvelope struct {
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype"`
+	SessionID string `json:"session_id"`
+}
+
+// EmitSystemKeepalive builds a benign system/keepalive line. Its only purpose
+// is resetting OpenClaw's no-output watchdog during long silent spans (the
+// active superego ladder can run several minutes of model calls with nothing
+// on the wire, and OpenClaw kills a CLI that stays quiet past its no-output
+// timeout). OpenClaw's stream-json parser treats every system subtype except
+// "init" as an unknown event and ignores it — the line resets the watchdog
+// (any parsed stdout JSON does) and nothing else. The subtype must never start
+// with "error" (OpenClaw keys round failure on that prefix).
+func EmitSystemKeepalive(sessionID string) ([]byte, error) {
+	return marshalLine(systemKeepaliveEnvelope{
+		Type:      TypeSystem,
+		Subtype:   "keepalive",
+		SessionID: sessionID,
+	})
+}
+
 // EmitAssistant builds an assistant message line carrying the given content
 // blocks (text and/or tool_use) and the round's usage counters.
 func EmitAssistant(sessionID string, eventUUID string, blocks []ContentBlock, usage Usage) ([]byte, error) {

@@ -42,6 +42,8 @@ func newTestSuperego(conversant Conversant, logSink *bytes.Buffer) *Superego {
 		SystemPrompt: "você é o superego",
 		Timeout:      time.Second,
 		Model:        "claude-sonnet-5",
+		// Fixed clock so the dated system prompt is deterministic in assertions.
+		Now: func() time.Time { return time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC) },
 	}
 	if logSink != nil {
 		params.LogSink = logSink
@@ -258,6 +260,34 @@ func TestDraftUnderReviewMessage_noEmotionsOmitsAboutsBlock(t *testing.T) {
 	}
 }
 
+// TestSuperego_datedSystemPromptAdvancesWithClock proves the date line is
+// rendered per call, not captured at construction: a long-lived session whose
+// clock crosses midnight must hand the superego the NEW day on the next review.
+func TestSuperego_datedSystemPromptAdvancesWithClock(t *testing.T) {
+	conversant := &fakeConversant{response: evalText("ok")}
+	days := []time.Time{
+		time.Date(2026, 10, 5, 23, 0, 0, 0, time.UTC),
+		time.Date(2026, 10, 6, 1, 0, 0, 0, time.UTC),
+	}
+	call := 0
+	s := NewSuperego(SuperegoParams{
+		Conversant: conversant, SystemPrompt: "você é o superego",
+		Timeout: time.Second, Model: "claude-sonnet-5",
+		Now: func() time.Time { d := days[min(call, len(days)-1)]; call++; return d },
+	})
+	snapshot := history.Snapshot{Turns: []history.Turn{{UserText: "oi", AssistantText: "resposta", Completed: true}}}
+	tags := []ParagraphAnnotation{{Investment: 4, Valence: "negativa"}}
+
+	reviewAndWait(s, 0, snapshot, []string{"resposta"}, tags)
+	if !strings.HasSuffix(conversant.gotSys, "Data de hoje: 2026-10-05.") {
+		t.Errorf("first review system prompt = %q, want day one", conversant.gotSys)
+	}
+	reviewAndWait(s, 0, snapshot, []string{"resposta"}, tags)
+	if !strings.HasSuffix(conversant.gotSys, "Data de hoje: 2026-10-06.") {
+		t.Errorf("second review system prompt = %q, want the advanced day", conversant.gotSys)
+	}
+}
+
 func TestSuperego_reviewHappyPathWithStructuredVerdict(t *testing.T) {
 	conversant := &fakeConversant{response: evalText(`Analisei o rascunho.
 {"verdict":"revise","annotations":[{"paragraph":1,"issue":"promessa sem caminho","why":"cria expectativa"}],"why":"promessa vaga"}`)}
@@ -271,7 +301,7 @@ func TestSuperego_reviewHappyPathWithStructuredVerdict(t *testing.T) {
 	reviewAndWait(s, 1, snapshot, []string{"vou consertar hoje"},
 		[]ParagraphAnnotation{{Investment: 4, Valence: "negativa", Emotions: []Emotion{{Emotion: "culpa", Level: 4, About: "vou consertar hoje"}}}})
 
-	if conversant.gotSys != "você é o superego" {
+	if conversant.gotSys != "você é o superego\n\nData de hoje: 2026-10-05." {
 		t.Errorf("system prompt = %q", conversant.gotSys)
 	}
 	if len(conversant.gotMessages) != 4 {

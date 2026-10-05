@@ -26,13 +26,14 @@ import (
 // callback's result, so a test can prove the tail reaches the core model yet
 // never persists.
 type fakeGovernor struct {
-	gotDraft        string
-	gotTurnIndex    int
-	gotSnapshot     history.Snapshot
-	deliver         string
-	held            bool
-	callRedraftWith []anthropic.Message
-	redraftResult   string
+	gotDraft         string
+	gotTurnIndex     int
+	gotSnapshot      history.Snapshot
+	deliver          string
+	held             bool
+	callRedraftWith  []anthropic.Message
+	redraftResult    string
+	redraftToolCalls []history.ToolCall
 }
 
 func (f *fakeGovernor) GovernOutput(
@@ -40,17 +41,18 @@ func (f *fakeGovernor) GovernOutput(
 	turnIndex int,
 	snapshot history.Snapshot,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
 ) (string, bool) {
 	f.gotDraft = draft
 	f.gotTurnIndex = turnIndex
 	f.gotSnapshot = snapshot
 	if f.callRedraftWith != nil {
-		text, err := redraft(ctx, f.callRedraftWith)
+		text, calls, err := redraft(ctx, f.callRedraftWith)
 		if err != nil {
 			return draft, false
 		}
 		f.redraftResult = text
+		f.redraftToolCalls = calls
 		return text, f.held
 	}
 	return f.deliver, f.held
@@ -90,7 +92,7 @@ func (g *recordingGovernor) GovernOutput(
 	turnIndex int,
 	snapshot history.Snapshot,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
 ) (string, bool) {
 	g.turnIndices = append(g.turnIndices, turnIndex)
 	g.snapshotLens = append(g.snapshotLens, len(snapshot.Turns))
@@ -204,13 +206,14 @@ func TestRun_ActiveGovernorRedraftActsWithTools(t *testing.T) {
 	gov := &fakeGovernor{
 		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}},
 	}
+	eval := &fakeTurnEvaluator{}
 
 	var out strings.Builder
 	err := Run(context.Background(), Config{
 		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
 		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
 		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
-		RedraftTimeout: time.Second, Governor: gov,
+		RedraftTimeout: time.Second, Governor: gov, TurnEvaluator: eval,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -232,6 +235,12 @@ func TestRun_ActiveGovernorRedraftActsWithTools(t *testing.T) {
 	if gov.redraftResult != "verified evidence-123" {
 		t.Errorf("redraft result = %q, want the evidence-backed answer", gov.redraftResult)
 	}
+	// The redraft also hands its own tool calls back to the governor so the next
+	// review round's provenance block covers the evidence it just gathered.
+	if len(gov.redraftToolCalls) != 1 || gov.redraftToolCalls[0].Name != "bash" ||
+		!strings.Contains(gov.redraftToolCalls[0].Result, "evidence-123") {
+		t.Errorf("redraft tool calls = %+v, want the bash evidence call with its result", gov.redraftToolCalls)
+	}
 
 	var resultText string
 	for _, ev := range parseLines(t, out.String()) {
@@ -248,6 +257,126 @@ func TestRun_ActiveGovernorRedraftActsWithTools(t *testing.T) {
 	}
 	if content, ok := msgs[len(msgs)-1].Content.(string); !ok || content != "verified evidence-123" {
 		t.Errorf("persisted final assistant = %+v, want the evidence-backed redraft", msgs[len(msgs)-1].Content)
+	}
+	// The canonical Turn records the redraft's tool call too: the delivered text
+	// rests on that evidence, so history must list it, not just a diag line.
+	if len(eval.snapshots) != 1 {
+		t.Fatalf("turn evaluator fired %d times, want 1", len(eval.snapshots))
+	}
+	turn := eval.snapshots[0].Turns[0]
+	if len(turn.ToolCalls) != 1 || turn.ToolCalls[0].Name != "bash" ||
+		!strings.Contains(turn.ToolCalls[0].Result, "evidence-123") {
+		t.Errorf("canonical turn tool calls = %+v, want the redraft's bash evidence call", turn.ToolCalls)
+	}
+}
+
+// slowGovernor blocks for delay before delivering, simulating a long superego
+// ladder, so the keepalive test can observe the ticker firing mid-ladder.
+type slowGovernor struct {
+	delay   time.Duration
+	deliver string
+}
+
+func (g *slowGovernor) GovernOutput(
+	ctx context.Context,
+	turnIndex int,
+	snapshot history.Snapshot,
+	draft string,
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+) (string, bool) {
+	time.Sleep(g.delay)
+	return g.deliver, false
+}
+
+// TestRun_GovernorKeepaliveDuringLadder locks in the no-output-watchdog fix: a
+// long-running governor ladder must put benign system/keepalive lines on the
+// wire while it deliberates, and the stream must still end with the normal
+// final assistant + result events after the last keepalive (the ticker stops
+// before the final emission, so the two can never interleave).
+func TestRun_GovernorKeepaliveDuringLadder(t *testing.T) {
+	server, _ := scriptedCoreServer(t, endTurnDraftBody)
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	gov := &slowGovernor{delay: 120 * time.Millisecond, deliver: "governed"}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: time.Second, Governor: gov,
+		GovernKeepaliveInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	keepalives, lastKeepalive, resultIndex := 0, -1, -1
+	for i, line := range lines {
+		if strings.Contains(line, `"subtype":"keepalive"`) {
+			keepalives++
+			lastKeepalive = i
+			if !strings.Contains(line, `"type":"system"`) || !strings.Contains(line, `"session_id":"sess-1"`) {
+				t.Errorf("malformed keepalive line: %s", line)
+			}
+		}
+		if strings.Contains(line, `"type":"result"`) {
+			resultIndex = i
+		}
+	}
+	if keepalives < 2 {
+		t.Errorf("saw %d keepalive lines during a 120ms ladder at 20ms interval, want >= 2:\n%s", keepalives, out.String())
+	}
+	if resultIndex == -1 || lastKeepalive > resultIndex {
+		t.Errorf("keepalive after the terminal result (last keepalive line %d, result line %d)", lastKeepalive, resultIndex)
+	}
+	// The governed text still arrives intact as the terminal result.
+	var resultText string
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+		}
+	}
+	if resultText != "governed" {
+		t.Errorf("delivered result = %q, want the governed text", resultText)
+	}
+}
+
+// TestRun_GovernorSnapshotCarriesTurnToolCalls locks in the provenance fix for
+// the active path (#4749): the reviewed turn the governor receives must carry
+// the tool calls the core actually ran this turn, result attached — that is
+// what feeds the superego's FERRAMENTAS_EXECUTADAS block. Before the fix the
+// reviewed turn was built without ToolCalls, so the superego saw no provenance
+// and rejected genuinely tool-backed drafts as fabricated.
+func TestRun_GovernorSnapshotCarriesTurnToolCalls(t *testing.T) {
+	server, _ := scriptedCoreServer(t,
+		toolUseBody("echo prov-42"),        // call 1: the core runs a real check
+		endTurnTextBody("checked prov-42"), // call 2: the evidence-backed draft
+	)
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	gov := &fakeGovernor{deliver: "ok"}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: time.Second, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	reviewed := gov.gotSnapshot.Turns[gov.gotTurnIndex]
+	if len(reviewed.ToolCalls) != 1 {
+		t.Fatalf("reviewed turn carries %d tool calls, want 1: %+v", len(reviewed.ToolCalls), reviewed.ToolCalls)
+	}
+	call := reviewed.ToolCalls[0]
+	if call.Name != "bash" || !strings.Contains(call.Input, "echo prov-42") {
+		t.Errorf("reviewed tool call = %+v, want the bash echo", call)
+	}
+	if !strings.Contains(call.Result, "prov-42") || call.IsError {
+		t.Errorf("reviewed tool call result = %q (isError %v), want the real output attached", call.Result, call.IsError)
 	}
 }
 
