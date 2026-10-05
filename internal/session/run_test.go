@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 	"github.com/vingarcia/kortex/internal/tools"
 )
@@ -258,6 +259,158 @@ func TestRun_EmptyFinalTurnEmitsErrorNotEmpty(t *testing.T) {
 	}
 	if !strings.Contains(result.Text, "max_tokens") {
 		t.Errorf("error result should name the stop_reason, got %q", result.Text)
+	}
+}
+
+// TestToolCallsFromMessages_extractsThisTurnOnly pins the #4749 extraction:
+// toolCallsFromMessages must open a ToolCall per tool_use block (preserving
+// order), attach each tool_result to its call by id (success and is_error), and
+// — because runTurn passes res.Messages[len(msgs):] — fold in only the slice it
+// is given, never a prior turn's tool traffic.
+func TestToolCallsFromMessages_extractsThisTurnOnly(t *testing.T) {
+	messages := []anthropic.Message{
+		// --- a PRIOR turn's exchange (index 0-1): must stay out of the result
+		// when runTurn slices it off with res.Messages[len(msgs):]. ---
+		{Role: "assistant", Content: []json.RawMessage{
+			json.RawMessage(`{"type":"tool_use","id":"prior-1","name":"OldTool","input":{"x":1}}`),
+		}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("prior-1", "old result", false),
+		}},
+		// --- THIS turn (index 2 onward): the new user message, an assistant turn
+		// mixing text with two tool_use blocks, then their two results. ---
+		{Role: "user", Content: "check the PR"},
+		{Role: "assistant", Content: []json.RawMessage{
+			json.RawMessage(`{"type":"text","text":"let me look"}`),
+			json.RawMessage(`{"type":"tool_use","id":"call-1","name":"Grep","input":{"pattern":"approved"}}`),
+			json.RawMessage(`{"type":"tool_use","id":"call-2","name":"Bash","input":{"cmd":"ls"}}`),
+		}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("call-1", "match found", false),
+			anthropic.NewToolResultBlock("call-2", "boom", true),
+		}},
+		{Role: "assistant", Content: "done"},
+	}
+
+	// priorLen mirrors runTurn's len(msgs): scan only this turn's appended slice.
+	const priorLen = 2
+	got := toolCallsFromMessages(messages[priorLen:])
+
+	if len(got) != 2 {
+		t.Fatalf("got %d tool calls, want 2 (prior turn must be excluded): %+v", len(got), got)
+	}
+	// Order follows tool_use order: Grep before Bash.
+	if got[0].ID != "call-1" || got[0].Name != "Grep" {
+		t.Errorf("call 0 = %+v, want id call-1 name Grep", got[0])
+	}
+	if got[0].Input != `{"pattern":"approved"}` {
+		t.Errorf("call 0 input = %q, want the verbatim tool_use input JSON", got[0].Input)
+	}
+	if got[0].Result != "match found" || got[0].IsError {
+		t.Errorf("call 0 result = %q isError=%v, want \"match found\" / false", got[0].Result, got[0].IsError)
+	}
+	if got[1].ID != "call-2" || got[1].Name != "Bash" {
+		t.Errorf("call 1 = %+v, want id call-2 name Bash", got[1])
+	}
+	if got[1].Result != "boom" || !got[1].IsError {
+		t.Errorf("call 1 result = %q isError=%v, want \"boom\" / true (is_error propagated)", got[1].Result, got[1].IsError)
+	}
+
+	// Guard the slicing claim directly: the full slice DOES fold the prior call
+	// in, so it is the len(msgs) offset — not toolCallsFromMessages — that scopes
+	// a Turn to its own tool traffic.
+	if full := toolCallsFromMessages(messages); len(full) != 3 {
+		t.Errorf("full-slice extraction got %d calls, want 3 (prior-1 + call-1 + call-2)", len(full))
+	}
+}
+
+// captureEvaluator is a stub TurnEvaluator that records the completed
+// history.Turn the session hands it, letting a test inspect the Turn built
+// end-to-end (ToolCalls included) without exposing runTurn.
+type captureEvaluator struct {
+	turns []history.Turn
+}
+
+func (c *captureEvaluator) EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot) {
+	c.turns = append(c.turns, snapshot.Turns[turnIndex])
+}
+
+// TestRun_ToolCallsPopulatedEndToEnd drives the REAL RunLoop/runTurn path with a
+// stubbed Anthropic server that returns a tool_use block (executed by the real
+// Dispatcher) and asserts the history.Turn the session builds carries the
+// extracted ToolCalls end-to-end. This guards a silent-regression gap:
+// toolCallsFromMessages type-switches on the concrete Content types RunLoop
+// produces — []json.RawMessage for the assistant tool_use block and
+// []anthropic.ToolResultBlock for the result. If anthropic.RawContent / RunLoop
+// ever change those concrete types, the type switch falls through, turn.ToolCalls
+// goes silently empty, and the superego regresses to emitting FALSE provenance
+// positives with no failing test — the opposite of this feature's few-false-
+// positives requirement. By exercising the live types (not hand-built ones, as
+// TestToolCallsFromMessages_extractsThisTurnOnly does), a future type change
+// breaks THIS test instead of silently emptying ToolCalls.
+func TestRun_ToolCallsPopulatedEndToEnd(t *testing.T) {
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			// First turn: a tool_use the real Dispatcher executes (bash echo),
+			// producing a genuine tool_result the loop feeds back.
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo provenance-ok"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 10, "output_tokens": 5}
+			}`))
+			return
+		}
+		// Second turn: end_turn with text closes the round.
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"ran it"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 12, "output_tokens": 6}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	capture := &captureEvaluator{}
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:         strings.NewReader(initializeLine("sys") + "\n" + userLine("s", "run echo") + "\n"),
+		Stdout:        &out,
+		Client:        client,
+		Dispatcher:    tools.NewDispatcher(),
+		Store:         NewStore(t.TempDir()),
+		SessionID:     "s",
+		Model:         "m",
+		MaxTokens:     1024,
+		NewUUID:       seqUUID(),
+		TurnEvaluator: capture,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if call != 2 {
+		t.Fatalf("API calls = %d, want 2 (tool_use round trip)", call)
+	}
+	if len(capture.turns) != 1 {
+		t.Fatalf("captured %d completed turns, want 1", len(capture.turns))
+	}
+
+	calls := capture.turns[0].ToolCalls
+	if len(calls) != 1 {
+		t.Fatalf("turn.ToolCalls = %+v, want exactly 1 extracted from the live RunLoop types", calls)
+	}
+	if calls[0].ID != "toolu_1" || calls[0].Name != "bash" {
+		t.Errorf("tool call = %+v, want id toolu_1 name bash", calls[0])
+	}
+	if calls[0].Input != `{"command":"echo provenance-ok"}` {
+		t.Errorf("tool call input = %q, want the verbatim tool_use input JSON", calls[0].Input)
+	}
+	// The real bash output must be attached to the call (result pairing by id over
+	// the live []anthropic.ToolResultBlock turn), and it is not an error.
+	if !strings.Contains(calls[0].Result, "provenance-ok") || calls[0].IsError {
+		t.Errorf("tool call result = %q isError=%v, want the real bash output attached / false", calls[0].Result, calls[0].IsError)
 	}
 }
 

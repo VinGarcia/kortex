@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
@@ -276,18 +277,78 @@ func runTurn(
 	}
 	// The turn's canonical text for the facets: the user message as sent (the
 	// annotator already rewrote it) and the assistant's DELIVERED text (the
-	// governed text on the active path, the raw draft otherwise). Unlike the
-	// proxy's event-driven history.Recorder, this native construction leaves
-	// ToolCalls and IsError unset — every current facet consumer reads only the
-	// user/assistant text, so the paths behave identically; a future facet that
-	// needs tool-call context would have to populate them from the LoopResult.
+	// governed text on the active path, the raw draft otherwise). ToolCalls is
+	// populated from this turn's exchanges so the superego can verify provenance
+	// (what the assistant actually ran this turn), mirroring the proxy's
+	// event-driven history.Recorder. Only the messages appended for THIS turn are
+	// scanned (res.Messages is the whole conversation; the prior history is
+	// msgs), so each Turn carries only its own tool calls, exactly as the proxy
+	// Recorder attaches them to the open turn. IsError is left false: a Turn is
+	// built only on the success path here (RunLoop failures emit an error result
+	// and return a nil turn above), which matches the proxy's non-error terminal
+	// result.
 	turn := history.Turn{
 		UserText:      userText,
 		AssistantText: finalText,
+		ToolCalls:     toolCallsFromMessages(res.Messages[len(msgs):]),
 		StopReason:    res.StopReason,
 		Completed:     true,
 	}
 	return finalMessages, &turn, nil
+}
+
+// toolCallsFromMessages derives this turn's tool calls from the native message
+// slice RunLoop appended for the turn (user → assistant tool_use → user
+// tool_result → … → final assistant). It mirrors the proxy history.Recorder:
+// every tool_use content block opens a ToolCall{ID,Name,Input}, and every
+// tool_result block attaches its text and is_error to the matching ToolCall by
+// id. The native loop (tools.RunLoop) executes each tool_use exactly once, so
+// each id carries exactly one result on this path. The native message shapes
+// are the concrete Go values
+// RunLoop builds: an assistant turn's Content is []json.RawMessage (the raw
+// content blocks), and a tool_result turn's Content is []anthropic.ToolResultBlock.
+// Other content shapes (e.g. the plain-string user message) carry no tool calls
+// and are skipped. The result preserves tool_use order and is deterministic.
+func toolCallsFromMessages(messages []anthropic.Message) []history.ToolCall {
+	var calls []history.ToolCall
+	for _, msg := range messages {
+		switch content := msg.Content.(type) {
+		case []json.RawMessage:
+			for _, raw := range content {
+				var block struct {
+					Type  string          `json:"type"`
+					ID    string          `json:"id"`
+					Name  string          `json:"name"`
+					Input json.RawMessage `json:"input"`
+				}
+				if err := json.Unmarshal(raw, &block); err != nil {
+					continue
+				}
+				if block.Type == "tool_use" {
+					calls = append(calls, history.ToolCall{
+						ID:    block.ID,
+						Name:  block.Name,
+						Input: string(block.Input),
+					})
+				}
+			}
+		case []anthropic.ToolResultBlock:
+			for _, result := range content {
+				for i := range calls {
+					if calls[i].ID != result.ToolUseID {
+						continue
+					}
+					// The native loop emits exactly one tool_result per tool_use id,
+					// so a plain assignment is correct: there is no duplicate result
+					// to guard against on this path.
+					calls[i].Result = result.Content
+					calls[i].IsError = result.IsError
+					break
+				}
+			}
+		}
+	}
+	return calls
 }
 
 // governTurn runs the active superego loop over the deferred final draft and
