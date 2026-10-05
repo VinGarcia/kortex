@@ -455,6 +455,13 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// OpenClaw owns the outer round deadline.
 	client := anthropic.NewClient(token, "", 0)
 
+	// Wire the prompt-cache watchdog on the CORE client only (the superego and
+	// evaluator facets hold their own clients): it makes silent cache-cost
+	// degradation LOUD by emitting a throttled structured WARN to stderr when a
+	// core turn's stable system prefix fails to cache. It observes only — a fault
+	// in it never breaks the turn. 0 cooldown selects the package default.
+	client.SetCacheWatchdog(anthropic.NewCacheWatchdog(stderr, 0))
+
 	// When KORTEX_LOG is set, mirror the passthrough path's wire log onto the
 	// native path: the real claude-cli's traffic is captured by trafficLogger,
 	// but the native client talks to the API directly, so its request/response

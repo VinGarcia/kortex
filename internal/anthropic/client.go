@@ -35,6 +35,10 @@ type Client struct {
 	// writes so concurrent callers never interleave a line.
 	wireLog io.Writer
 	wireMu  sync.Mutex
+	// watchdog, when non-nil, observes each successful response for prompt-cache
+	// degradation (see SetCacheWatchdog / CacheWatchdog). It is an observer only:
+	// it never blocks, mutates, or errors the request/response flow.
+	watchdog *CacheWatchdog
 }
 
 // NewClient builds a client holding the OAuth token. baseURL "" means the
@@ -61,6 +65,16 @@ func NewClient(token string, baseURL string, timeout time.Duration) *Client {
 // swapped while calls are in flight.
 func (c *Client) SetWireLog(w io.Writer) {
 	c.wireLog = w
+}
+
+// SetCacheWatchdog wires the prompt-cache watchdog that inspects each
+// successful response for silent cache degradation (see CacheWatchdog). Wire it
+// only on the CORE client: it is scoped per-client, so enabling it here (and
+// not on the superego/evaluator clients) confines it to the core message path
+// the F4 spec targets. A nil watchdog (the default) disables observation. Like
+// SetWireLog it is meant to be set once at construction, before any request.
+func (c *Client) SetCacheWatchdog(w *CacheWatchdog) {
+	c.watchdog = w
 }
 
 // logWire appends one request/response line to the wire log when enabled. The
@@ -316,14 +330,32 @@ func markStableSystemPrefix(model string, system []systemBlock) {
 	if len(system) == 0 {
 		return
 	}
+	if estimatedSystemTokens(system) < minCacheableTokens(model) {
+		return
+	}
+	system[len(system)-1].CacheControl = &cacheControl{Type: "ephemeral"}
+}
+
+// estimatedSystemTokens approximates the system prefix size in tokens using the
+// standard ~4-bytes-per-token heuristic (token counting is not available
+// client-side). It is the single source of the size estimate shared by
+// markStableSystemPrefix (deciding whether to mark a breakpoint) and the cache
+// watchdog (deciding whether a prefix was large enough that caching was
+// expected), so the two never drift apart.
+func estimatedSystemTokens(system []systemBlock) int {
 	totalChars := 0
 	for _, block := range system {
 		totalChars += len(block.Text)
 	}
-	if totalChars/4 < minCacheableTokens(model) {
-		return
-	}
-	system[len(system)-1].CacheControl = &cacheControl{Type: "ephemeral"}
+	return totalChars / 4
+}
+
+// systemHasBreakpoint reports whether the request's system array went out with
+// an ephemeral cache breakpoint — i.e. the last block carries cache_control.
+// markStableSystemPrefix only ever marks the last block, so this reads the
+// exact wire truth the watchdog needs.
+func systemHasBreakpoint(system []systemBlock) bool {
+	return len(system) > 0 && system[len(system)-1].CacheControl != nil
 }
 
 // CreateMessage performs one non-streaming Messages call. Transport
@@ -406,10 +438,30 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 			Raw:   raw,
 		}
 	}
+	c.observeCache(req.Model, system, wr.Usage)
 	return MessageResponse{
 		Text:       text.String(),
 		Content:    blocks,
 		StopReason: wr.StopReason,
 		Usage:      wr.Usage,
 	}, nil
+}
+
+// observeCache runs the cache watchdog over one successful response. It is
+// fail-safe by contract (F4 requirement: the watchdog must never break the
+// request flow): a nil watchdog is a no-op, and any panic inside the watchdog
+// is recovered so the response the caller already holds is always returned
+// intact. The recovered panic is reported (not swallowed) — a fail-loud monitor
+// must surface its own bug rather than hide it. system is the exact block array
+// sent on the wire, so the watchdog can read whether a breakpoint went out.
+func (c *Client) observeCache(model string, system []systemBlock, usage Usage) {
+	if c.watchdog == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.watchdog.reportDefect(r)
+		}
+	}()
+	c.watchdog.observe(model, system, usage)
 }
