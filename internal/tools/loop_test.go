@@ -248,6 +248,116 @@ func TestRunLoop_forwardsEffort(t *testing.T) {
 	}
 }
 
+// TestRunLoop_ephemeralContextSentbutNotPersisted is the tools-seam assertion
+// for the ephemeral tone digest: EphemeralContext must be appended as the LAST
+// user message of EVERY core call (so the core sees it as the final item of its
+// context), exactly once per call (never accumulating across tool rounds), and
+// must NEVER appear in the returned Messages (canonical history). The loop runs
+// two rounds (tool_use then end_turn) so both the intermediate and the final
+// call are checked.
+func TestRunLoop_ephemeralContextSentButNotPersisted(t *testing.T) {
+	const digest = "<<<TOM_DA_CONVERSA_INICIO>>>\n- alegria\n<<<TOM_DA_CONVERSA_FIM>>>"
+	call := 0
+	var sentPerCall [][]anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		sentPerCall = append(sentPerCall, body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo hi"},"caller":{"type":"direct"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			}`))
+			return
+		}
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"done"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:            "m",
+		MaxTokens:        1024,
+		UserMessage:      "oi",
+		EphemeralContext: digest,
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if call != 2 {
+		t.Fatalf("want 2 API calls, got %d", call)
+	}
+
+	// Every call must end with the ephemeral digest as its final message, and
+	// carry it exactly once (no accumulation as the loop grows the array).
+	for i, msgs := range sentPerCall {
+		if len(msgs) == 0 {
+			t.Fatalf("call %d sent no messages", i+1)
+		}
+		last := msgs[len(msgs)-1]
+		if last.Role != "user" || last.Content != digest {
+			t.Errorf("call %d: last message = %+v, want the ephemeral digest as a trailing user message", i+1, last)
+		}
+		occurrences := 0
+		for _, m := range msgs {
+			if m.Content == digest {
+				occurrences++
+			}
+		}
+		if occurrences != 1 {
+			t.Errorf("call %d: digest appeared %d times, want exactly 1 (no accumulation)", i+1, occurrences)
+		}
+	}
+
+	// The digest must NOT be persisted into canonical history: no returned
+	// message may carry it.
+	for i, m := range result.Messages {
+		if m.Content == digest {
+			t.Errorf("returned Messages[%d] carries the ephemeral digest; it must stay out of canonical history", i)
+		}
+	}
+}
+
+// TestRunLoop_emptyEphemeralContextChangesNothing proves the fail-open default:
+// an empty EphemeralContext appends no extra message, so the wire shape is
+// byte-for-byte what it was before the field existed.
+func TestRunLoop_emptyEphemeralContextChangesNothing(t *testing.T) {
+	var sent []anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		sent = body.Messages
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "m",
+		MaxTokens:   1024,
+		UserMessage: "oi",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	// Only the single user message: no extra trailing ephemeral message.
+	if len(sent) != 1 {
+		t.Fatalf("sent %d messages, want 1 (just the user turn, no ephemeral append)", len(sent))
+	}
+}
+
 // TestRunLoop_maxTurnsExceeded ensures a model that never stops asking for
 // tools fails loudly instead of looping forever.
 func TestRunLoop_maxTurnsExceeded(t *testing.T) {

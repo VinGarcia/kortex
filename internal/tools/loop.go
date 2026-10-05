@@ -64,6 +64,15 @@ type LoopRequest struct {
 	// events and their tool_result turns are still emitted live. With DeferFinal
 	// false the emission is byte-for-byte what it was before this field existed.
 	DeferFinal bool
+	// EphemeralContext, when non-empty, is appended as ONE extra trailing user
+	// message to the array sent to the core model on EVERY call in the loop, but
+	// is NEVER added to the accumulating/returned Messages. It is ephemeral
+	// injected context — the tone digest — recomputed per turn and kept out of
+	// canonical history, exactly like the superego's ephemeral tail. Placed last
+	// so it is the final item of the core's context; placed in the message tail
+	// (never the system prefix) so it never disturbs the cacheable prefix
+	// (anti-nonce rule: mutable per-turn content goes at the end of messages).
+	EphemeralContext string
 }
 
 // LoopResult is the outcome of a completed tool-loop.
@@ -87,6 +96,21 @@ type LoopResult struct {
 	// on its own re-emitted result (EmitFinalTurn), since RunLoop did not emit
 	// the result itself.
 	Usage anthropic.Usage
+}
+
+// withEphemeralContext returns messages with one extra trailing user message
+// carrying ephemeral injected context (the tone digest), or messages unchanged
+// when ephemeral is "". The result is only ever handed to a single CreateMessage
+// call; the caller's accumulating messages slice is never mutated (a fresh slice
+// is allocated), so the ephemeral content never enters the returned LoopResult,
+// canonical history, or the stream.
+func withEphemeralContext(messages []anthropic.Message, ephemeral string) []anthropic.Message {
+	if ephemeral == "" {
+		return messages
+	}
+	out := make([]anthropic.Message, 0, len(messages)+1)
+	out = append(out, messages...)
+	return append(out, anthropic.Message{Role: "user", Content: ephemeral})
 }
 
 // RunLoop ports the F3a spike's tool_use/tool_result cycle
@@ -138,7 +162,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			System:    req.System,
 			MaxTokens: req.MaxTokens,
 			Effort:    req.Effort,
-			Messages:  messages,
+			Messages:  withEphemeralContext(messages, req.EphemeralContext),
 			Tools:     tools,
 		})
 		cancel()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -71,6 +72,85 @@ func sequencedResponder(t *testing.T, replies ...string) (*httptest.Server, *[][
 	}))
 	t.Cleanup(server.Close)
 	return server, &calls
+}
+
+// recordingGovernor records what the governor saw on EVERY turn (not just the
+// last), so a multi-turn test can assert the superego's per-turn input is
+// unchanged by an unrelated feature.
+type recordingGovernor struct {
+	turnIndices  []int
+	snapshotLens []int
+	deliver      string
+}
+
+func (g *recordingGovernor) GovernOutput(
+	ctx context.Context,
+	turnIndex int,
+	snapshot history.Snapshot,
+	draft string,
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, error),
+) (string, bool) {
+	g.turnIndices = append(g.turnIndices, turnIndex)
+	g.snapshotLens = append(g.snapshotLens, len(snapshot.Turns))
+	return g.deliver, false
+}
+
+// TestRun_ToneDigestInvisibleToGovernor locks in FIX 1: wiring the tone digest
+// must NOT change what the active superego/governor receives. The governor and
+// the TurnEvaluator are mutually exclusive, so on the active path `turns` is
+// never accumulated and the governor must keep seeing turnIndex 0 and a
+// single-turn snapshot on EVERY turn — the digest draws from its own
+// priorUserTexts accumulator instead. A two-turn session run twice (with the
+// digest wired, and as a no-digest baseline) must produce identical governor
+// input, proving the feature is invisible to the superego (same turnIndex, same
+// snapshot size, so same per-turn token cost).
+func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
+	run := func(digester ToneDigester) *recordingGovernor {
+		server, _ := sequencedResponder(t, "raw-draft")
+		client := anthropic.NewClient("secret", server.URL, time.Second)
+		gov := &recordingGovernor{deliver: "governed"}
+		in := strings.Join([]string{
+			initializeLine("sys"),
+			userLine("sess-1", "estou exausto"),
+			userLine("sess-1", "e agora?"),
+		}, "\n") + "\n"
+		var out strings.Builder
+		err := Run(context.Background(), Config{
+			Stdin: strings.NewReader(in), Stdout: &out, Client: client,
+			Dispatcher: tools.NewDispatcher(), Store: NewStore(t.TempDir()), SessionID: "sess-1",
+			Model: "m", MaxTokens: 1024, NewUUID: seqUUID(), Governor: gov, ToneDigester: digester,
+		})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return gov
+	}
+
+	withDigest := run(&fakeToneDigester{digest: "<<<TOM_DA_CONVERSA_INICIO>>>\n- x\n<<<TOM_DA_CONVERSA_FIM>>>"})
+	baseline := run(nil)
+
+	// The governor path never accumulates turns, so it sees turnIndex 0 and a
+	// single-turn snapshot on both turns — with or without the digest.
+	wantTurnIndices := []int{0, 0}
+	wantSnapshotLens := []int{1, 1}
+	for _, c := range []struct {
+		name string
+		gov  *recordingGovernor
+	}{{"with-digest", withDigest}, {"baseline", baseline}} {
+		if !slices.Equal(c.gov.turnIndices, wantTurnIndices) {
+			t.Errorf("%s: governor turnIndices = %v, want %v", c.name, c.gov.turnIndices, wantTurnIndices)
+		}
+		if !slices.Equal(c.gov.snapshotLens, wantSnapshotLens) {
+			t.Errorf("%s: governor snapshot sizes = %v, want %v", c.name, c.gov.snapshotLens, wantSnapshotLens)
+		}
+	}
+	// And the two runs are byte-for-byte identical in what the governor saw: the
+	// digest is invisible to the superego.
+	if !slices.Equal(withDigest.turnIndices, baseline.turnIndices) ||
+		!slices.Equal(withDigest.snapshotLens, baseline.snapshotLens) {
+		t.Errorf("digest changed governor input: with-digest (idx=%v lens=%v) vs baseline (idx=%v lens=%v)",
+			withDigest.turnIndices, withDigest.snapshotLens, baseline.turnIndices, baseline.snapshotLens)
+	}
 }
 
 // TestRun_ActiveGovernorDeliversGovernedText proves the active path emits and

@@ -414,6 +414,110 @@ func TestRun_ToolCallsPopulatedEndToEnd(t *testing.T) {
 	}
 }
 
+// fakeToneDigester is a stub ToneDigester that returns a fixed digest and
+// records the user texts it was handed, so a test can assert both the injected
+// block AND that the digester saw the session's annotated user messages.
+type fakeToneDigester struct {
+	digest   string
+	gotTexts [][]string
+}
+
+func (f *fakeToneDigester) Digest(userTexts []string) string {
+	f.gotTexts = append(f.gotTexts, append([]string(nil), userTexts...))
+	return f.digest
+}
+
+// TestRun_ToneDigestInjectedButNotPersisted is the end-to-end seam for the
+// ephemeral tone digest, mirroring the superego ephemeral-tail contract: for a
+// turn with annotations the digest MUST be present as the LAST message of the
+// core's context, and it must NOT be persisted into the shared history
+// afterward. A two-turn session proves both: each turn sends the digest as its
+// trailing message, yet the second turn's history (and the persisted store)
+// carry only the real user+assistant messages, never the digest.
+func TestRun_ToneDigestInjectedButNotPersisted(t *testing.T) {
+	const digest = "<<<TOM_DA_CONVERSA_INICIO>>>\n- cansaço — nível máx 4, valência negativa, 1x\n<<<TOM_DA_CONVERSA_FIM>>>"
+
+	var lastMessages [][]anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		lastMessages = append(lastMessages, body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	digester := &fakeToneDigester{digest: digest}
+
+	in := strings.Join([]string{
+		initializeLine("sys"),
+		userLine("sess-1", "estou exausto"),
+		userLine("sess-1", "e agora?"),
+	}, "\n") + "\n"
+	var out strings.Builder
+
+	err := Run(context.Background(), Config{
+		Stdin: strings.NewReader(in), Stdout: &out, Client: client,
+		Dispatcher: tools.NewDispatcher(), Store: store, SessionID: "sess-1",
+		Model: "m", MaxTokens: 1024, NewUUID: seqUUID(), ToneDigester: digester,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(lastMessages) != 2 {
+		t.Fatalf("captured %d core calls, want 2 (one per user turn)", len(lastMessages))
+	}
+
+	// PRESENT: every turn's core context ends with the ephemeral digest.
+	for turn, msgs := range lastMessages {
+		if len(msgs) == 0 {
+			t.Fatalf("turn %d sent no messages", turn+1)
+		}
+		last := msgs[len(msgs)-1]
+		if last.Role != "user" || last.Content != digest {
+			t.Errorf("turn %d: last core message = %+v, want the ephemeral digest", turn+1, last)
+		}
+	}
+
+	// NOT PERSISTED: the second turn carries only the real prior user+assistant
+	// plus the new user message plus this turn's digest = 4. Had the first turn's
+	// digest been persisted into history, the count would be larger.
+	if n := len(lastMessages[1]); n != 4 {
+		t.Errorf("second turn sent %d messages, want 4 (prior user+assistant + new user + ephemeral digest); extra implies the digest leaked into history", n)
+	}
+
+	// NOT PERSISTED: the store holds only real conversation turns, never the
+	// digest block.
+	saved, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	for i, m := range saved {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "TOM_DA_CONVERSA") {
+			t.Errorf("persisted message %d carries the ephemeral digest: %q", i, s)
+		}
+	}
+	if len(saved) != 4 {
+		t.Errorf("persisted %d messages, want 4 (2 turns of user+assistant, no digest)", len(saved))
+	}
+
+	// The digester was fed the session's annotated user texts, growing by one per
+	// turn (prior turns' texts + the current one), never the assistant text.
+	if len(digester.gotTexts) != 2 {
+		t.Fatalf("digester called %d times, want 2", len(digester.gotTexts))
+	}
+	if got := digester.gotTexts[0]; len(got) != 1 || got[0] != "estou exausto" {
+		t.Errorf("first digest call texts = %v, want [estou exausto]", got)
+	}
+	if got := digester.gotTexts[1]; len(got) != 2 || got[0] != "estou exausto" || got[1] != "e agora?" {
+		t.Errorf("second digest call texts = %v, want [estou exausto, e agora?]", got)
+	}
+}
+
 func TestRun_TurnErrorEmitsResultAndContinues(t *testing.T) {
 	// A server that 500s fails the Messages call, so RunLoop errors; the session
 	// must still emit a terminal error result and keep reading the next turn.

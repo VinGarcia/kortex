@@ -35,6 +35,21 @@ type TurnEvaluator interface {
 	EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot)
 }
 
+// ToneDigester is the facet seam for the ephemeral tone digest: given the
+// session's user messages (each already carrying the input annotator's
+// `[emoções pN]` lines, oldest first, the current turn's message last), it
+// returns a compact, human-readable digest of the conversation's current
+// emotional tone to inject as the LAST item of the core's context for the turn.
+// The block is EPHEMERAL — recomputed each turn, injected only into that turn's
+// core call (never into the canonical history and never onto the stream), exactly
+// like the superego's ephemeral tail. "" means inject nothing (fail-open: no
+// annotations, or any internal error). Defined here, not imported from facet, for
+// the same decoupling reason the other seams are; facet.ToneDigest satisfies it
+// structurally. A nil Config.ToneDigester skips the digest.
+type ToneDigester interface {
+	Digest(userTexts []string) string
+}
+
 // OutputGovernor is the facet seam for the active superego loop: it runs
 // SYNCHRONOUSLY before the turn's final assistant/result events are emitted and
 // decides the text to deliver. Given the core's draft, it runs the blocking
@@ -127,6 +142,11 @@ type Config struct {
 	// mode this is left nil: the governor already evaluates synchronously, so the
 	// async shadow evaluation would be redundant work on the same draft.
 	TurnEvaluator TurnEvaluator
+	// ToneDigester, when non-nil, computes the ephemeral tone digest injected as
+	// the last item of the core's context on each turn (the session's annotated
+	// user messages in, a bounded digest block out). Nil skips the digest, leaving
+	// the core context unchanged. The digest never enters canonical history.
+	ToneDigester ToneDigester
 	// Governor, when non-nil, puts the session on the active-superego path: the
 	// final turn is deferred (RunLoop DeferFinal), the governor decides the text
 	// to deliver, and the delivered text — not the core's raw draft — is emitted
@@ -162,7 +182,17 @@ func Run(ctx context.Context, cfg Config) error {
 	// turns accumulates one history.Turn per completed turn, feeding the
 	// TurnEvaluator the same per-process view the passthrough recorder gives
 	// it: turns handled by this process, not the cross-resume history on disk.
+	// It stays gated on TurnEvaluator being wired (see below) so the
+	// active-superego path — mutually exclusive with the evaluator — keeps seeing
+	// a single-turn view (turnIndex 0), exactly as before this feature existed.
 	var turns []history.Turn
+	// priorUserTexts is the tone digest's OWN lightweight source of prior turns:
+	// just each completed turn's annotated user text, accumulated on every path
+	// independently of turns. The digest needs only UserText (not a full
+	// history.Turn with tool results), and feeding it from here keeps the digest
+	// decoupled from — and cost-neutral to — the governor/superego, which must
+	// not begin seeing multi-turn history as a side effect of this feature.
+	var priorUserTexts []string
 
 	scanner := bufio.NewScanner(cfg.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
@@ -204,17 +234,27 @@ func Run(ctx context.Context, cfg Config) error {
 				userText = cfg.Annotator.Annotate(userText)
 			}
 			var turn *history.Turn
-			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, userText)
+			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
 			if err != nil {
 				return err
 			}
 			// A failed turn (turn == nil) emitted its error result and left
-			// history unchanged; it has no assistant output to evaluate, so the
-			// evaluator fires only on a turn that completed successfully.
-			if turn != nil && cfg.TurnEvaluator != nil {
-				turns = append(turns, *turn)
-				snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: append([]history.Turn(nil), turns...)}
-				cfg.TurnEvaluator.EvaluateCompletedTurn(len(turns)-1, snapshot)
+			// history unchanged, so there is nothing to accumulate or evaluate.
+			if turn != nil {
+				// The tone digest's own accumulator grows on every completed turn,
+				// regardless of which facets are wired, so the digest always sees the
+				// full prior conversation's annotated user text.
+				priorUserTexts = append(priorUserTexts, turn.UserText)
+				// turns and the evaluator stay gated on TurnEvaluator exactly as
+				// before: the active-superego (Governor) path is mutually exclusive
+				// with the evaluator, so turns stays empty there and the governor keeps
+				// seeing a single-turn snapshot (turnIndex 0). The digest must not
+				// change that, which is why it draws from priorUserTexts above instead.
+				if cfg.TurnEvaluator != nil {
+					turns = append(turns, *turn)
+					snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: append([]history.Turn(nil), turns...)}
+					cfg.TurnEvaluator.EvaluateCompletedTurn(len(turns)-1, snapshot)
+				}
 			}
 		}
 	}
@@ -237,6 +277,7 @@ func runTurn(
 	systemPrompt string,
 	msgs []anthropic.Message,
 	priorTurns []history.Turn,
+	priorUserTexts []string,
 	userText string,
 ) ([]anthropic.Message, *history.Turn, error) {
 	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
@@ -248,6 +289,11 @@ func runTurn(
 		UserMessage: userText,
 		CallTimeout: cfg.LoopCallTimeout,
 		Emitter:     emitter,
+		// The ephemeral tone digest is injected as the last item of the core's
+		// context for this turn and never persisted (see toneDigest). It draws from
+		// priorUserTexts, not priorTurns, so it stays independent of the governor's
+		// turn view.
+		EphemeralContext: toneDigest(cfg, priorUserTexts, userText),
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
 		DeferFinal: cfg.Governor != nil,
@@ -295,6 +341,23 @@ func runTurn(
 		Completed:     true,
 	}
 	return finalMessages, &turn, nil
+}
+
+// toneDigest computes the ephemeral tone digest for the turn about to run: the
+// session's annotated user messages (every prior turn's UserText, oldest first,
+// then this turn's text) handed to the digester. priorUserTexts is the digest's
+// own accumulator (see Run), kept separate from the governor's turn view so the
+// digest never changes what the superego receives. Returns "" when no digester
+// is wired, so the core context is unchanged on the no-facet path. The digest is
+// handed to RunLoop as EphemeralContext and never persisted.
+func toneDigest(cfg Config, priorUserTexts []string, userText string) string {
+	if cfg.ToneDigester == nil {
+		return ""
+	}
+	userTexts := make([]string, 0, len(priorUserTexts)+1)
+	userTexts = append(userTexts, priorUserTexts...)
+	userTexts = append(userTexts, userText)
+	return cfg.ToneDigester.Digest(userTexts)
 }
 
 // toolCallsFromMessages derives this turn's tool calls from the native message

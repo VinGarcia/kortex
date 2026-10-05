@@ -449,6 +449,16 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	if facets.governor != nil {
 		governor = facets.governor
 	}
+	// The ephemeral tone digest activates whenever the input annotator is on:
+	// without annotations there is nothing to digest (it returns "" and injects
+	// nothing), so the annotator's presence is the natural gate — no separate
+	// config flag. minLevel 0 includes every emotion level (the task's tie-breaker
+	// on the design's ambiguous >=3 cut, which authoritatively governs the diary,
+	// not this digest).
+	var toneDigester session.ToneDigester
+	if facets.annotator != nil {
+		toneDigester = facet.NewToneDigest(0)
+	}
 
 	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
 	// legitimate long generation (a deep tool loop) must not be cut off, and
@@ -500,6 +510,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		Annotator:       annotator,
 		TurnEvaluator:   turnEvaluator,
 		Governor:        governor,
+		ToneDigester:    toneDigester,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
