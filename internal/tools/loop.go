@@ -73,6 +73,18 @@ type LoopRequest struct {
 	// (never the system prefix) so it never disturbs the cacheable prefix
 	// (anti-nonce rule: mutable per-turn content goes at the end of messages).
 	EphemeralContext string
+	// FinalizeOnBudget changes what happens when the loop reaches MaxTurns while
+	// the model is still asking for tools. The default (false) fails closed with
+	// an error, which is right for a user turn that has no fallback output. When
+	// true, RunLoop instead makes ONE final call with no tools offered, so the
+	// round ends gracefully with a deliverable text answer that still sees every
+	// tool_result gathered so far — the model is forced to stop acting and
+	// answer. This is the bounded superego-redraft path: the redraft may run a
+	// small number of tool rounds to resolve the superego's finding, and when it
+	// exhausts that budget it answers with the evidence it has rather than
+	// erroring the turn. Only this opt-in path finalizes; every other caller
+	// keeps the fail-closed behavior.
+	FinalizeOnBudget bool
 }
 
 // LoopResult is the outcome of a completed tool-loop.
@@ -237,5 +249,63 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		)
 	}
 
+	// The budget is exhausted with a tool_use still pending. Fail closed by
+	// default; the FinalizeOnBudget caller instead gets one graceful toolless
+	// call so the round still ends with a deliverable answer.
+	if req.FinalizeOnBudget {
+		return finalizeWithoutTools(ctx, client, req, messages, maxTurns, callTimeout, totalUsage)
+	}
 	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
+}
+
+// finalizeWithoutTools makes one last core call with NO tools offered after the
+// tool-loop hit its round budget, so a FinalizeOnBudget loop ends with a
+// deliverable text answer (the model sees every tool_result gathered so far)
+// instead of erroring. It mirrors the loop's own final-turn handling: the
+// empty-text guard, the deferred-vs-live emission, the appended assistant turn,
+// and the usage-summed result. messages already ends with the last turn's
+// user(tool_result), which is a valid prefix for a toolless call; turns is the
+// budget that was consumed (reported as LoopResult.Turns).
+func finalizeWithoutTools(
+	ctx context.Context,
+	client *anthropic.Client,
+	req LoopRequest,
+	messages []anthropic.Message,
+	turns int,
+	callTimeout time.Duration,
+	totalUsage anthropic.Usage,
+) (LoopResult, error) {
+	cctx, cancel := context.WithTimeout(ctx, callTimeout)
+	resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
+		Model:     req.Model,
+		System:    req.System,
+		MaxTokens: req.MaxTokens,
+		Effort:    req.Effort,
+		Messages:  messages,
+		// No Tools: force a text answer so the budgeted round closes gracefully.
+	})
+	cancel()
+	if err != nil {
+		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call exceeded per-call deadline (%s): %w", callTimeout, err)
+		}
+		return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call: %w", err)
+	}
+	totalUsage = totalUsage.Add(resp.Usage)
+	if strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
+		return LoopResult{}, fmt.Errorf("tools: tool-loop finalize returned no deliverable text (stop_reason %q)", resp.StopReason)
+	}
+	if !req.DeferFinal {
+		if err := req.Emitter.assistant(resp); err != nil {
+			return LoopResult{}, err
+		}
+	}
+	messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
+	result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turns, Messages: messages, Usage: totalUsage}
+	if !req.DeferFinal {
+		if err := req.Emitter.result(result, totalUsage); err != nil {
+			return LoopResult{}, err
+		}
+	}
+	return result, nil
 }

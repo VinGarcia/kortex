@@ -385,6 +385,104 @@ func TestRunLoop_maxTurnsExceeded(t *testing.T) {
 	}
 }
 
+// TestRunLoop_finalizeOnBudgetEndsGracefully proves the bounded superego-redraft
+// path: when the loop reaches its MaxTurns budget with a tool_use still pending,
+// FinalizeOnBudget makes ONE last toolless call so the round ends with a
+// deliverable text answer (seeing the tool_results gathered) instead of the
+// fail-closed MaxTurns error. The budget here is 2, so two tool rounds run and
+// the third (finalize) call — which carries no "tools" field — returns the
+// closing text.
+func TestRunLoop_finalizeOnBudgetEndsGracefully(t *testing.T) {
+	var calls int
+	var finalizeHadTools bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls <= 2 {
+			// The two budgeted tool rounds: each asks for a bash tool_use.
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_x","name":"bash","input":{"command":"echo again"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			}`))
+			return
+		}
+		// The finalize call must offer no tools; record whether it did so the
+		// test can prove tools were dropped for the closing answer.
+		var body struct {
+			Tools []json.RawMessage `json:"tools"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		finalizeHadTools = len(body.Tools) > 0
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"closed with the evidence in hand"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 2, "output_tokens": 2}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:            "m",
+		MaxTokens:        10,
+		UserMessage:      "keep asking for tools",
+		MaxTurns:         2,
+		FinalizeOnBudget: true,
+	})
+	if err != nil {
+		t.Fatalf("FinalizeOnBudget must end gracefully, got error: %v", err)
+	}
+	// Two budgeted tool rounds plus the one finalize call.
+	if calls != 3 {
+		t.Fatalf("API calls = %d, want 3 (2 budgeted tool rounds + 1 finalize)", calls)
+	}
+	if finalizeHadTools {
+		t.Error("finalize call offered tools; it must drop them to force a text answer")
+	}
+	if result.FinalText != "closed with the evidence in hand" {
+		t.Errorf("FinalText = %q, want the finalize text answer", result.FinalText)
+	}
+	if result.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q, want end_turn from the finalize call", result.StopReason)
+	}
+}
+
+// TestRunLoop_finalizeOnBudgetEmptyStillFailsClosed proves the finalize call is
+// not a blank check: if the forced toolless answer strips to nothing, RunLoop
+// still errors (the caller fails open to the draft in hand) rather than
+// delivering an empty turn.
+func TestRunLoop_finalizeOnBudgetEmptyStillFailsClosed(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_x","name":"bash","input":{"command":"echo again"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			}`))
+			return
+		}
+		// The finalize call returns no text block at all.
+		w.Write([]byte(`{"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:            "m",
+		MaxTokens:        10,
+		UserMessage:      "loop then finalize empty",
+		MaxTurns:         1,
+		FinalizeOnBudget: true,
+	})
+	if err == nil {
+		t.Fatal("an empty finalize answer must still fail closed")
+	}
+}
+
 // TestRunLoop_callTimeoutFailsClosed proves a hung CreateMessage is bounded by
 // LoopRequest.CallTimeout rather than blocking the turn forever: when the
 // endpoint never responds, RunLoop returns a deadline error PROMPTLY (bounded

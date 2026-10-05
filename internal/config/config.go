@@ -41,6 +41,15 @@ const DefaultSuperegoModel = "claude-opus-4-8"
 // when the valence is negative or mixed.
 const DefaultGateMinInvestment = 4
 
+// DefaultRedraftToolBudget is the per-redraft tool-use round budget when the
+// config leaves redraftToolBudget unset (0). A superego-triggered redraft in
+// active mode may run the tool loop to ACT on the critique (e.g. actually run
+// the verification the superego flagged as missing) instead of merely rewording;
+// this budget caps how many tool-use round trips that single redraft may make
+// before it must finalize with a text answer. It is deliberately small: a
+// redraft should resolve the specific finding, not open an unbounded tool loop.
+const DefaultRedraftToolBudget = 3
+
 // SuperegoModeShadow (the default) runs the superego asynchronously after the
 // turn is delivered: observe-only, log-only. SuperegoModeActive runs it
 // synchronously before delivery, inside the blocking core↔superego loop.
@@ -148,6 +157,15 @@ type Superego struct {
 	// whole history. A cap trades review depth for token cost when a session
 	// grows long.
 	MaxHistoryTurns int `json:"maxHistoryTurns"`
+	// RedraftToolBudget caps how many tool-use round trips a single active-mode
+	// redraft may make before it must answer with text. It only matters in
+	// mode "active": when the superego flags a finding that needs ACTION (for
+	// example "you did not actually verify X"), the redraft drives the same
+	// tool loop the turn uses so the core can run the check and answer with
+	// evidence, instead of rewording the problem away. 0 means
+	// DefaultRedraftToolBudget. Keep it small: the redraft should resolve the
+	// specific finding, never open an unbounded tool loop.
+	RedraftToolBudget int `json:"redraftToolBudget"`
 }
 
 // Load reads and validates the config file at path.
@@ -252,6 +270,9 @@ func (s Superego) Validate() error {
 	}
 	if s.MaxHistoryTurns < 0 {
 		return fmt.Errorf("maxHistoryTurns must be >= 0, got %d", s.MaxHistoryTurns)
+	}
+	if s.RedraftToolBudget < 0 {
+		return fmt.Errorf("redraftToolBudget must be >= 0, got %d", s.RedraftToolBudget)
 	}
 	if s.Mode != "" && s.Mode != SuperegoModeShadow && s.Mode != SuperegoModeActive {
 		return fmt.Errorf("mode must be %q or %q, got %q", SuperegoModeShadow, SuperegoModeActive, s.Mode)
