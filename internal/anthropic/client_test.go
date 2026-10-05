@@ -197,6 +197,83 @@ func TestCreateMessage_wireLog(t *testing.T) {
 	}
 }
 
+// TestCreateMessage_cacheControl proves the client marks an ephemeral cache
+// breakpoint on the stable system prefix only when that prefix clears the
+// model's cacheable floor, and always at the END of the prefix (never on an
+// earlier block). Below the floor or with no caller system it marks nothing, so
+// the request still goes out — caching failing to apply must never break a call.
+func TestCreateMessage_cacheControl(t *testing.T) {
+	// A system prompt comfortably above every model's floor (Haiku 4.5's 4096
+	// tokens ~= 16k bytes is the highest) vs one between the opus/sonnet floor
+	// (1024 tokens ~= 4k bytes) and the haiku floor, which discriminates the
+	// per-model minimum.
+	bigSystem := strings.Repeat("stable system prefix content. ", 1000) // ~30k bytes
+	midSystem := strings.Repeat("system ", 1200)                        // ~8.4k bytes ~= 2100 tokens
+
+	tests := []struct {
+		desc            string
+		model           string
+		system          string
+		wantCacheMarked bool
+	}{
+		{desc: "large prefix caches on opus", model: "claude-opus-4-8", system: bigSystem, wantCacheMarked: true},
+		{desc: "large prefix caches on haiku", model: "claude-haiku-4-5-20251001", system: bigSystem, wantCacheMarked: true},
+		{desc: "mid prefix caches on opus (floor 1024)", model: "claude-opus-4-8", system: midSystem, wantCacheMarked: true},
+		{desc: "mid prefix below haiku floor (4096) is not cached", model: "claude-haiku-4-5-20251001", system: midSystem, wantCacheMarked: false},
+		{desc: "short prefix below floor is not cached", model: "claude-opus-4-8", system: "tiny system", wantCacheMarked: false},
+		{desc: "empty caller system is not cached", model: "claude-opus-4-8", system: "", wantCacheMarked: false},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			var gotBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Errorf("decoding request body: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+			}))
+			defer server.Close()
+
+			client := NewClient("t", server.URL, time.Second)
+			if _, err := client.CreateMessage(context.Background(), MessageRequest{
+				Model:     test.model,
+				System:    test.system,
+				MaxTokens: 1024,
+				Messages:  []Message{{Role: "user", Content: "hello"}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			system, ok := gotBody["system"].([]any)
+			if !ok || len(system) == 0 {
+				t.Fatalf("system = %v, want a non-empty block array", gotBody["system"])
+			}
+			if got := blockHasEphemeralCache(system[len(system)-1]); got != test.wantCacheMarked {
+				t.Errorf("last system block cache_control = %v, want %v", got, test.wantCacheMarked)
+			}
+			// The breakpoint belongs only at the end of the stable prefix: the
+			// preamble block (and any block before the last) must never carry it.
+			for i := 0; i < len(system)-1; i++ {
+				if blockHasEphemeralCache(system[i]) {
+					t.Errorf("system block %d carries cache_control; breakpoint must sit only at the end of the stable prefix", i)
+				}
+			}
+		})
+	}
+}
+
+// blockHasEphemeralCache reports whether a decoded system block carries an
+// ephemeral cache_control marker.
+func blockHasEphemeralCache(block any) bool {
+	m, ok := block.(map[string]any)
+	if !ok {
+		return false
+	}
+	cc, ok := m["cache_control"].(map[string]any)
+	return ok && cc["type"] == "ephemeral"
+}
+
 func TestCreateMessage_errors(t *testing.T) {
 	tests := []struct {
 		desc        string

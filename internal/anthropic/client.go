@@ -117,7 +117,12 @@ func NewToolResultBlock(toolUseID string, content string, isError bool) ToolResu
 // plain facet calls that predate the tool-loop; non-nil, it is forwarded
 // verbatim in the "tools" field.
 type MessageRequest struct {
-	Model     string
+	Model string
+	// System is the turn-invariant system prompt. Keep it byte-identical across
+	// the turns of a conversation: the client marks it as a prompt-cache prefix
+	// (see markStableSystemPrefix), so interpolating volatile per-turn content
+	// here would miss the cache and instead pay the cache-write penalty every
+	// turn — strictly worse than not caching.
 	System    string
 	MaxTokens int
 	Messages  []Message
@@ -235,9 +240,20 @@ type outputConfig struct {
 // that merely starts with the preamble passes for short systems but is
 // rejected (bare 429) once the rest of the prompt is large — verified live
 // 2026-10-04 against claude-fable-5 with the real 61k-char OpenClaw prompt.
+// CacheControl, when set on a block, asks the API to cache the request prefix
+// up to and including that block (see markStableSystemPrefix).
 type systemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+// cacheControl is a prompt-cache breakpoint. The Messages API caches the exact
+// request prefix (tools → system → messages) up to and including the block
+// carrying it, so a later turn whose prefix is byte-identical reads those
+// tokens from cache (~0.1x the input price) instead of re-billing them.
+type cacheControl struct {
 	Type string `json:"type"`
-	Text string `json:"text"`
 }
 
 type wireResponse struct {
@@ -272,6 +288,44 @@ type wireError struct {
 // in the following block.
 const claudeCodePreamble = "You are Claude Code, Anthropic's official CLI for Claude."
 
+// minCacheableTokens is the smallest system prefix the Messages API will
+// actually cache for a model. A cache_control breakpoint on a shorter prefix is
+// ignored silently — no error, no caching — so marking below this floor is
+// pointless. Haiku 4.5's floor is 4096 tokens; every other model this client
+// targets (opus-4-8, sonnet, fable-5) sits at or below 1024, so 1024 is the
+// safe default that never marks below a model's real floor.
+func minCacheableTokens(model string) int {
+	if strings.Contains(model, "haiku") {
+		return 4096
+	}
+	return 1024
+}
+
+// markStableSystemPrefix places one ephemeral cache breakpoint at the END of
+// the stable system prefix (the last system block), so the whole turn-invariant
+// system — the Claude Code preamble plus the caller's prompt — is cached once
+// and every later turn reads it back instead of re-billing the entire context
+// each turn.
+//
+// It is fail-safe: when system is empty or its estimated size is below the model's
+// cacheable floor, it marks nothing and the request proceeds uncached, which is
+// exactly what the API would do with an under-floor breakpoint anyway. The size
+// estimate uses the standard ~4-bytes-per-token heuristic because token
+// counting is not available client-side; a near-miss costs nothing.
+func markStableSystemPrefix(model string, system []systemBlock) {
+	if len(system) == 0 {
+		return
+	}
+	totalChars := 0
+	for _, block := range system {
+		totalChars += len(block.Text)
+	}
+	if totalChars/4 < minCacheableTokens(model) {
+		return
+	}
+	system[len(system)-1].CacheControl = &cacheControl{Type: "ephemeral"}
+}
+
 // CreateMessage performs one non-streaming Messages call. Transport
 // failures come back wrapped; API failures come back as *APIError.
 func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (MessageResponse, error) {
@@ -279,6 +333,7 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 	if req.System != "" {
 		system = append(system, systemBlock{Type: "text", Text: req.System})
 	}
+	markStableSystemPrefix(req.Model, system)
 	wire := wireRequest{
 		Model:     req.Model,
 		System:    system,
