@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -153,6 +154,217 @@ func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
 	}
 }
 
+// scriptedCoreServer replies to each Messages API call with the next raw JSON
+// body in bodies (repeating the last), and records every call's raw request
+// body so a test can assert what the redraft tool loop sent (the critique, the
+// guard-rail, and the tool_results fed back). Unlike sequencedResponder it lets
+// a test script tool_use bodies, which the redraft now drives.
+func scriptedCoreServer(t *testing.T, bodies ...string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var reqs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		i := min(len(reqs), len(bodies)-1)
+		reqs = append(reqs, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, bodies[i])
+	}))
+	t.Cleanup(server.Close)
+	return server, &reqs
+}
+
+const (
+	endTurnDraftBody = `{"content":[{"type":"text","text":"raw-draft"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+)
+
+func toolUseBody(command string) string {
+	return fmt.Sprintf(`{"content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":%q}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`, command)
+}
+
+func endTurnTextBody(text string) string {
+	return fmt.Sprintf(`{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, text)
+}
+
+// TestRun_ActiveGovernorRedraftActsWithTools proves directive #4753: a redraft
+// whose finding needs ACTION drives the real bounded tool loop — it runs the
+// check (a bash tool_use the dispatcher executes) and answers with the evidence,
+// instead of merely rewording. The redraft's opening message carries the
+// superego critique plus the deterministic bounded-action guard-rail, and the
+// tool_result is fed back into the loop before the evidence-backed draft is
+// delivered and persisted.
+func TestRun_ActiveGovernorRedraftActsWithTools(t *testing.T) {
+	server, reqs := scriptedCoreServer(t,
+		endTurnDraftBody,                         // call 1: the initial draft
+		toolUseBody("echo evidence-123"),         // call 2: redraft acts (runs the check)
+		endTurnTextBody("verified evidence-123"), // call 3: redraft answers with evidence
+	)
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: time.Second, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Draft + two redraft tool-loop calls (tool_use, then the evidence answer).
+	if len(*reqs) != 3 {
+		t.Fatalf("core model calls = %d, want 3 (draft + redraft tool round + redraft answer)", len(*reqs))
+	}
+	// The redraft's opening user message carried the critique and the guard-rail.
+	if !strings.Contains((*reqs)[1], "CRITIQUE-X") || !strings.Contains((*reqs)[1], "sem retrabalho gratuito") {
+		t.Errorf("redraft opening call missing critique or guard-rail:\n%s", (*reqs)[1])
+	}
+	// The second redraft-loop call carried the real bash tool_result back — proof
+	// the loop actually executed the check rather than rewording around it.
+	if !strings.Contains((*reqs)[2], "evidence-123") {
+		t.Errorf("redraft loop did not feed the tool evidence back:\n%s", (*reqs)[2])
+	}
+	if gov.redraftResult != "verified evidence-123" {
+		t.Errorf("redraft result = %q, want the evidence-backed answer", gov.redraftResult)
+	}
+
+	var resultText string
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+		}
+	}
+	if resultText != "verified evidence-123" {
+		t.Errorf("delivered result = %q, want the evidence-backed redraft", resultText)
+	}
+	msgs, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if content, ok := msgs[len(msgs)-1].Content.(string); !ok || content != "verified evidence-123" {
+		t.Errorf("persisted final assistant = %+v, want the evidence-backed redraft", msgs[len(msgs)-1].Content)
+	}
+}
+
+// TestRun_ActiveGovernorRedraftToolBudgetEnforced proves the per-redraft tool
+// budget caps the loop: with RedraftToolBudget 2 the redraft runs exactly two
+// tool rounds and then finalizes with a text answer (FinalizeOnBudget), so a
+// core that keeps asking for tools can never run an unbounded loop and the turn
+// still completes with a deliverable draft rather than hanging or erroring.
+func TestRun_ActiveGovernorRedraftToolBudgetEnforced(t *testing.T) {
+	server, reqs := scriptedCoreServer(t,
+		endTurnDraftBody,                    // call 1: the initial draft
+		toolUseBody("echo loop"),            // call 2: redraft tool round 1
+		toolUseBody("echo loop"),            // call 3: redraft tool round 2 (budget = 2)
+		endTurnTextBody("budget-finalized"), // call 4: forced toolless finalize
+	)
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: 5 * time.Second, RedraftToolBudget: 2, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Draft + 2 budgeted tool rounds + 1 finalize = 4 calls. If the budget were
+	// not enforced the server would keep handing back tool_use forever.
+	if len(*reqs) != 4 {
+		t.Fatalf("core model calls = %d, want 4 (draft + 2 tool rounds + finalize)", len(*reqs))
+	}
+	if gov.redraftResult != "budget-finalized" {
+		t.Errorf("redraft result = %q, want the finalized answer", gov.redraftResult)
+	}
+	var resultText string
+	sawError := false
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+			sawError = ev.Result.IsError
+		}
+	}
+	if sawError {
+		t.Errorf("budget exhaustion surfaced an error result; it must end gracefully:\n%s", out.String())
+	}
+	if resultText != "budget-finalized" {
+		t.Errorf("delivered result = %q, want budget-finalized (graceful finalize)", resultText)
+	}
+}
+
+// TestRun_ActiveGovernorRedraftToolErrorFallsBackToText proves the fail-safe: if
+// the redraft tool loop errors for a non-deadline reason (here the first loop
+// call 500s), the redraft degrades to the pre-#4753 text-only revision rather
+// than breaking the turn, and that reworded draft is delivered cleanly.
+func TestRun_ActiveGovernorRedraftToolErrorFallsBackToText(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, endTurnDraftBody)
+		case 2:
+			// The redraft tool loop's first call fails (not a deadline) -> RunLoop
+			// errors -> the closure falls back to the text-only redraft.
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, endTurnTextBody("fallback-reworded"))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{
+		callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}},
+	}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: 5 * time.Second, Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Draft, failed tool-loop call, text-only fallback = 3 calls.
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("core model calls = %d, want 3 (draft + failed tool loop + text fallback)", n)
+	}
+	if gov.redraftResult != "fallback-reworded" {
+		t.Errorf("redraft result = %q, want the text-only fallback draft", gov.redraftResult)
+	}
+	var resultText string
+	sawError := false
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			resultText = ev.Result.Text
+			sawError = ev.Result.IsError
+		}
+	}
+	if sawError {
+		t.Errorf("tool-loop error broke the turn; the fallback should deliver cleanly:\n%s", out.String())
+	}
+	if resultText != "fallback-reworded" {
+		t.Errorf("delivered result = %q, want fallback-reworded", resultText)
+	}
+}
+
 // TestRun_ActiveGovernorDeliversGovernedText proves the active path emits and
 // persists the GOVERNED text, and that the core's raw draft never reaches the
 // wire or the canonical history.
@@ -244,8 +456,13 @@ func TestRun_ActiveGovernorEphemeralTailNotPersisted(t *testing.T) {
 	}
 	redraftMsgs := (*calls)[1]
 	last := redraftMsgs[len(redraftMsgs)-1]
-	if content, ok := last.Content.(string); !ok || content != "CRITIQUE-TAIL-TEXT" {
-		t.Errorf("redraft call did not carry the ephemeral tail as its last message: %+v", redraftMsgs)
+	// The redraft now drives the tool loop, so its opening user message is the
+	// critique followed by the deterministic bounded-action guard-rail. It must
+	// still carry the critique verbatim (the loop reached it) and the guard-rail.
+	if content, ok := last.Content.(string); !ok ||
+		!strings.Contains(content, "CRITIQUE-TAIL-TEXT") ||
+		!strings.Contains(content, redraftActionInstruction) {
+		t.Errorf("redraft call did not carry the critique tail + guard-rail as its last message: %+v", redraftMsgs)
 	}
 	if gov.redraftResult != "revised-draft" {
 		t.Errorf("redraft returned %q, want revised-draft", gov.redraftResult)

@@ -133,9 +133,16 @@ type builtFacets struct {
 	// the output evaluator is built WITHOUT its shadow trigger (the governor
 	// drives the superego directly), so the session wires the governor instead
 	// of the async TurnEvaluator.
-	governor  *facet.ActiveSuperego
-	logFile   *os.File
-	mcpClient *mcp.Client
+	governor *facet.ActiveSuperego
+	// redraftToolBudget is the per-redraft tool-use round budget the active
+	// governor's redraft loop honors (session.Config.RedraftToolBudget). It is
+	// carried here, already resolved to a concrete value (config default applied),
+	// because the native run entrypoint wires session.Config from builtFacets, not
+	// from the raw config. It stays 0 in the non-active case, which session never
+	// consults off the Governor path.
+	redraftToolBudget int
+	logFile           *os.File
+	mcpClient         *mcp.Client
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -247,6 +254,15 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 			Model:     resolveSuperegoModel(seCfg.Model),
 			LogSink:   logSink,
 		})
+		// The redraft's bounded tool loop runs in the session (it owns the
+		// dispatcher/RunLoop); resolve the budget here — the composition root owns
+		// config defaults, keeping config.DefaultRedraftToolBudget the single
+		// source of truth — and carry the concrete value to the session wiring.
+		budget := config.DefaultRedraftToolBudget
+		if seCfg.RedraftToolBudget > 0 {
+			budget = seCfg.RedraftToolBudget
+		}
+		built.redraftToolBudget = budget
 	}
 	return built, nil
 }
@@ -494,23 +510,24 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
 	err = session.Run(ctx, session.Config{
-		Stdin:           stdin,
-		Stdout:          stdout,
-		Client:          client,
-		Dispatcher:      dispatcher,
-		Store:           session.NewStore(nativeStateDir(getenv)),
-		SessionID:       sessionID,
-		Model:           model,
-		Effort:          effort,
-		MaxTokens:       defaultMaxTokens,
-		RedraftTimeout:  defaultRedraftTimeout,
-		LoopCallTimeout: defaultLoopCallTimeout,
-		NewUUID:         newUUIDv4,
-		Diag:            stderr,
-		Annotator:       annotator,
-		TurnEvaluator:   turnEvaluator,
-		Governor:        governor,
-		ToneDigester:    toneDigester,
+		Stdin:             stdin,
+		Stdout:            stdout,
+		Client:            client,
+		Dispatcher:        dispatcher,
+		Store:             session.NewStore(nativeStateDir(getenv)),
+		SessionID:         sessionID,
+		Model:             model,
+		Effort:            effort,
+		MaxTokens:         defaultMaxTokens,
+		RedraftTimeout:    defaultRedraftTimeout,
+		RedraftToolBudget: facets.redraftToolBudget,
+		LoopCallTimeout:   defaultLoopCallTimeout,
+		NewUUID:           newUUIDv4,
+		Diag:              stderr,
+		Annotator:         annotator,
+		TurnEvaluator:     turnEvaluator,
+		Governor:          governor,
+		ToneDigester:      toneDigester,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)

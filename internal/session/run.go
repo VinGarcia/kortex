@@ -85,6 +85,17 @@ const maxLineBytes = 16 << 20
 // matches main.go's defaultRedraftTimeout.
 const DefaultRedraftTimeout = 60 * time.Second
 
+// redraftActionInstruction is the deterministic guard-rail appended to the tail
+// of an active-mode redraft prompt. It is read by the CORE model, so it is
+// written as explicit, full-sentence Portuguese (the language the core and
+// superego already converse in). It tells the core that this redraft may ACT —
+// run tools to actually resolve the superego's finding — while bounding that
+// action to only what the specific critique requires, so a redraft resolves the
+// problem with evidence rather than rewording it out of existence.
+const redraftActionInstruction = "Você pode usar ferramentas nesta rodada para RESOLVER de fato os problemas apontados pelo superego — por exemplo, rodando a verificação que você afirmou ter feito, em vez de apenas reescrever o texto. " +
+	"Limite-se ao estritamente necessário: faça apenas as modificações de texto e as chamadas de ferramenta indispensáveis para sanar os pontos levantados na crítica acima, sem retrabalho gratuito e sem reabrir partes da resposta que já estavam corretas. " +
+	"Quando terminar, responda com a nova versão final da resposta, incorporando as evidências que você obteve."
+
 // Config is everything Run needs, supplied by the composition root (main): Run
 // reads no env and resolves no paths of its own. Every field except Diag is
 // required.
@@ -127,6 +138,17 @@ type Config struct {
 	// tool loop has no fallback output, so a timed-out call fails closed as a
 	// turn error rather than fail-open like the redraft.
 	LoopCallTimeout time.Duration
+	// RedraftToolBudget caps how many tool-use round trips a single active
+	// superego redraft may make before it must answer with text. A
+	// superego-triggered redraft drives the SAME tool loop the turn uses, so the
+	// core can ACT on the critique (e.g. actually run the verification the
+	// superego flagged as missing) and answer with evidence instead of rewording
+	// the problem away; this budget bounds that loop so a redraft can never open
+	// an unbounded tool run. The composition root resolves the configured value
+	// (falling back to config.DefaultRedraftToolBudget) and passes the concrete
+	// budget in; 0 is handed straight to RunLoop, which applies its own MaxTurns
+	// default. Only consulted on the active (Governor) path.
+	RedraftToolBudget int
 	// NewUUID mints one v4 message uuid per emitted assistant/user event.
 	NewUUID func() string
 	// Diag, when non-nil, receives one-line diagnostics for non-fatal problems
@@ -440,11 +462,25 @@ func governTurn(
 	snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: reviewTurns}
 
 	// redraft asks the core model for a new draft over the turn's canonical
-	// messages plus the ephemeral tail. No tools are offered: a redraft is a pure
-	// text revision, never a fresh round of tool execution. The tail is appended
-	// to a clone, so res.Messages (the canonical history) is never mutated by the
-	// loop. Each redraft's usage is accumulated so the re-emitted result bills the
-	// full round, not just the first draft.
+	// messages plus the ephemeral tail. Unlike the pre-#4753 behavior (a pure
+	// text revision with no tools), it drives the SAME bounded tool loop a normal
+	// turn uses, so when the superego's finding needs ACTION — e.g. "you did not
+	// actually verify X" — the core can run the check and answer with evidence
+	// rather than rewording the problem out of existence. The tail's final entry
+	// is the critique this redraft must answer; it becomes the loop's user
+	// message (with the deterministic bounded-action guard-rail appended), and
+	// everything before it continues the conversation as history. The tail is
+	// appended to a clone, so res.Messages (the canonical history) is never
+	// mutated. Each redraft's usage is accumulated so the re-emitted result bills
+	// the full round, not just the first draft.
+	//
+	// The whole redraft (tool loop plus any fallback) is bounded by RedraftTimeout
+	// so a hung or runaway redraft can never block the turn; the loop is further
+	// capped at RedraftToolBudget tool-use rounds and finalizes with a text answer
+	// when that budget is spent (FinalizeOnBudget). If the tool loop errors for
+	// any non-deadline reason, the redraft falls back to the pre-#4753 text-only
+	// revision; and GovernOutput itself fails open to the best draft in hand if
+	// the redraft returns an error, so acting can never break the turn.
 	var redraftUsage anthropic.Usage
 	redraft := func(ctx context.Context, tail []anthropic.Message) (string, error) {
 		redraftTimeout := cfg.RedraftTimeout
@@ -453,27 +489,62 @@ func governTurn(
 		}
 		ctx, cancel := context.WithTimeout(ctx, redraftTimeout)
 		defer cancel()
-		messages := append(slices.Clone(res.Messages), tail...)
-		resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
-			Model:     cfg.Model,
-			System:    systemPrompt,
-			MaxTokens: cfg.MaxTokens,
-			Effort:    cfg.Effort,
-			Messages:  messages,
-		})
-		if err != nil {
-			return "", err
+
+		// A nil/empty tail carries no critique to answer, so it cannot drive the
+		// tool loop; it falls straight to the text-only path, preserving the
+		// pre-#4753 behavior exactly for that (never-reached-in-practice) case.
+		if len(tail) > 0 {
+			loopHistory := append(slices.Clone(res.Messages), tail[:len(tail)-1]...)
+			loopRes, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
+				Model:       cfg.Model,
+				System:      systemPrompt,
+				MaxTokens:   cfg.MaxTokens,
+				Effort:      cfg.Effort,
+				History:     loopHistory,
+				UserMessage: redraftToolUserMessage(tail[len(tail)-1]),
+				MaxTurns:    cfg.RedraftToolBudget,
+				CallTimeout: cfg.LoopCallTimeout,
+				// Budget exhausted ends the round with a text answer that still sees
+				// the tool_results gathered, not a turn error.
+				FinalizeOnBudget: true,
+				// Emitter left nil: the redraft's tool loop is internal deliberation
+				// over the ephemeral tail, so its intermediate assistant/tool_result
+				// events never reach the wire — only the governed final text does
+				// (EmitFinalTurn). The tools' real side effects still run; that is
+				// the point of letting the redraft act.
+			})
+			if err == nil {
+				redraftUsage = redraftUsage.Add(loopRes.Usage)
+				// A redraft can now run tools with real side effects whose events
+				// never reach the wire (Emitter is nil above), so leave a bounded
+				// audit trail of what it did. Only the messages this redraft appended
+				// (everything past loopHistory) are inspected, so the original turn's
+				// tool calls are never re-logged; each line carries the tool id, name,
+				// error flag, and a length-capped result marker, never full output.
+				for _, call := range toolCallsFromMessages(loopRes.Messages[len(loopHistory):]) {
+					diagf(cfg.Diag, "session: redraft tool call id=%s name=%s is_error=%t result=%q",
+						call.ID, call.Name, call.IsError, auditResultMarker(call.Result))
+				}
+				// A redraft that strips to nothing is not a deliverable draft; report
+				// it as a failure so GovernOutput fails open to the non-empty draft in
+				// hand rather than delivering an empty turn OpenClaw would reject.
+				if strings.TrimSpace(tools.StripToolMarkup(loopRes.FinalText)) == "" {
+					return "", fmt.Errorf("redraft tool loop returned no deliverable text (stop_reason %q)", loopRes.StopReason)
+				}
+				return loopRes.FinalText, nil
+			}
+			// The overall redraft deadline already fired: the text-only fallback
+			// cannot succeed on a dead context and would only burn another blocked
+			// call, so surface the error and let GovernOutput fail open.
+			if ctx.Err() != nil {
+				return "", err
+			}
+			// Fail-safe: the bounded tool loop errored for another reason. Degrade to
+			// the pre-#4753 text-only redraft — a reword is worse than acting, but far
+			// better than breaking the turn.
+			diagf(cfg.Diag, "session: redraft tool loop failed, falling back to text-only redraft: %v", err)
 		}
-		redraftUsage = redraftUsage.Add(resp.Usage)
-		// A redraft that strips to nothing (the thinking model spent its budget on
-		// thinking, or emitted only tool-call markup) is not a deliverable draft.
-		// Report it as a failure so GovernOutput fails open to the non-empty draft
-		// in hand — the first draft RunLoop already guaranteed is non-empty — rather
-		// than delivering an empty turn OpenClaw would reject.
-		if strings.TrimSpace(tools.StripToolMarkup(resp.Text)) == "" {
-			return "", fmt.Errorf("redraft returned no deliverable text (stop_reason %q)", resp.StopReason)
-		}
-		return resp.Text, nil
+		return textOnlyRedraft(ctx, cfg, systemPrompt, res.Messages, tail, &redraftUsage)
 	}
 
 	// The held bool is intentionally not consumed here: when a turn is held,
@@ -520,6 +591,65 @@ func replaceFinalAssistantText(messages []anthropic.Message, text string) []anth
 	out := slices.Clone(messages)
 	out[len(out)-1] = anthropic.Message{Role: "assistant", Content: text}
 	return out
+}
+
+// textOnlyRedraft is the pre-#4753 redraft: one core-model call with no tools
+// offered, over the canonical messages plus the ephemeral tail. It is the
+// fail-safe the action-capable redraft degrades to when its bounded tool loop
+// errors, and the path a nil/empty tail takes. The caller owns the context
+// deadline (the redraft closure already wrapped ctx with RedraftTimeout), so
+// this does not re-bound it. Usage is accumulated into the caller's running
+// total via the usage pointer so the re-emitted result still bills this call.
+func textOnlyRedraft(
+	ctx context.Context,
+	cfg Config,
+	systemPrompt string,
+	canonical []anthropic.Message,
+	tail []anthropic.Message,
+	usage *anthropic.Usage,
+) (string, error) {
+	messages := append(slices.Clone(canonical), tail...)
+	resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
+		Model:     cfg.Model,
+		System:    systemPrompt,
+		MaxTokens: cfg.MaxTokens,
+		Effort:    cfg.Effort,
+		Messages:  messages,
+	})
+	if err != nil {
+		return "", err
+	}
+	*usage = usage.Add(resp.Usage)
+	if strings.TrimSpace(tools.StripToolMarkup(resp.Text)) == "" {
+		return "", fmt.Errorf("redraft returned no deliverable text (stop_reason %q)", resp.StopReason)
+	}
+	return resp.Text, nil
+}
+
+// auditResultMarker bounds a tool result to a short, rune-safe marker for the
+// redraft audit log so a large tool payload can never flood the diag stream; it
+// records enough to correlate the call, never the full output.
+func auditResultMarker(result string) string {
+	const maxRunes = 120
+	runes := []rune(result)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…(+more)"
+	}
+	return result
+}
+
+// redraftToolUserMessage renders the user message that opens the redraft tool
+// loop: the superego critique the redraft must answer (the ephemeral tail's
+// final entry), followed by the deterministic bounded-action guard-rail that
+// tells the core to act only as far as the finding requires. A critique whose
+// content is not a plain string (never produced by revisionInstruction today)
+// degrades to the guard-rail alone rather than dropping it.
+func redraftToolUserMessage(critique anthropic.Message) string {
+	text, _ := critique.Content.(string)
+	if text == "" {
+		return redraftActionInstruction
+	}
+	return text + "\n\n" + redraftActionInstruction
 }
 
 func diagf(w io.Writer, format string, args ...any) {
