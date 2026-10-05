@@ -302,7 +302,9 @@ func runTurn(
 // tool_result → … → final assistant). It mirrors the proxy history.Recorder:
 // every tool_use content block opens a ToolCall{ID,Name,Input}, and every
 // tool_result block attaches its text and is_error to the matching ToolCall by
-// id (first writer wins). The native message shapes are the concrete Go values
+// id. The native loop (tools.RunLoop) executes each tool_use exactly once, so
+// each id carries exactly one result on this path. The native message shapes
+// are the concrete Go values
 // RunLoop builds: an assistant turn's Content is []json.RawMessage (the raw
 // content blocks), and a tool_result turn's Content is []anthropic.ToolResultBlock.
 // Other content shapes (e.g. the plain-string user message) carry no tool calls
@@ -336,12 +338,11 @@ func toolCallsFromMessages(messages []anthropic.Message) []history.ToolCall {
 					if calls[i].ID != result.ToolUseID {
 						continue
 					}
-					// First writer wins, matching the Recorder: a repeated result
-					// for the same id never overwrites the first.
-					if calls[i].Result == "" && !calls[i].IsError {
-						calls[i].Result = result.Content
-						calls[i].IsError = result.IsError
-					}
+					// The native loop emits exactly one tool_result per tool_use id,
+					// so a plain assignment is correct: there is no duplicate result
+					// to guard against on this path.
+					calls[i].Result = result.Content
+					calls[i].IsError = result.IsError
 					break
 				}
 			}

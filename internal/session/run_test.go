@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 	"github.com/vingarcia/kortex/internal/tools"
 )
@@ -320,6 +321,96 @@ func TestToolCallsFromMessages_extractsThisTurnOnly(t *testing.T) {
 	// a Turn to its own tool traffic.
 	if full := toolCallsFromMessages(messages); len(full) != 3 {
 		t.Errorf("full-slice extraction got %d calls, want 3 (prior-1 + call-1 + call-2)", len(full))
+	}
+}
+
+// captureEvaluator is a stub TurnEvaluator that records the completed
+// history.Turn the session hands it, letting a test inspect the Turn built
+// end-to-end (ToolCalls included) without exposing runTurn.
+type captureEvaluator struct {
+	turns []history.Turn
+}
+
+func (c *captureEvaluator) EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot) {
+	c.turns = append(c.turns, snapshot.Turns[turnIndex])
+}
+
+// TestRun_ToolCallsPopulatedEndToEnd drives the REAL RunLoop/runTurn path with a
+// stubbed Anthropic server that returns a tool_use block (executed by the real
+// Dispatcher) and asserts the history.Turn the session builds carries the
+// extracted ToolCalls end-to-end. This guards a silent-regression gap:
+// toolCallsFromMessages type-switches on the concrete Content types RunLoop
+// produces — []json.RawMessage for the assistant tool_use block and
+// []anthropic.ToolResultBlock for the result. If anthropic.RawContent / RunLoop
+// ever change those concrete types, the type switch falls through, turn.ToolCalls
+// goes silently empty, and the superego regresses to emitting FALSE provenance
+// positives with no failing test — the opposite of this feature's few-false-
+// positives requirement. By exercising the live types (not hand-built ones, as
+// TestToolCallsFromMessages_extractsThisTurnOnly does), a future type change
+// breaks THIS test instead of silently emptying ToolCalls.
+func TestRun_ToolCallsPopulatedEndToEnd(t *testing.T) {
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			// First turn: a tool_use the real Dispatcher executes (bash echo),
+			// producing a genuine tool_result the loop feeds back.
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo provenance-ok"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 10, "output_tokens": 5}
+			}`))
+			return
+		}
+		// Second turn: end_turn with text closes the round.
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"ran it"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 12, "output_tokens": 6}
+		}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	capture := &captureEvaluator{}
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:         strings.NewReader(initializeLine("sys") + "\n" + userLine("s", "run echo") + "\n"),
+		Stdout:        &out,
+		Client:        client,
+		Dispatcher:    tools.NewDispatcher(),
+		Store:         NewStore(t.TempDir()),
+		SessionID:     "s",
+		Model:         "m",
+		MaxTokens:     1024,
+		NewUUID:       seqUUID(),
+		TurnEvaluator: capture,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if call != 2 {
+		t.Fatalf("API calls = %d, want 2 (tool_use round trip)", call)
+	}
+	if len(capture.turns) != 1 {
+		t.Fatalf("captured %d completed turns, want 1", len(capture.turns))
+	}
+
+	calls := capture.turns[0].ToolCalls
+	if len(calls) != 1 {
+		t.Fatalf("turn.ToolCalls = %+v, want exactly 1 extracted from the live RunLoop types", calls)
+	}
+	if calls[0].ID != "toolu_1" || calls[0].Name != "bash" {
+		t.Errorf("tool call = %+v, want id toolu_1 name bash", calls[0])
+	}
+	if calls[0].Input != `{"command":"echo provenance-ok"}` {
+		t.Errorf("tool call input = %q, want the verbatim tool_use input JSON", calls[0].Input)
+	}
+	// The real bash output must be attached to the call (result pairing by id over
+	// the live []anthropic.ToolResultBlock turn), and it is not an error.
+	if !strings.Contains(calls[0].Result, "provenance-ok") || calls[0].IsError {
+		t.Errorf("tool call result = %q isError=%v, want the real bash output attached / false", calls[0].Result, calls[0].IsError)
 	}
 }
 
