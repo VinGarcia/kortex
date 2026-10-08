@@ -81,6 +81,74 @@ func DecodeInbound(text string) Inbound {
 	return inbound
 }
 
+// SuspectedEchoDrift reports whether the genuinely new message still carries the
+// structural shape of an OpenClaw inbound-context echo, which means the wire
+// format drifted (OpenClaw renamed the inboundContextMarker or stopped collapsing
+// echoed turn bodies) and the marker-based split in splitInbound silently failed
+// to strip it. The split keys on the exact marker, so a marker change makes
+// DecodeInbound return the whole echo as NewMessage with no signal; this predicate
+// re-examines NewMessage for marker-INDEPENDENT fingerprints so a caller can warn
+// on the drift (DIRETIVA #4803 observability follow-up). It lives in package
+// protocol because every fingerprint it matches is OpenClaw wire text, which only
+// this package may know.
+//
+// It demands a STRUCTURAL fingerprint, never size alone, so a long legitimate
+// message from a resumed session is not mistaken for an echo. True when ANY holds:
+//   - the marker leaked into NewMessage verbatim (OpenClaw stopped collapsing);
+//   - an echo-block label survived independent of the marker symbol (covers a
+//     marker RENAME): the "Conversation info:"/"Recent chat history:" headers, or
+//     the ```json fence of the Conversation info block;
+//   - a last-resort mass signal: four or more lines of which at least two carry
+//     OpenClaw's "[<timestamp>] <sender>:" echoed-turn prefix.
+func (in Inbound) SuspectedEchoDrift() bool {
+	msg := in.NewMessage
+	if strings.Contains(msg, inboundContextMarker) {
+		return true
+	}
+	// The labels carry the marker in healthy wire, so their text WITHOUT the
+	// marker is a distinct fingerprint from conversationInfoHeader: it is what
+	// survives a marker rename.
+	if strings.Contains(msg, "Conversation info:") ||
+		strings.Contains(msg, "Recent chat history:") ||
+		strings.Contains(msg, "```json") {
+		return true
+	}
+	return looksLikeEchoedTurns(msg)
+}
+
+// looksLikeEchoedTurns is SuspectedEchoDrift's last resort: OpenClaw renders each
+// echoed prior turn as a "[<timestamp>] <sender>: <body>" line, so several lines
+// of which at least two carry that bracketed-timestamp prefix betray an un-stripped
+// echo even if every marker and label were renamed in the same release.
+func looksLikeEchoedTurns(msg string) bool {
+	lines := strings.Split(msg, "\n")
+	if len(lines) < 4 {
+		return false
+	}
+	timestamped := 0
+	for _, line := range lines {
+		if hasBracketedTimestampPrefix(line) {
+			timestamped++
+		}
+	}
+	return timestamped >= 2
+}
+
+// hasBracketedTimestampPrefix reports whether a line opens with OpenClaw's
+// "[<timestamp>] " echoed-turn prefix: a leading "[...]" whose bracketed content
+// holds a digit (a date/time), which a plain "[note]" aside does not.
+func hasBracketedTimestampPrefix(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "[") {
+		return false
+	}
+	end := strings.IndexByte(line, ']')
+	if end < 0 {
+		return false
+	}
+	return strings.ContainsAny(line[1:end], "0123456789")
+}
+
 // splitInbound divides text at the boundary after the last OpenClaw context
 // block: echo is every context block (joined as received), newMessage is the
 // text after them, and hasEcho reports whether any context block was present.
