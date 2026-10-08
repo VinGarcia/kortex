@@ -199,3 +199,14 @@ func (r *Recorder) Snapshot() Snapshot {
 	}
 	return Snapshot{SessionID: r.sessionID, Turns: turns}
 }
+
+// AppendToolCalls returns a fresh slice holding base's tool calls followed by
+// extra, in that order, never mutating or aliasing base (empty extra still
+// yields an independent copy). It is the single owner of the turn-provenance
+// append rule both sides of the governor port need — the superego ladder
+// extending a reviewed turn's provenance between rounds, and the session
+// folding a turn's redraft calls into the canonical Turn — so neither
+// re-derives the non-mutation clone-append.
+func AppendToolCalls(base []ToolCall, extra ...ToolCall) []ToolCall {
+	return append(append([]ToolCall(nil), base...), extra...)
+}

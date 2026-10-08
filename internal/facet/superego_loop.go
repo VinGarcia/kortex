@@ -217,15 +217,17 @@ func gateDecision(fire bool) string {
 // carries calls appended to its ToolCalls, so each ladder round's provenance
 // block (FERRAMENTAS_EXECUTADAS, #4749) reflects every tool the turn has run so
 // far — original turn plus all redrafts; without the fold the superego keeps
-// rejecting a redraft for the very facts it just verified. The turns slice and
-// the reviewed turn's ToolCalls are cloned, so the snapshot the session handed
-// to GovernOutput is never mutated. turnIndex is not re-guarded here: the
-// ladder only reaches a redraft after round 1's ReviewDraft validated the same
-// index against the same snapshot.
+// rejecting a redraft for the very facts it just verified. The turns slice is
+// cloned here and the reviewed turn's ToolCalls are cloned by
+// history.AppendToolCalls (the single owner of the provenance-append rule the
+// session shares), so the snapshot the session handed to GovernOutput is never
+// mutated. turnIndex is not re-guarded here: the ladder only reaches a redraft
+// after round 1's ReviewDraft validated the same index against the same
+// snapshot.
 func appendReviewedToolCalls(snapshot history.Snapshot, turnIndex int, calls []history.ToolCall) history.Snapshot {
 	turns := append([]history.Turn(nil), snapshot.Turns...)
 	reviewed := &turns[turnIndex]
-	reviewed.ToolCalls = append(append([]history.ToolCall(nil), reviewed.ToolCalls...), calls...)
+	reviewed.ToolCalls = history.AppendToolCalls(reviewed.ToolCalls, calls...)
 	snapshot.Turns = turns
 	return snapshot
 }

@@ -191,3 +191,40 @@ func TestRecorder_lastCompletedTurn(t *testing.T) {
 		t.Error("duplicate result must not report a newly closed turn")
 	}
 }
+
+func TestAppendToolCalls(t *testing.T) {
+	base := []ToolCall{{ID: "a"}, {ID: "b"}}
+	extra := []ToolCall{{ID: "c"}, {ID: "d"}}
+
+	got := AppendToolCalls(base, extra...)
+
+	// Order: base first, then extra, in the given order.
+	want := []string{"a", "b", "c", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d (%+v)", len(got), len(want), got)
+	}
+	for i, id := range want {
+		if got[i].ID != id {
+			t.Errorf("got[%d].ID = %q, want %q", i, got[i].ID, id)
+		}
+	}
+
+	// Non-mutation and non-aliasing: the owner must never disturb the slice the
+	// caller still holds. Appending past the result's length must not reach into
+	// base's backing array, and mutating the result must not change base.
+	got = append(got, ToolCall{ID: "e"})
+	got[0].ID = "mutated"
+	if len(base) != 2 || base[0].ID != "a" || base[1].ID != "b" {
+		t.Errorf("base was mutated: %+v", base)
+	}
+
+	// Empty extra yields an independent copy of base, not an alias.
+	copyOnly := AppendToolCalls(base)
+	if len(copyOnly) != len(base) {
+		t.Fatalf("copy len = %d, want %d", len(copyOnly), len(base))
+	}
+	copyOnly[0].ID = "mutated"
+	if base[0].ID != "a" {
+		t.Errorf("empty-extra copy aliased base: %+v", base)
+	}
+}

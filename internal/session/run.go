@@ -386,9 +386,11 @@ func runTurn(
 		// of what the assistant actually ran this turn, so the canonical Turn
 		// records them alongside the original loop's calls — otherwise history
 		// lists a delivered text whose evidence it omits. Combined on a fresh
-		// slice: turnToolCalls also backs the governor's reviewed turn above.
+		// slice via history.AppendToolCalls (the single owner of the
+		// provenance-append rule the facet ladder also uses): turnToolCalls also
+		// backs the governor's reviewed turn above, so it must not be mutated.
 		if len(redraftCalls) > 0 {
-			turnToolCalls = append(append([]history.ToolCall(nil), turnToolCalls...), redraftCalls...)
+			turnToolCalls = history.AppendToolCalls(turnToolCalls, redraftCalls...)
 		}
 	}
 
