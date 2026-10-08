@@ -286,14 +286,12 @@ func Run(ctx context.Context, cfg Config) error {
 			if ev.IsReplay || ev.Message == nil {
 				continue
 			}
-			// The input-annotator facet rewrites the user's text before the
-			// turn runs, so the annotated text is what the core model sees and
-			// what the canonical history persists — exactly the passthrough
-			// behavior, where the annotated line is what reaches the backend.
-			userText := ev.Message.TextContent()
-			if cfg.Annotator != nil {
-				userText = cfg.Annotator.Annotate(userText)
-			}
+			// Decode OpenClaw's inbound echo and forward only the genuinely new
+			// message; the echo's discard-vs-bootstrap handling is keyed on
+			// len(msgs) == 0 (empty canonical history). See composeInboundUserText
+			// for the DIRETIVA #4803 rationale and the coupling of the two cases.
+			inbound := protocol.DecodeInbound(ev.Message.TextContent())
+			userText := composeInboundUserText(inbound, len(msgs) == 0, cfg.Annotator)
 			var turn *history.Turn
 			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
 			if err != nil {
