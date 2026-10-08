@@ -94,6 +94,74 @@ func TestDecodeInbound(t *testing.T) {
 	})
 }
 
+func TestSuspectedEchoDrift(t *testing.T) {
+	tests := []struct {
+		name       string
+		newMessage string
+		want       bool
+	}{
+		{
+			name:       "plain new message is not drift",
+			newMessage: "roda o script de novo\n\nmais um parágrafo normal",
+			want:       false,
+		},
+		{
+			name:       "marker leaked into the new message (stopped collapsing)",
+			newMessage: "Recent chat history: " + inboundContextMarker + "\n[Sun 2026-10-04 20:33] Vinícius: oi",
+			want:       true,
+		},
+		{
+			name:       "renamed marker but Conversation info label survives",
+			newMessage: "Conversation info: ⟦openclaw:context⟧\n```json\n{\"chat_id\":\"c1\"}\n```",
+			want:       true,
+		},
+		{
+			name:       "renamed marker but Recent chat history label survives",
+			newMessage: "Recent chat history: ⟦openclaw:context⟧\n[Sun 2026-10-04 20:33] Vinícius: oi",
+			want:       true,
+		},
+		{
+			name:       "json fence alone is a fingerprint",
+			newMessage: "algo\n```json\n{\"x\":1}\n```",
+			want:       true,
+		},
+		{
+			name:       "mass heuristic: four lines, two timestamped",
+			newMessage: "[Sun 2026-10-04 20:30] Vini: um\n[Sun 2026-10-04 20:31] Vini: dois\ntexto solto\nmais texto",
+			want:       true,
+		},
+		{
+			name:       "three timestamped lines are below the line floor",
+			newMessage: "[Sun 2026-10-04 20:30] Vini: um\n[Sun 2026-10-04 20:31] Vini: dois\n[Sun 2026-10-04 20:32] Vini: tres",
+			want:       false,
+		},
+		{
+			name:       "four lines but only one timestamped is not drift",
+			newMessage: "[Sun 2026-10-04 20:30] Vini: um\nlinha dois\nlinha tres\nlinha quatro",
+			want:       false,
+		},
+		{
+			name:       "bracketed prefixes without a digit do not count as timestamps",
+			newMessage: "[nota] uma\n[aside] duas\n[todo] tres\n[fim] quatro",
+			want:       false,
+		},
+		{
+			name:       "long legitimate multi-paragraph message stays silent",
+			newMessage: "Oi, tudo bem? Queria te contar uma coisa longa.\n\nPrimeiro ponto que é importante.\n\nSegundo ponto que também importa.\n\nTerceiro ponto para fechar o raciocínio.",
+			want:       false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := Inbound{NewMessage: test.newMessage}.SuspectedEchoDrift()
+			if got != test.want {
+				t.Errorf("SuspectedEchoDrift() = %v, want %v for %q", got, test.want, test.newMessage)
+			}
+		})
+	}
+}
+
 // TestNewMessageSegment_SharesSplit guards that NewMessageSegment and
 // DecodeInbound agree on the new-message boundary (they share splitInbound), so
 // the proxy annotator's guard and the native decode never diverge.
