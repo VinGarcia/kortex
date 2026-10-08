@@ -81,8 +81,18 @@ type systemKeepaliveEnvelope struct {
 // on the wire, and OpenClaw kills a CLI that stays quiet past its no-output
 // timeout). OpenClaw's stream-json parser treats every system subtype except
 // "init" as an unknown event and ignores it — the line resets the watchdog
-// (any parsed stdout JSON does) and nothing else. The subtype must never start
-// with "error" (OpenClaw keys round failure on that prefix).
+// (any parsed stdout JSON does) and nothing else.
+//
+// WIRE DIVERGENCE: the real claude-cli protocol (F0) has no system/keepalive
+// subtype — this line is kortex-originated, a deliberate divergence from the
+// spec kortex otherwise mirrors byte-for-byte, not an oversight. It leans on
+// the ignore-unknown-subtypes behavior above as a soft dependency: an OpenClaw
+// that later rejected unknown subtypes would break it. Raising OpenClaw's
+// no-output watchdog timeout via config instead is not recorded anywhere as
+// evaluated, so treat that route as still open, not rejected on merit.
+//
+// The subtype must never start with "error" (OpenClaw keys round failure on
+// that prefix).
 func EmitSystemKeepalive(sessionID string) ([]byte, error) {
 	return marshalLine(systemKeepaliveEnvelope{
 		Type:      TypeSystem,
