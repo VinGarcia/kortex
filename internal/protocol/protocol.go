@@ -214,7 +214,7 @@ func Parse(line []byte) Event {
 	ev := Event{
 		Type:      w.Type,
 		Subtype:   w.Subtype,
-		SessionID: firstNonEmpty(w.SessionID, w.SessionIDCamel, w.ConversationID, w.ConversationCamel),
+		SessionID: FirstNonEmpty(w.SessionID, w.SessionIDCamel, w.ConversationID, w.ConversationCamel),
 		UUID:      w.UUID,
 		RequestID: w.RequestID,
 		IsReplay:  w.IsReplay,
@@ -291,7 +291,8 @@ func (m *Message) TextContent() string {
 	return buf.String()
 }
 
-func firstNonEmpty(values ...string) string {
+// FirstNonEmpty returns the first non-empty value, or "" when all are empty.
+func FirstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if v != "" {
 			return v

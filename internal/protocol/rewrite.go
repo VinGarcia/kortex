@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // ErrUnsupportedContent marks a message whose content shape cannot be
@@ -82,19 +81,12 @@ const inboundContextMarker = "⟦openclaw:ctx⟧"
 // must inspect only the new turn (e.g. a facet's idempotency guard) scopes to
 // this segment, or echoed content from prior turns is mistaken for the new one.
 // Wire-format knowledge of the marker lives here because protocol is the only
-// package that owns the claude-cli/OpenClaw wire format.
+// package that owns the claude-cli/OpenClaw wire format. DecodeInbound returns
+// this same segment alongside the echo and typed info when a caller needs more
+// than the new message (see inbound.go).
 func NewMessageSegment(text string) string {
-	if !strings.Contains(text, inboundContextMarker) {
-		return text
-	}
-	blocks := strings.Split(text, "\n\n")
-	lastContext := -1
-	for i, block := range blocks {
-		if strings.Contains(block, inboundContextMarker) {
-			lastContext = i
-		}
-	}
-	return strings.Join(blocks[lastContext+1:], "\n\n")
+	_, newMessage, _ := splitInbound(text)
+	return newMessage
 }
 
 // contentText extracts the rewritable text from a message content value and
