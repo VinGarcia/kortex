@@ -51,6 +51,7 @@ func textResponder(t *testing.T, reply string) (*httptest.Server, *recorded) {
 		if n := len(body.Messages); n > 0 {
 			if text, ok := body.Messages[n-1].Content.(string); ok {
 				rec.lastUserText = text
+				rec.userTexts = append(rec.userTexts, text)
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -65,6 +66,9 @@ type recorded struct {
 	lastSystem       string
 	lastMessageCount int
 	lastUserText     string
+	// userTexts records the last user content of every call, in order, so a test
+	// can assert what each turn forwarded to the core (not just the final turn).
+	userTexts []string
 }
 
 func initializeLine(prompt string) string {
