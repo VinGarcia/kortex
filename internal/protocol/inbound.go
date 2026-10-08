@@ -81,6 +81,15 @@ func DecodeInbound(text string) Inbound {
 	return inbound
 }
 
+// MarkerPresent reports whether OpenClaw's inbound-context marker was still in the
+// raw payload. By splitInbound's invariant a non-empty Echo means the marker was
+// found and the echo stripped, so Echo != "" is the marker's presence. It lives
+// here so the Echo-means-marker invariant stays owned by package protocol rather
+// than being inferred at a session call-site.
+func (in Inbound) MarkerPresent() bool {
+	return in.Echo != ""
+}
+
 // SuspectedEchoDrift reports whether the genuinely new message still carries the
 // structural shape of an OpenClaw inbound-context echo, which means the wire
 // format drifted (OpenClaw renamed the inboundContextMarker or stopped collapsing

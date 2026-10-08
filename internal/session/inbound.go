@@ -69,11 +69,9 @@ func composeInboundUserText(inbound protocol.Inbound, canonicalEmpty bool, annot
 //
 // canonicalTurns is len(canonical history). A fresh session (0) preserves the echo
 // as marked bootstrap rather than discarding it, so re-inflation cannot happen and
-// no warning is due. marker_present reports whether OpenClaw's marker was still
-// present in the raw payload (inbound.Echo != "", by splitInbound's invariant), so
-// a renamed marker (absent, Echo empty) is told apart from an un-collapsed body
-// (marker intact) at a glance; the body is never logged — the echo is large and
-// carries user content.
+// no warning is due. marker_present (inbound.MarkerPresent()) tells a renamed
+// marker (absent) apart from an un-collapsed body (marker intact) at a glance; the
+// body is never logged — the echo is large and carries user content.
 func warnOnEchoDrift(diag io.Writer, sessionID string, inbound protocol.Inbound, canonicalTurns int) {
 	if canonicalTurns == 0 || !inbound.SuspectedEchoDrift() {
 		return
@@ -85,7 +83,7 @@ func warnOnEchoDrift(diag io.Writer, sessionID string, inbound protocol.Inbound,
 		"session: wire-drift suspected in OpenClaw inbound echo-discard, canonical history may be silently re-inflating "+
 			"(OpenClaw renamed the inbound-context marker or stopped collapsing echoed turn bodies) "+
 			"session=%s canonical_turns=%d new_msg_bytes=%d new_msg_lines=%d marker_present=%t",
-		sessionID, canonicalTurns, len(newMessage), strings.Count(newMessage, "\n")+1, inbound.Echo != "")
+		sessionID, canonicalTurns, len(newMessage), strings.Count(newMessage, "\n")+1, inbound.MarkerPresent())
 }
 
 // inboundMetaLine renders the compact meta line appended after the new message:
