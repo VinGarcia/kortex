@@ -292,6 +292,10 @@ func Run(ctx context.Context, cfg Config) error {
 			// for the DIRETIVA #4803 rationale and the coupling of the two cases.
 			inbound := protocol.DecodeInbound(ev.Message.TextContent())
 			userText := composeInboundUserText(inbound, len(msgs) == 0, cfg.Annotator)
+			// Observe-only: warn if the echo still looks un-stripped on a session
+			// with canonical history, which signals OpenClaw wire drift silently
+			// re-inflating that history (#4803 follow-up). Does not alter userText.
+			warnOnEchoDrift(cfg.Diag, cfg.SessionID, inbound, len(msgs))
 			var turn *history.Turn
 			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
 			if err != nil {

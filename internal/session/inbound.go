@@ -1,6 +1,7 @@
 package session
 
 import (
+	"io"
 	"strings"
 
 	"github.com/vingarcia/kortex/internal/protocol"
@@ -56,6 +57,33 @@ func composeInboundUserText(inbound protocol.Inbound, canonicalEmpty bool, annot
 		parts = append(parts, meta)
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// warnOnEchoDrift emits one observe-only WARN line when the OpenClaw inbound
+// echo-discard path shows signs of wire drift — OpenClaw renamed the inbound
+// context marker or stopped collapsing echoed turn bodies — which would otherwise
+// silently re-inflate canonical history every turn, the exact harm DIRETIVA #4803
+// prevents, with no signal. It only observes: it never alters what
+// composeInboundUserText forwards, which is why it sits at the Run call-site
+// rather than inside the pure compose.
+//
+// canonicalTurns is len(canonical history). A fresh session (0) preserves the echo
+// as marked bootstrap rather than discarding it, so re-inflation cannot happen and
+// no warning is due. marker_present (inbound.MarkerPresent()) tells a renamed
+// marker (absent) apart from an un-collapsed body (marker intact) at a glance; the
+// body is never logged — the echo is large and carries user content.
+func warnOnEchoDrift(diag io.Writer, sessionID string, inbound protocol.Inbound, canonicalTurns int) {
+	if canonicalTurns == 0 || !inbound.SuspectedEchoDrift() {
+		return
+	}
+	// TODO(metrics): increment inbound_echo_drift_total here once internal/ grows a
+	// metrics seam; none exists today, so adding one now would be premature.
+	newMessage := inbound.NewMessage
+	diagf(diag,
+		"session: wire-drift suspected in OpenClaw inbound echo-discard, canonical history may be silently re-inflating "+
+			"(OpenClaw renamed the inbound-context marker or stopped collapsing echoed turn bodies) "+
+			"session=%s canonical_turns=%d new_msg_bytes=%d new_msg_lines=%d marker_present=%t",
+		sessionID, canonicalTurns, len(newMessage), strings.Count(newMessage, "\n")+1, inbound.MarkerPresent())
 }
 
 // inboundMetaLine renders the compact meta line appended after the new message:
