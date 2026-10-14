@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/history"
 )
 
@@ -19,10 +20,10 @@ type fakeConversant struct {
 	delay       time.Duration
 	calls       int
 	gotSys      string
-	gotMessages []ReviewMessage
+	gotMessages []anthropic.Message
 }
 
-func (f *fakeConversant) Converse(ctx context.Context, system string, messages []ReviewMessage) (Evaluation, error) {
+func (f *fakeConversant) Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error) {
 	f.calls++
 	f.gotSys = system
 	f.gotMessages = messages
@@ -69,7 +70,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 		snapshot        history.Snapshot
 		turnIndex       int
 		maxHistoryTurns int
-		want            []ReviewMessage
+		want            []anthropic.Message
 	}{
 		{
 			desc: "two turns: prior exchange (annotation line stripped) plus reviewed turn's user text, draft closes",
@@ -82,7 +83,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 				{UserText: "e agora?", AssistantText: "vou consertar hoje", Completed: true},
 			}},
 			turnIndex: 1,
-			want: []ReviewMessage{
+			want: []anthropic.Message{
 				{Role: "user", Content: "contava com você ontem"},
 				{Role: "assistant", Content: "desculpa, falhei mesmo"},
 				{Role: "user", Content: "e agora?"},
@@ -96,7 +97,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 				{UserText: "ok", AssistantText: "reviewed", Completed: true},
 			}},
 			turnIndex: 1,
-			want: []ReviewMessage{
+			want: []anthropic.Message{
 				{Role: "assistant", Content: "resposta sem prompt"},
 				{Role: "user", Content: "ok"},
 				{Role: "user", Content: draft},
@@ -111,7 +112,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 			}},
 			turnIndex:       2,
 			maxHistoryTurns: 2,
-			want: []ReviewMessage{
+			want: []anthropic.Message{
 				{Role: "user", Content: "meio"},
 				{Role: "assistant", Content: "recente"},
 				{Role: "user", Content: "atual"},
@@ -125,7 +126,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 			}},
 			turnIndex:       0,
 			maxHistoryTurns: 10,
-			want: []ReviewMessage{
+			want: []anthropic.Message{
 				{Role: "user", Content: "oi"},
 				{Role: "user", Content: draft},
 			},
@@ -138,7 +139,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 				t.Fatalf("got %d messages, want %d: %+v", len(got), len(test.want), got)
 			}
 			for i := range got {
-				if got[i] != test.want[i] {
+				if got[i].Role != test.want[i].Role || got[i].Content != test.want[i].Content {
 					t.Errorf("message %d = %+v, want %+v", i, got[i], test.want[i])
 				}
 			}
@@ -146,11 +147,13 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 	}
 }
 
-// TestSuperegoMessages_appendsReviewedTurnToolSummary covers #4749: only the
-// reviewed turn's tool calls are summarized into the closing draft-user message
-// (name, bounded input/result snippets, error marker), and the summary rides
-// AFTER the draft, not in place of it.
-func TestSuperegoMessages_appendsReviewedTurnToolSummary(t *testing.T) {
+// TestSuperegoMessages_shadowPathIsTextOnly pins the retired #4749 behavior:
+// the SHADOW path reconstructs from the snapshot's final text only, so the
+// closing message is the bare draft and no tool-provenance block is emitted —
+// the reviewed turn's tool traffic reaches the superego on the ACTIVE path via
+// the real tool_use/tool_result blocks (TestActiveSuperego_* in the loop test),
+// not a summary here.
+func TestSuperegoMessages_shadowPathIsTextOnly(t *testing.T) {
 	snapshot := history.Snapshot{Turns: []history.Turn{
 		{
 			UserText:      "checa o PR #4749",
@@ -158,73 +161,18 @@ func TestSuperegoMessages_appendsReviewedTurnToolSummary(t *testing.T) {
 			Completed:     true,
 			ToolCalls: []history.ToolCall{
 				{ID: "t1", Name: "Grep", Input: `{"pattern":"approved"}`, Result: "PR #4749 approved"},
-				{ID: "t2", Name: "Bash", Input: `{"cmd":"gh pr view"}`, Result: "boom", IsError: true},
 			},
 		},
 	}}
 	msgs := superegoMessages(snapshot, 0, "DRAFT", 0)
 	final := msgs[len(msgs)-1]
-	if final.Role != "user" {
-		t.Fatalf("closing message role = %q, want user", final.Role)
+	if final.Role != "user" || final.Content != "DRAFT" {
+		t.Errorf("closing message = %+v, want the bare draft-user with no tool block", final)
 	}
-	// The draft is preserved and precedes the tool block.
-	if !strings.HasPrefix(final.Content, "DRAFT\n\n") {
-		t.Errorf("tool summary must be appended after the draft, got:\n%s", final.Content)
-	}
-	for _, want := range []string{
-		"<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_INICIO>>>",
-		"<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_FIM>>>",
-		"Grep",
-		`{"pattern":"approved"}`,
-		"PR #4749 approved",
-		"Bash",
-		"[ERRO]", // t2 failed
-		"boom",
-	} {
-		if !strings.Contains(final.Content, want) {
-			t.Errorf("tool summary missing %q:\n%s", want, final.Content)
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "FERRAMENTAS") {
+			t.Errorf("shadow path must emit no tool-provenance block:\n%s", s)
 		}
-	}
-}
-
-// TestSuperegoMessages_noToolBlockWhenNoCalls pins the empty case: a reviewed
-// turn that ran no tools appends nothing — the closing message is the bare
-// draft, with no delimiter block.
-func TestSuperegoMessages_noToolBlockWhenNoCalls(t *testing.T) {
-	snapshot := history.Snapshot{Turns: []history.Turn{
-		{UserText: "oi", AssistantText: "reviewed", Completed: true},
-	}}
-	msgs := superegoMessages(snapshot, 0, "DRAFT", 0)
-	final := msgs[len(msgs)-1]
-	if final.Content != "DRAFT" {
-		t.Errorf("closing message = %q, want the bare draft with no tool block", final.Content)
-	}
-	if strings.Contains(final.Content, "FERRAMENTAS_EXECUTADAS") {
-		t.Errorf("no tool block must be emitted when the reviewed turn ran no tools:\n%s", final.Content)
-	}
-}
-
-// TestToolCallsSummary_truncatesAndSkipsEmpty covers the snippet bounds: an
-// input/result longer than the cap is cut to superegoTool*Max runes with an
-// ellipsis, and nil tool calls yield "" (no block).
-func TestToolCallsSummary_truncatesAndSkipsEmpty(t *testing.T) {
-	if s := toolCallsSummary(nil); s != "" {
-		t.Errorf("toolCallsSummary(nil) = %q, want \"\"", s)
-	}
-
-	long := strings.Repeat("a", 500)
-	summary := toolCallsSummary([]history.ToolCall{{Name: "Big", Input: long, Result: long}})
-	if strings.Contains(summary, long) {
-		t.Errorf("summary carried the full 500-rune payload, want it truncated:\n%s", summary)
-	}
-	// Input and result are capped at 200 runes then ellipsized.
-	wantInput := strings.Repeat("a", superegoToolInputMax) + "…"
-	wantResult := strings.Repeat("a", superegoToolResultMax) + "…"
-	if !strings.Contains(summary, wantInput) {
-		t.Errorf("input not truncated to %d runes + ellipsis:\n%s", superegoToolInputMax, summary)
-	}
-	if !strings.Contains(summary, wantResult) {
-		t.Errorf("result not truncated to %d runes + ellipsis:\n%s", superegoToolResultMax, summary)
 	}
 }
 
@@ -308,7 +256,8 @@ func TestSuperego_reviewHappyPathWithStructuredVerdict(t *testing.T) {
 		t.Fatalf("superego saw %d messages, want 4: %+v", len(conversant.gotMessages), conversant.gotMessages)
 	}
 	final := conversant.gotMessages[3]
-	if final.Role != "user" || !strings.Contains(final.Content, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+	finalText, _ := final.Content.(string)
+	if final.Role != "user" || !strings.Contains(finalText, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
 		t.Errorf("final message is not the draft-user: %+v", final)
 	}
 
@@ -441,7 +390,7 @@ func TestSuperego_failureModes(t *testing.T) {
 // panic would kill the whole proxy process.
 type panicConversant struct{}
 
-func (panicConversant) Converse(_ context.Context, _ string, _ []ReviewMessage) (Evaluation, error) {
+func (panicConversant) Converse(_ context.Context, _ string, _ []anthropic.Message) (Evaluation, error) {
 	panic("boom")
 }
 

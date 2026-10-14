@@ -5,44 +5,44 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/history"
 )
 
 // This file assembles the superego's view of the conversation (design #4351
-// + #4354): the canonical history converted to the API message array the
-// core itself consumed — clean final text, tags stripped (tags are
-// orchestrator metadata, never part of the canonical history) — with the
-// turn under review entering NOT as an assistant message but as a final
-// user-role message framed as an unsent draft, the F2c emotion tags
-// interleaved between its paragraphs. The draft framing is DETERMINISTIC
-// (fixed strings below, never model-generated).
+// + #4354). The ACTIVE/governor path builds the view from the core's own
+// anthropic.Message array (see Superego.ReviewDraft) — identical context,
+// tool_use/tool_result blocks and all. This file covers the SHADOW path, which
+// has only a history.Snapshot (the proxy Recorder has no API array), plus the
+// deterministic draft-under-review framing shared by both paths: the turn under
+// review enters NOT as an assistant message but as a final user-role message
+// framed as an unsent draft, the F2c emotion tags interleaved between its
+// paragraphs. The draft framing is DETERMINISTIC (fixed strings below, never
+// model-generated).
 
 // superegoMessages converts the history snapshot into the superego's message
-// array. Turns after turnIndex are ignored; turns[turnIndex]'s user text
-// closes the plain history and draft (the reframed reviewed output) is the
-// final user message. maxHistoryTurns > 0 keeps only that many of the most
+// array for the SHADOW path. Turns after turnIndex are ignored; turns[turnIndex]'s
+// user text closes the plain history and draft (the reframed reviewed output) is
+// the final user message. maxHistoryTurns > 0 keeps only that many of the most
 // recent turns (the reviewed turn included), dropping the oldest ones.
 //
-// Simplifications, on purpose: the HISTORY turns' tool calls are omitted (the
-// superego judges the spoken exchange; replaying every past turn's tool
-// traffic would multiply tokens for little judgment value), and turns whose
-// user or assistant text is empty contribute no message for that side.
-// Consecutive same-role messages are valid Messages API input, so no artificial
-// filler is inserted. The ONE exception is the reviewed turn: a compact,
-// bounded summary of only turns[turnIndex]'s tool calls is appended to the
-// draft-user message so the superego can verify the provenance of facts the
-// assistant claimed to have checked (#4749). Nothing is appended when the
-// reviewed turn ran no tools.
-func superegoMessages(snapshot history.Snapshot, turnIndex int, draft string, maxHistoryTurns int) []ReviewMessage {
+// The shadow path reconstructs from the Snapshot's final text only: the Snapshot
+// carries flattened per-turn ToolCalls, not the interleaved tool_use/tool_result
+// blocks, so replaying them faithfully is impossible here — only the active path,
+// which holds the core's real anthropic.Message array, can carry tool traffic to
+// the superego. Turns whose user or assistant text is empty contribute no message
+// for that side; consecutive same-role messages are valid Messages API input, so
+// no artificial filler is inserted.
+func superegoMessages(snapshot history.Snapshot, turnIndex int, draft string, maxHistoryTurns int) []anthropic.Message {
 	turns := snapshot.Turns[:turnIndex+1]
 	start := 0
 	if maxHistoryTurns > 0 && len(turns) > maxHistoryTurns {
 		start = len(turns) - maxHistoryTurns
 	}
-	var messages []ReviewMessage
+	var messages []anthropic.Message
 	for i := start; i <= turnIndex; i++ {
 		if user := stripAnnotationLines(turns[i].UserText); user != "" {
-			messages = append(messages, ReviewMessage{Role: "user", Content: user})
+			messages = append(messages, anthropic.Message{Role: "user", Content: user})
 		}
 		if i == turnIndex {
 			// The reviewed turn's assistant text enters as the draft-user
@@ -51,76 +51,10 @@ func superegoMessages(snapshot history.Snapshot, turnIndex int, draft string, ma
 			break
 		}
 		if turns[i].AssistantText != "" {
-			messages = append(messages, ReviewMessage{Role: "assistant", Content: turns[i].AssistantText})
+			messages = append(messages, anthropic.Message{Role: "assistant", Content: turns[i].AssistantText})
 		}
 	}
-	final := draft
-	if summary := toolCallsSummary(turns[turnIndex].ToolCalls); summary != "" {
-		final = draft + "\n\n" + summary
-	}
-	return append(messages, ReviewMessage{Role: "user", Content: final})
-}
-
-// superegoToolInputMax and superegoToolResultMax bound how much of each tool
-// call's input and result the summary shows. The superego only needs enough to
-// confirm a fact was actually fetched, not the full payload; bounding keeps the
-// reviewed turn's tool block from blowing up the token budget on a large tool
-// output.
-const (
-	superegoToolInputMax  = 200
-	superegoToolResultMax = 200
-)
-
-// toolCallsSummary renders the reviewed turn's tool calls as one compact,
-// deterministic, clearly-delimited block for the superego, in the same
-// Portuguese framing as the draft-under-review message. Each call shows its
-// name, a bounded snippet of the input and of the result, and an error marker
-// when the tool failed. It returns "" when there are no tool calls, so the
-// caller appends nothing (no empty block). Ordering follows ToolCalls, which
-// preserves tool_use order, so the output is stable.
-func toolCallsSummary(calls []history.ToolCall) string {
-	if len(calls) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_INICIO>>>\n")
-	b.WriteString("Ferramentas que EU realmente executei neste turno (use para verificar a procedência de fatos que afirmei ter apurado):\n")
-	for i, call := range calls {
-		name := call.Name
-		if name == "" {
-			name = "(sem nome)"
-		}
-		fmt.Fprintf(&b, "\n%d. %s", i+1, name)
-		if call.IsError {
-			b.WriteString(" [ERRO]")
-		}
-		if input := boundedSnippet(call.Input, superegoToolInputMax); input != "" {
-			fmt.Fprintf(&b, "\n   entrada: %s", input)
-		}
-		if result := boundedSnippet(call.Result, superegoToolResultMax); result != "" {
-			fmt.Fprintf(&b, "\n   resultado: %s", result)
-		}
-	}
-	b.WriteString("\n<<<FERRAMENTAS_EXECUTADAS_NESTE_TURNO_FIM>>>")
-	return b.String()
-}
-
-// boundedSnippet reduces s to its first non-empty line, trimmed and capped at
-// maxRunes runes (an ellipsis marks truncation). It is rune-safe so a cap never
-// splits a multi-byte character. "" in → "" out.
-func boundedSnippet(s string, maxRunes int) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	if nl := strings.IndexByte(s, '\n'); nl >= 0 {
-		s = strings.TrimSpace(s[:nl])
-	}
-	runes := []rune(s)
-	if len(runes) > maxRunes {
-		return string(runes[:maxRunes]) + "…"
-	}
-	return s
+	return append(messages, anthropic.Message{Role: "user", Content: draft})
 }
 
 // stripAnnotationLines removes the input annotator's injected tag lines

@@ -71,9 +71,14 @@ package differs — `proxy` versus `session`.
   deterministic gate) and, on a gate hit, runs the superego ladder
   (`ReviewDraft`, up to `DefaultLadderRounds` rounds) — approve delivers
   the draft, `hold_ask_human` delivers a hold-and-ask message instead,
-  `revise` feeds the critique back to the core for a redraft. The rejected
-  drafts and critiques live only in an ephemeral message tail, never
-  persisted to canonical history and never emitted on the stream.
+  `revise` feeds the critique back to the core for a redraft. The active
+  governor reviews from the core's OWN message array — the identical
+  `[]anthropic.Message` the core consumed this turn, `tool_use`/`tool_result`
+  blocks and all, with only the turn under review reframed as a draft-user
+  message — where the shadow path instead reconstructs from the
+  `history.Snapshot`'s flattened text. The rejected drafts and critiques live
+  only in an ephemeral message tail, never persisted to canonical history and
+  never emitted on the stream.
 - `internal/session` — the native producer path, entered from
   `main.runNative` when `KORTEX_STREAM_EMITTER` is set. Instead of execing
   the real `claude`, `session.Run` reads the NDJSON stream-json protocol
@@ -93,8 +98,9 @@ Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
 `make lint`): `proxy` may import `protocol` and `history`; `history` may
 import `protocol`; `facet` may import `protocol`, `anthropic` and `history`
 (read-only consumption of the canonical history: the proxy hands facets a
-`history.Snapshot` per completed turn via `proxy.TurnEvaluator`); never the
-reverse. `proxy` never imports `facet` — facets reach the pump only through
+`history.Snapshot` per completed turn via `proxy.TurnEvaluator`, and on the
+native active path `session` hands the governor the core's own
+`anthropic.Message` array to review); never the reverse. `proxy` never imports `facet` — facets reach the pump only through
 the `proxy.Interceptor`/`proxy.TurnEvaluator` interfaces, wired by `main`.
 On the native path `session` may import `protocol`, `tools`, `anthropic`
 and `history`; `tools` may import `anthropic`, `mcp` and `protocol`; never

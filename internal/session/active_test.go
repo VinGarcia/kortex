@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
-	"github.com/vingarcia/kortex/internal/history"
 	"github.com/vingarcia/kortex/internal/protocol"
 	"github.com/vingarcia/kortex/internal/tools"
 )
@@ -26,33 +25,33 @@ import (
 // callback's result, so a test can prove the tail reaches the core model yet
 // never persists.
 type fakeGovernor struct {
-	gotDraft         string
-	gotTurnIndex     int
-	gotSnapshot      history.Snapshot
-	deliver          string
-	held             bool
-	callRedraftWith  []anthropic.Message
-	redraftResult    string
-	redraftToolCalls []history.ToolCall
+	gotDraft        string
+	gotTurnIndex    int
+	gotMessages     []anthropic.Message
+	deliver         string
+	held            bool
+	callRedraftWith []anthropic.Message
+	redraftResult   string
+	redraftMessages []anthropic.Message
 }
 
 func (f *fakeGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
-	snapshot history.Snapshot,
+	messages []anthropic.Message,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 ) (string, bool) {
 	f.gotDraft = draft
 	f.gotTurnIndex = turnIndex
-	f.gotSnapshot = snapshot
+	f.gotMessages = messages
 	if f.callRedraftWith != nil {
-		text, calls, err := redraft(ctx, f.callRedraftWith)
+		text, msgs, err := redraft(ctx, f.callRedraftWith)
 		if err != nil {
 			return draft, false
 		}
 		f.redraftResult = text
-		f.redraftToolCalls = calls
+		f.redraftMessages = msgs
 		return text, f.held
 	}
 	return f.deliver, f.held
@@ -80,34 +79,57 @@ func sequencedResponder(t *testing.T, replies ...string) (*httptest.Server, *[][
 
 // recordingGovernor records what the governor saw on EVERY turn (not just the
 // last), so a multi-turn test can assert the superego's per-turn input is
-// unchanged by an unrelated feature.
+// unchanged by an unrelated feature. It keeps both the per-turn message-array
+// length and the arrays themselves, so a test can assert the size AND scan the
+// content for a feature that must stay invisible to the superego.
 type recordingGovernor struct {
-	turnIndices  []int
-	snapshotLens []int
-	deliver      string
+	turnIndices []int
+	messageLens []int
+	gotMessages [][]anthropic.Message
+	deliver     string
 }
 
 func (g *recordingGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
-	snapshot history.Snapshot,
+	messages []anthropic.Message,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 ) (string, bool) {
 	g.turnIndices = append(g.turnIndices, turnIndex)
-	g.snapshotLens = append(g.snapshotLens, len(snapshot.Turns))
+	g.messageLens = append(g.messageLens, len(messages))
+	g.gotMessages = append(g.gotMessages, messages)
 	return g.deliver, false
 }
 
+// messageText renders one message's content for substring assertions: a plain
+// string directly, and any structured content (assistant tool_use blocks, a
+// tool_result turn) as its JSON, so a test can look for a tool name, command,
+// or result inside the real blocks the governor received.
+func messageText(t *testing.T, m anthropic.Message) string {
+	t.Helper()
+	if s, ok := m.Content.(string); ok {
+		return s
+	}
+	raw, err := json.Marshal(m.Content)
+	if err != nil {
+		t.Fatalf("marshaling message content: %v", err)
+	}
+	return string(raw)
+}
+
 // TestRun_ToneDigestInvisibleToGovernor locks in FIX 1: wiring the tone digest
-// must NOT change what the active superego/governor receives. The governor and
-// the TurnEvaluator are mutually exclusive, so on the active path `turns` is
-// never accumulated and the governor must keep seeing turnIndex 0 and a
-// single-turn snapshot on EVERY turn — the digest draws from its own
-// priorUserTexts accumulator instead. A two-turn session run twice (with the
-// digest wired, and as a no-digest baseline) must produce identical governor
-// input, proving the feature is invisible to the superego (same turnIndex, same
-// snapshot size, so same per-turn token cost).
+// must NOT change what the active superego/governor receives. The digest is
+// ephemeral — injected only into the core's single API call via
+// EphemeralContext and never written into res.Messages — so the governor's
+// review array (res.Messages minus the final draft) must be byte-for-byte the
+// same with or without the digest, and must never contain the digest block. The
+// governor and the TurnEvaluator are mutually exclusive, so on the active path
+// `turns` is never accumulated and turnIndex stays 0 on every turn (the digest
+// draws from its own priorUserTexts accumulator instead). A two-turn session run
+// twice (with the digest wired, and as a no-digest baseline) must produce
+// identical governor input, proving the feature is invisible to the superego —
+// same turnIndex and same message-array size, so same per-turn token cost.
 func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
 	run := func(digester ToneDigester) *recordingGovernor {
 		server, _ := sequencedResponder(t, "raw-draft")
@@ -130,13 +152,16 @@ func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
 		return gov
 	}
 
-	withDigest := run(&fakeToneDigester{digest: "<<<TOM_DA_CONVERSA_INICIO>>>\n- x\n<<<TOM_DA_CONVERSA_FIM>>>"})
+	const digestBlock = "<<<TOM_DA_CONVERSA_INICIO>>>\n- x\n<<<TOM_DA_CONVERSA_FIM>>>"
+	withDigest := run(&fakeToneDigester{digest: digestBlock})
 	baseline := run(nil)
 
-	// The governor path never accumulates turns, so it sees turnIndex 0 and a
-	// single-turn snapshot on both turns — with or without the digest.
+	// The governor path never accumulates turns, so turnIndex stays 0 on both
+	// turns. Its review array grows with the conversation exactly as the core's
+	// does: turn 1 carries only the first user message (the final draft is
+	// stripped), turn 2 carries user1 + the governed assistant1 + user2.
 	wantTurnIndices := []int{0, 0}
-	wantSnapshotLens := []int{1, 1}
+	wantMessageLens := []int{1, 3}
 	for _, c := range []struct {
 		name string
 		gov  *recordingGovernor
@@ -144,16 +169,25 @@ func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
 		if !slices.Equal(c.gov.turnIndices, wantTurnIndices) {
 			t.Errorf("%s: governor turnIndices = %v, want %v", c.name, c.gov.turnIndices, wantTurnIndices)
 		}
-		if !slices.Equal(c.gov.snapshotLens, wantSnapshotLens) {
-			t.Errorf("%s: governor snapshot sizes = %v, want %v", c.name, c.gov.snapshotLens, wantSnapshotLens)
+		if !slices.Equal(c.gov.messageLens, wantMessageLens) {
+			t.Errorf("%s: governor message-array sizes = %v, want %v", c.name, c.gov.messageLens, wantMessageLens)
 		}
 	}
-	// And the two runs are byte-for-byte identical in what the governor saw: the
+	// The digest never appears in the governor's review array on any turn: it is
+	// injected only into the core's own API call, never into res.Messages.
+	for turn, msgs := range withDigest.gotMessages {
+		for _, m := range msgs {
+			if strings.Contains(messageText(t, m), "TOM_DA_CONVERSA") {
+				t.Errorf("turn %d: tone digest leaked into the governor's review array: %+v", turn, m)
+			}
+		}
+	}
+	// And the two runs are identical in the SIZE of what the governor saw: the
 	// digest is invisible to the superego.
 	if !slices.Equal(withDigest.turnIndices, baseline.turnIndices) ||
-		!slices.Equal(withDigest.snapshotLens, baseline.snapshotLens) {
+		!slices.Equal(withDigest.messageLens, baseline.messageLens) {
 		t.Errorf("digest changed governor input: with-digest (idx=%v lens=%v) vs baseline (idx=%v lens=%v)",
-			withDigest.turnIndices, withDigest.snapshotLens, baseline.turnIndices, baseline.snapshotLens)
+			withDigest.turnIndices, withDigest.messageLens, baseline.turnIndices, baseline.messageLens)
 	}
 }
 
@@ -235,11 +269,26 @@ func TestRun_ActiveGovernorRedraftActsWithTools(t *testing.T) {
 	if gov.redraftResult != "verified evidence-123" {
 		t.Errorf("redraft result = %q, want the evidence-backed answer", gov.redraftResult)
 	}
-	// The redraft also hands its own tool calls back to the governor so the next
-	// review round's provenance block covers the evidence it just gathered.
-	if len(gov.redraftToolCalls) != 1 || gov.redraftToolCalls[0].Name != "bash" ||
-		!strings.Contains(gov.redraftToolCalls[0].Result, "evidence-123") {
-		t.Errorf("redraft tool calls = %+v, want the bash evidence call with its result", gov.redraftToolCalls)
+	// The redraft also hands its own tool traffic back to the governor as real
+	// message blocks, so the next review round sees the evidence it just gathered
+	// in the same shape the core consumed: the assistant's tool_use then the
+	// matching tool_result — never the critique scaffolding or the redraft's own
+	// draft, which the facet re-frames separately.
+	if len(gov.redraftMessages) != 2 {
+		t.Fatalf("redraft returned %d messages, want 2 (tool_use + tool_result): %+v", len(gov.redraftMessages), gov.redraftMessages)
+	}
+	useBlock := gov.redraftMessages[0]
+	if useBlock.Role != "assistant" || !strings.Contains(messageText(t, useBlock), "echo evidence-123") {
+		t.Errorf("redraft message 0 = %+v, want the assistant tool_use running the check", useBlock)
+	}
+	resultBlock := gov.redraftMessages[1]
+	if resultBlock.Role != "user" || !strings.Contains(messageText(t, resultBlock), "evidence-123") {
+		t.Errorf("redraft message 1 = %+v, want the tool_result carrying the evidence", resultBlock)
+	}
+	for _, m := range gov.redraftMessages {
+		if strings.Contains(messageText(t, m), "CRITIQUE-X") || strings.Contains(messageText(t, m), "verified evidence-123") {
+			t.Errorf("redraft messages leaked the critique scaffolding or the draft itself: %+v", m)
+		}
 	}
 
 	var resultText string
@@ -280,9 +329,9 @@ type slowGovernor struct {
 func (g *slowGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
-	snapshot history.Snapshot,
+	messages []anthropic.Message,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 ) (string, bool) {
 	time.Sleep(g.delay)
 	return g.deliver, false
@@ -342,13 +391,15 @@ func TestRun_GovernorKeepaliveDuringLadder(t *testing.T) {
 	}
 }
 
-// TestRun_GovernorSnapshotCarriesTurnToolCalls locks in the provenance fix for
-// the active path (#4749): the reviewed turn the governor receives must carry
-// the tool calls the core actually ran this turn, result attached — that is
-// what feeds the superego's FERRAMENTAS_EXECUTADAS block. Before the fix the
-// reviewed turn was built without ToolCalls, so the superego saw no provenance
-// and rejected genuinely tool-backed drafts as fabricated.
-func TestRun_GovernorSnapshotCarriesTurnToolCalls(t *testing.T) {
+// TestRun_GovernorMessagesCarryTurnToolBlocks locks in the provenance parity for
+// the active path (#4351/#4749): the review array the governor receives is the
+// core's OWN conversation for the turn, so it must carry the real tool_use and
+// tool_result blocks the core ran this turn — that is the provenance the
+// superego reviews from. The reviewed turn enters as those raw blocks (not a
+// flattened summary and not the final draft, which the facet re-frames as a
+// draft-user message). Before parity the superego saw only the spoken text and
+// rejected genuinely tool-backed drafts as fabricated.
+func TestRun_GovernorMessagesCarryTurnToolBlocks(t *testing.T) {
 	server, _ := scriptedCoreServer(t,
 		toolUseBody("echo prov-42"),        // call 1: the core runs a real check
 		endTurnTextBody("checked prov-42"), // call 2: the evidence-backed draft
@@ -367,16 +418,30 @@ func TestRun_GovernorSnapshotCarriesTurnToolCalls(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	reviewed := gov.gotSnapshot.Turns[gov.gotTurnIndex]
-	if len(reviewed.ToolCalls) != 1 {
-		t.Fatalf("reviewed turn carries %d tool calls, want 1: %+v", len(reviewed.ToolCalls), reviewed.ToolCalls)
+	// The core's array for this turn is [user "hi", assistant tool_use, user
+	// tool_result, assistant draft]; the governor sees it minus the final draft.
+	if len(gov.gotMessages) != 3 {
+		t.Fatalf("governor saw %d messages, want 3 (user + tool_use + tool_result, draft stripped): %+v", len(gov.gotMessages), gov.gotMessages)
 	}
-	call := reviewed.ToolCalls[0]
-	if call.Name != "bash" || !strings.Contains(call.Input, "echo prov-42") {
-		t.Errorf("reviewed tool call = %+v, want the bash echo", call)
+	if gov.gotMessages[0].Role != "user" || messageText(t, gov.gotMessages[0]) != "hi" {
+		t.Errorf("governor message 0 = %+v, want the user turn", gov.gotMessages[0])
 	}
-	if !strings.Contains(call.Result, "prov-42") || call.IsError {
-		t.Errorf("reviewed tool call result = %q (isError %v), want the real output attached", call.Result, call.IsError)
+	useBlock := gov.gotMessages[1]
+	if useBlock.Role != "assistant" ||
+		!strings.Contains(messageText(t, useBlock), "tool_use") ||
+		!strings.Contains(messageText(t, useBlock), "echo prov-42") {
+		t.Errorf("governor message 1 = %+v, want the assistant tool_use running the check", useBlock)
+	}
+	resultBlock := gov.gotMessages[2]
+	if resultBlock.Role != "user" || !strings.Contains(messageText(t, resultBlock), "prov-42") {
+		t.Errorf("governor message 2 = %+v, want the tool_result with the real output", resultBlock)
+	}
+	// The final draft is never part of the review array (the facet re-frames it as
+	// a draft-user message instead).
+	for _, m := range gov.gotMessages {
+		if strings.Contains(messageText(t, m), "checked prov-42") {
+			t.Errorf("the final draft leaked into the governor's review array: %+v", m)
+		}
 	}
 }
 

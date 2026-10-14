@@ -281,9 +281,10 @@ func TestOutputEvaluator_superegoTrigger(t *testing.T) {
 				t.Fatalf("superego conversant called %d times, want 1", conversant.calls)
 			}
 			final := conversant.gotMessages[len(conversant.gotMessages)-1]
-			if !strings.Contains(final.Content, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") ||
-				!strings.Contains(final.Content, "não vou fazer isso\n[emoções p1: investment=4 valence=negativa emotions=recusa(4)]") {
-				t.Errorf("draft-user message = %q", final.Content)
+			finalText, _ := final.Content.(string)
+			if !strings.Contains(finalText, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") ||
+				!strings.Contains(finalText, "não vou fazer isso\n[emoções p1: investment=4 valence=negativa emotions=recusa(4)]") {
+				t.Errorf("draft-user message = %q", finalText)
 			}
 			if critique, ok := superego.Critiques()[0]; !ok || critique.Verdict != "approve" {
 				t.Errorf("critique for turn 0 = %+v, %v", critique, ok)

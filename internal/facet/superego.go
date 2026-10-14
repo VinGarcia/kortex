@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -79,24 +80,22 @@ const superegoFacet = "superego"
 // response bill an essay.
 const superegoMaxTokens = 4096
 
-// ReviewMessage is one message of the superego's assembled context, in
-// facet-owned shape: the adapter behind the Conversant port translates it
-// to its provider's wire type, keeping the context-assembly service
-// decoupled from any provider.
-type ReviewMessage struct {
-	Role    string // "user" or "assistant"
-	Content string
-}
-
 // Conversant is the multi-message model call the superego makes: its own
-// system prompt over the full conversation message array. It is a separate
-// port from Evaluator (single user message) because the superego's whole
-// point is seeing the conversation the core saw. Tests substitute a fake.
+// system prompt over the full conversation message array, in the SAME
+// provider-shaped type the core consumes (anthropic.Message, including
+// tool_use/tool_result content blocks). It is a separate port from Evaluator
+// (single user message) because the superego's whole point is seeing the
+// conversation the core saw — the identical array, not a lossy re-render
+// (design #4351). Tests substitute a fake.
 type Conversant interface {
-	Converse(ctx context.Context, system string, messages []ReviewMessage) (Evaluation, error)
+	Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error)
 }
 
-// AnthropicConversant adapts the anthropic client to the Conversant port.
+// AnthropicConversant adapts the anthropic client to the Conversant port. The
+// messages already carry the provider's wire shape, so the adapter forwards
+// them verbatim — the context-assembly service (superego_context.go and the
+// governor) owns building the array, and this adapter only carries the model
+// routing and the superego's token bound.
 type AnthropicConversant struct {
 	client *anthropic.Client
 	model  string
@@ -106,16 +105,12 @@ func NewAnthropicConversant(client *anthropic.Client, model string) *AnthropicCo
 	return &AnthropicConversant{client: client, model: model}
 }
 
-func (c *AnthropicConversant) Converse(ctx context.Context, system string, messages []ReviewMessage) (Evaluation, error) {
-	wire := make([]anthropic.Message, len(messages))
-	for i, m := range messages {
-		wire[i] = anthropic.Message{Role: m.Role, Content: m.Content}
-	}
+func (c *AnthropicConversant) Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error) {
 	resp, err := c.client.CreateMessage(ctx, anthropic.MessageRequest{
 		Model:     c.model,
 		System:    system,
 		MaxTokens: superegoMaxTokens,
-		Messages:  wire,
+		Messages:  messages,
 	})
 	if err != nil {
 		return Evaluation{}, err
@@ -222,36 +217,48 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 // ReviewDraft runs ONE superego review synchronously and returns the critique.
 // Unlike Review (shadow, async, fire-and-forget, log-only), this is the
 // active-loop primitive: the caller is the blocking core↔superego loop and
-// consumes the verdict to decide approve/revise/hold. round is the ladder
-// round (1-4), surfaced to the model alongside the prior rounds' critiques so
-// it honors the 3+1 contract (revise only in rounds 1-3, hold only in round
-// 4). ok is false (with a logged reason) only when the review could not run at
-// all (bad input, API error, timeout); the loop fails open on false. A
-// successful call with an unparseable verdict returns ok=true and an empty
-// Verdict — the loop treats that as fail-open too. draftParagraphs and tags
-// come from the SAME segmentation the evaluator committed to, so index i tags
-// paragraph i. The caller owns the context deadline.
+// consumes the verdict to decide approve/revise/hold.
+//
+// messages is the core's OWN conversation array for this turn — the exact
+// []anthropic.Message the core consumed, EXCLUDING the final assistant draft
+// (design #4351: identical context, same message array). The reviewed draft
+// does not re-enter as an assistant message; it is appended here as a final
+// user-role "draft not yet sent" (design #4354, anti-self-leniency), carrying
+// the ladder round and the prior rounds' critiques (activeDraftMessage). This
+// is the ONE preserved asymmetry versus the core's view; the history
+// tool_use/tool_result blocks are carried verbatim, so the superego sees the
+// same evidence the core did.
+//
+// round is the ladder round (1-4), surfaced to the model alongside the prior
+// rounds' critiques so it honors the 3+1 contract (revise only in rounds 1-3,
+// hold only in round 4). ok is false (with a logged reason) only when the
+// review could not run at all (bad input, API error, timeout); the loop fails
+// open on false. A successful call with an unparseable verdict returns ok=true
+// and an empty Verdict — the loop treats that as fail-open too. draftParagraphs
+// and tags come from the SAME segmentation the evaluator committed to, so index
+// i tags paragraph i. The caller owns the context deadline.
 func (s *Superego) ReviewDraft(
 	ctx context.Context,
 	turnIndex int,
-	snapshot history.Snapshot,
+	messages []anthropic.Message,
 	round int,
 	prior []SuperegoCritique,
 	draftParagraphs []string,
 	tags []ParagraphAnnotation,
 ) (SuperegoCritique, bool) {
-	if turnIndex < 0 || turnIndex >= len(snapshot.Turns) {
-		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, Round: round, Err: fmt.Sprintf("turn index %d outside snapshot of %d turns", turnIndex, len(snapshot.Turns))})
-		return SuperegoCritique{}, false
-	}
 	if len(draftParagraphs) == 0 || len(draftParagraphs) != len(tags) {
 		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, Round: round, Err: fmt.Sprintf("draft/tags mismatch: %d paragraphs, %d tags", len(draftParagraphs), len(tags))})
 		return SuperegoCritique{}, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	messages := superegoMessages(snapshot, turnIndex, activeDraftMessage(draftParagraphs, tags, round, prior), s.maxHistoryTurns)
-	critique, entry, err := s.converse(ctx, turnIndex, round, messages)
+	// The draft enters as the final user-role message; the core's array is the
+	// durable view, so it is cloned before the append and never mutated.
+	view := append(slices.Clone(messages), anthropic.Message{
+		Role:    "user",
+		Content: activeDraftMessage(draftParagraphs, tags, round, prior),
+	})
+	critique, entry, err := s.converse(ctx, turnIndex, round, view)
 	s.log.record(entry)
 	if err != nil {
 		return SuperegoCritique{}, false
@@ -263,7 +270,7 @@ func (s *Superego) ReviewDraft(
 // the log entry, shared by the shadow (Review) and active (ReviewDraft) paths.
 // It never records the entry itself — the caller does, after deciding what
 // else to do with the result. round 0 means the shadow path (no ladder round).
-func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messages []ReviewMessage) (SuperegoCritique, callLog, error) {
+func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
 	start := time.Now()
 	eval, err := s.conversant.Converse(ctx, s.datedSystemPrompt(), messages)
 	entry := callLog{

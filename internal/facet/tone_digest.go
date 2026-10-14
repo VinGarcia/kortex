@@ -39,6 +39,24 @@ const maxDigestEmotions = 12
 // pathological tag cannot bloat the block.
 const digestEmotionNameMax = 60
 
+// boundedSnippet reduces s to its first non-empty line, trimmed and capped at
+// maxRunes runes (an ellipsis marks truncation). It is rune-safe so a cap never
+// splits a multi-byte character. "" in → "" out.
+func boundedSnippet(s string, maxRunes int) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if nl := strings.IndexByte(s, '\n'); nl >= 0 {
+		s = strings.TrimSpace(s[:nl])
+	}
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return s
+}
+
 // The ephemeral digest block delimiters, in the same spirit as the superego's
 // clearly-delimited ephemeral blocks (superego_context.go). They let the core
 // model recognize the injected tone context as a bounded, orchestrator-authored

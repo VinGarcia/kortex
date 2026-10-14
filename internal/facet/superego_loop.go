@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
-	"github.com/vingarcia/kortex/internal/history"
 )
 
 // ActiveSuperego is the F2d facet in ACTIVE MODE: the blocking core↔superego
@@ -89,18 +89,25 @@ func NewActiveSuperego(params ActiveSuperegoParams) *ActiveSuperego {
 // every other path (deliver, revise-then-deliver, cap fallback, fail-open)
 // returns held=false with the text to speak.
 //
-// snapshot carries the turn under review at turnIndex (its AssistantText is the
-// draft). redraft asks the CORE model for a new draft given an ephemeral tail
-// (the prior critiques as user feedback and the prior redrafts as assistant
-// turns) appended to the turn's canonical messages; the session never persists
-// that tail. The caller owns the context deadline for the whole loop; the
-// evaluator and superego each own their per-call timeout internally.
+// messages is the core's OWN conversation array for this turn — the exact
+// []anthropic.Message the core consumed, EXCLUDING the final assistant draft
+// (design #4351: the superego reviews from the identical context, tool_use and
+// tool_result blocks and all; draft is passed separately and re-enters as a
+// draft-user message inside ReviewDraft). redraft asks the CORE model for a new
+// draft given an ephemeral tail (the prior critiques as user feedback and the
+// prior redrafts as assistant turns) appended to the turn's canonical messages;
+// the session never persists that tail. Alongside the new draft text, redraft
+// returns the message blocks it appended while acting (#4753: the redraft's own
+// tool_use/tool_result traffic, EXCLUDING its draft), which this loop folds into
+// the running review view so the next round's superego sees the evidence the
+// redraft just gathered. The caller owns the context deadline for the whole
+// loop; the evaluator and superego each own their per-call timeout internally.
 func (a *ActiveSuperego) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
-	snapshot history.Snapshot,
+	messages []anthropic.Message,
 	draft string,
-	redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 ) (text string, held bool) {
 	// Fail-open umbrella: a panic anywhere in the loop degrades to delivering
 	// the original draft, never a crashed wire or a swallowed reply.
@@ -127,10 +134,15 @@ func (a *ActiveSuperego) GovernOutput(
 	current := draft
 	curEval := de
 	var critiques []SuperegoCritique // critique1, critique2, ... (one per round run)
-	var redrafts []string            // draft2, draft3, ... (original draft is in snapshot/messages)
+	var redrafts []string            // draft2, draft3, ... (original draft is passed as `draft`)
+	// reviewMessages is the running review view: the core's array, grown each
+	// revise round with the redraft's own tool traffic so the next review sees
+	// the evidence it gathered (#4753). The draft itself is never in here — it
+	// always enters as the draft-user message inside ReviewDraft.
+	reviewMessages := messages
 
 	for round := 1; round <= a.maxRounds; round++ {
-		crit, ok := a.superego.ReviewDraft(ctx, turnIndex, snapshot, round, critiques, curEval.Paragraphs, curEval.Tags)
+		crit, ok := a.superego.ReviewDraft(ctx, turnIndex, reviewMessages, round, critiques, curEval.Paragraphs, curEval.Tags)
 		if !ok {
 			// The superego call failed (logged inside ReviewDraft) — fail open.
 			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open"})
@@ -156,16 +168,18 @@ func (a *ActiveSuperego) GovernOutput(
 				return current, false
 			}
 			critiques = append(critiques, crit)
-			newDraft, newCalls, err := redraft(ctx, revisionTail(critiques, redrafts))
+			newDraft, newMessages, err := redraft(ctx, revisionTail(critiques, redrafts))
 			if err != nil {
 				// A redraft failure fails open to the best draft in hand.
 				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error()})
 				return current, false
 			}
-			// Fold the redraft's own tool calls (#4753) into the reviewed turn —
-			// see appendReviewedToolCalls for why the next round must see them.
-			if len(newCalls) > 0 {
-				snapshot = appendReviewedToolCalls(snapshot, turnIndex, newCalls)
+			// Fold the redraft's own tool traffic (#4753) into the review view so
+			// the next round's superego sees the evidence this redraft gathered;
+			// without it the superego keeps rejecting a redraft for the very facts
+			// it just verified. slices.Clone keeps the caller's array unmutated.
+			if len(newMessages) > 0 {
+				reviewMessages = append(slices.Clone(reviewMessages), newMessages...)
 			}
 			if newDraft == current {
 				// Exact-identity anti-cycle guard (ratified option (b)): the core
@@ -211,25 +225,6 @@ func gateDecision(fire bool) string {
 		return "revise"
 	}
 	return "deliver"
-}
-
-// appendReviewedToolCalls returns a copy of snapshot whose turn at turnIndex
-// carries calls appended to its ToolCalls, so each ladder round's provenance
-// block (FERRAMENTAS_EXECUTADAS, #4749) reflects every tool the turn has run so
-// far — original turn plus all redrafts; without the fold the superego keeps
-// rejecting a redraft for the very facts it just verified. The turns slice is
-// cloned here and the reviewed turn's ToolCalls are cloned by
-// history.AppendToolCalls (the single owner of the provenance-append rule the
-// session shares), so the snapshot the session handed to GovernOutput is never
-// mutated. turnIndex is not re-guarded here: the ladder only reaches a redraft
-// after round 1's ReviewDraft validated the same index against the same
-// snapshot.
-func appendReviewedToolCalls(snapshot history.Snapshot, turnIndex int, calls []history.ToolCall) history.Snapshot {
-	turns := append([]history.Turn(nil), snapshot.Turns...)
-	reviewed := &turns[turnIndex]
-	reviewed.ToolCalls = history.AppendToolCalls(reviewed.ToolCalls, calls...)
-	snapshot.Turns = turns
-	return snapshot
 }
 
 // revisionTail builds the ephemeral message tail handed to the CORE redraft

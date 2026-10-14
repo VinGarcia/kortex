@@ -29,6 +29,7 @@ package facet
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,19 +101,31 @@ func liveSuperego(t *testing.T) *Superego {
 	})
 }
 
-// reviewBait runs round 1 of the active ladder over the bait draft appended
-// to the given prior turns, mirroring governTurn's snapshot construction.
+// turnsToMessages renders prior turns as the core's own conversation array
+// (text-only), the same alternating user/assistant shape the native path hands
+// the governor before the final draft. Empty sides contribute no message.
+func turnsToMessages(priorTurns []history.Turn) []anthropic.Message {
+	var messages []anthropic.Message
+	for _, turn := range priorTurns {
+		if turn.UserText != "" {
+			messages = append(messages, anthropic.Message{Role: "user", Content: turn.UserText})
+		}
+		if turn.AssistantText != "" {
+			messages = append(messages, anthropic.Message{Role: "assistant", Content: turn.AssistantText})
+		}
+	}
+	return messages
+}
+
+// reviewBait runs round 1 of the active ladder over the bait draft, building the
+// core's message array the governor would hand ReviewDraft: the prior turns plus
+// the reviewed turn's user text, EXCLUDING the draft (ReviewDraft appends it as
+// the draft-user message itself).
 func reviewBait(t *testing.T, s *Superego, priorTurns []history.Turn, reviewUserText string) SuperegoCritique {
 	t.Helper()
 	turnIndex := len(priorTurns)
-	turns := append(append([]history.Turn(nil), priorTurns...), history.Turn{
-		UserText:      reviewUserText,
-		AssistantText: baitDraft,
-		StopReason:    "end_turn",
-		Completed:     true,
-	})
-	snapshot := history.Snapshot{SessionID: "live-test", Turns: turns}
-	critique, ok := s.ReviewDraft(context.Background(), turnIndex, snapshot, 1, nil, []string{baitDraft}, baitTags)
+	messages := append(turnsToMessages(priorTurns), anthropic.Message{Role: "user", Content: reviewUserText})
+	critique, ok := s.ReviewDraft(context.Background(), turnIndex, messages, 1, nil, []string{baitDraft}, baitTags)
 	if !ok {
 		t.Fatalf("ReviewDraft failed (API error or malformed context); critique: %+v", critique)
 	}
@@ -141,12 +154,13 @@ func TestSuperegoLive_GenuineBaitIsNotApproved(t *testing.T) {
 	}
 }
 
-// TestSuperegoLive_ToolVerifiedFactIsNotFlagged covers #4749 live: a draft that
-// asserts a concrete fact IS backed by a tool call present in the reviewed
-// turn's summary (FERRAMENTAS_EXECUTADAS_NESTE_TURNO). With the provenance in
-// front of it, the superego has no grounds to flag the claim as unverified, so
-// it must approve. This exercises the summary-append path (superegoMessages →
-// ReviewDraft) against the real prompt; before #4749 the superego saw only the
+// TestSuperegoLive_ToolVerifiedFactIsNotFlagged covers tool provenance live: a
+// draft that asserts a concrete fact IS backed by a tool call present in the
+// reviewed turn's REAL message blocks — the assistant's tool_use and the
+// matching tool_result the core itself consumed. With that provenance in front
+// of it, the superego has no grounds to flag the claim as unverified, so it must
+// approve. This exercises the parity path (res.Messages → ReviewDraft) against
+// the real prompt; without the carried blocks the superego would see only the
 // spoken text and could not distinguish a checked fact from a fabricated one.
 func TestSuperegoLive_ToolVerifiedFactIsNotFlagged(t *testing.T) {
 	s := liveSuperego(t)
@@ -156,22 +170,17 @@ func TestSuperegoLive_ToolVerifiedFactIsNotFlagged(t *testing.T) {
 		Valence:    "neutra",
 		Emotions:   []Emotion{},
 	}}
-	reviewed := history.Turn{
-		UserText:      "O PR #4749 já pode mergear? Dá uma conferida no CI.",
-		AssistantText: draft,
-		StopReason:    "end_turn",
-		Completed:     true,
-		// The provenance the superego gets to see: the assistant really ran the
-		// check, and the result confirms exactly the claimed fact.
-		ToolCalls: []history.ToolCall{{
-			ID:     "gh-1",
-			Name:   "Bash",
-			Input:  `{"command":"gh pr checks 4749"}`,
-			Result: "CI / build (pull_request) ... pass\n142 tests, 142 passed",
-		}},
+	// The core's own array for the reviewed turn, EXCLUDING the final draft: the
+	// user's ask, then the real tool_use/tool_result blocks proving the assistant
+	// ran the check and the result confirms exactly the claimed fact.
+	messages := []anthropic.Message{
+		{Role: "user", Content: "O PR #4749 já pode mergear? Dá uma conferida no CI."},
+		{Role: "assistant", Content: []json.RawMessage{json.RawMessage(
+			`{"type":"tool_use","id":"gh-1","name":"Bash","input":{"command":"gh pr checks 4749"}}`)}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("gh-1", "CI / build (pull_request) ... pass\n142 tests, 142 passed", false)}},
 	}
-	snapshot := history.Snapshot{SessionID: "live-test", Turns: []history.Turn{reviewed}}
-	critique, ok := s.ReviewDraft(context.Background(), 0, snapshot, 1, nil, []string{draft}, tags)
+	critique, ok := s.ReviewDraft(context.Background(), 0, messages, 1, nil, []string{draft}, tags)
 	if !ok {
 		t.Fatalf("ReviewDraft failed (API error or malformed context); critique: %+v", critique)
 	}

@@ -3,6 +3,7 @@ package facet
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
-	"github.com/vingarcia/kortex/internal/history"
 )
 
 // scriptStep is one canned model reply: an evaluation or an error. A scripted
@@ -35,14 +35,15 @@ func (s *scriptedEvaluator) Evaluate(_ context.Context, _ string, _ string) (Eva
 
 // scriptedConversant feeds ReviewDraft a fixed sequence of superego replies and
 // records each round's assembled messages so a test can assert on the draft-under
-// review and the prior-round annotations the ladder surfaces.
+// review, the carried-over tool blocks, and the prior-round annotations the
+// ladder surfaces.
 type scriptedConversant struct {
 	steps       []scriptStep
 	calls       int
-	gotMessages [][]ReviewMessage
+	gotMessages [][]anthropic.Message
 }
 
-func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []ReviewMessage) (Evaluation, error) {
+func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []anthropic.Message) (Evaluation, error) {
 	s.gotMessages = append(s.gotMessages, messages)
 	step := s.steps[min(s.calls, len(s.steps)-1)]
 	s.calls++
@@ -51,28 +52,47 @@ func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []Re
 
 // redrafter is the core redraft callback double: it returns a fixed sequence of
 // redrafts (or errors) and records every ephemeral tail it was handed.
-// toolCalls, when set, is returned alongside the matching redraft, simulating a
-// redraft that ran its own tools (#4753).
+// redraftMsgs, when set, is returned alongside the matching redraft as the
+// message blocks that redraft appended while acting (its own tool_use/
+// tool_result traffic, excluding its draft), simulating an acting redraft (#4753).
 type redrafter struct {
-	drafts    []string
-	errs      []error
-	toolCalls [][]history.ToolCall
-	calls     int
-	tails     [][]anthropic.Message
+	drafts      []string
+	errs        []error
+	redraftMsgs [][]anthropic.Message
+	calls       int
+	tails       [][]anthropic.Message
 }
 
-func (r *redrafter) fn(_ context.Context, tail []anthropic.Message) (string, []history.ToolCall, error) {
+func (r *redrafter) fn(_ context.Context, tail []anthropic.Message) (string, []anthropic.Message, error) {
 	r.tails = append(r.tails, tail)
 	i := r.calls
 	r.calls++
 	if i < len(r.errs) && r.errs[i] != nil {
 		return "", nil, r.errs[i]
 	}
-	var calls []history.ToolCall
-	if i < len(r.toolCalls) {
-		calls = r.toolCalls[i]
+	var msgs []anthropic.Message
+	if i < len(r.redraftMsgs) {
+		msgs = r.redraftMsgs[i]
 	}
-	return r.drafts[min(i, len(r.drafts)-1)], calls, nil
+	return r.drafts[min(i, len(r.drafts)-1)], msgs, nil
+}
+
+// messagesContain reports whether any message's content carries substr, flattening
+// string content directly and JSON-marshaling block content (tool_use raw blocks,
+// tool_result blocks) so a test can assert on the tool provenance the superego saw.
+func messagesContain(msgs []anthropic.Message, substr string) bool {
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok {
+			if strings.Contains(s, substr) {
+				return true
+			}
+			continue
+		}
+		if b, err := json.Marshal(m.Content); err == nil && strings.Contains(string(b), substr) {
+			return true
+		}
+	}
+	return false
 }
 
 // gateFires / gateQuiet are single-paragraph evaluator replies whose aggregate
@@ -116,8 +136,12 @@ func newTestGovernor(evalSteps []scriptStep, seSteps []scriptStep, logSink *byte
 	return gov, ev, co
 }
 
-func govSnapshot(draft string) history.Snapshot {
-	return history.Snapshot{Turns: []history.Turn{{UserText: "oi", AssistantText: draft, Completed: true}}}
+// govMessages is the core's own conversation array for the reviewed turn,
+// EXCLUDING the final assistant draft (the governor is handed exactly that, the
+// draft arriving separately). A single prior user message is enough for the
+// ladder tests that do not exercise carried-over tool provenance.
+func govMessages() []anthropic.Message {
+	return []anthropic.Message{{Role: "user", Content: "oi"}}
 }
 
 func TestActiveSuperego_ladder(t *testing.T) {
@@ -219,7 +243,7 @@ func TestActiveSuperego_ladder(t *testing.T) {
 			gov, _, co := newTestGovernor(test.evalSteps, test.seSteps, nil)
 			rd := &redrafter{drafts: test.redrafts, errs: test.redraftErr}
 
-			text, held := gov.GovernOutput(context.Background(), 0, govSnapshot(draft), draft, rd.fn)
+			text, held := gov.GovernOutput(context.Background(), 0, govMessages(), draft, rd.fn)
 
 			if !strings.Contains(text, test.wantText) {
 				t.Errorf("delivered text = %q, want containing %q", text, test.wantText)
@@ -250,7 +274,7 @@ func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 	)
 	rd := &redrafter{drafts: []string{"rev2", "rev3", "rev4"}}
 
-	gov.GovernOutput(context.Background(), 0, govSnapshot(draft), draft, rd.fn)
+	gov.GovernOutput(context.Background(), 0, govMessages(), draft, rd.fn)
 
 	if len(rd.tails) != 3 {
 		t.Fatalf("expected 3 redraft tails, got %d", len(rd.tails))
@@ -287,11 +311,12 @@ func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 }
 
 // TestActiveSuperego_redraftToolCallsReachNextReview locks in the provenance
-// fix for acting redrafts (#4753 + #4749): when a redraft runs its own tools,
-// the NEXT review round's reviewed-turn message must carry those calls in the
-// FERRAMENTAS_EXECUTADAS block — alongside the original turn's calls — so the
-// superego judges the redraft against the evidence it just gathered. The
-// caller's snapshot must stay untouched (the fold clones before mutating).
+// fix for acting redrafts (#4753): the original turn's tool_use/tool_result
+// blocks ride the core's message array into round 1's review, and when a redraft
+// runs its own tools the NEXT round's review must carry those new blocks too —
+// as the real provider-shaped messages the core consumed, not a summary — so the
+// superego judges the redraft against the evidence it just gathered. The caller's
+// message slice must stay untouched (the governor clones before appending).
 func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
 	const draft = "rascunho original"
 	gov, _, co := newTestGovernor(
@@ -299,20 +324,28 @@ func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
 		[]scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("approve")},
 		nil,
 	)
+	// The redraft "acts": it returns the tool_use/tool_result blocks it ran (the
+	// governor folds them into the review view for the next round).
 	rd := &redrafter{
 		drafts: []string{"rev2 com evidência"},
-		toolCalls: [][]history.ToolCall{{
-			{ID: "t-redraft", Name: "web_fetch", Input: `{"url":"https://arxiv.org/abs/2604.14228"}`, Result: "HTTP 200: título real"},
+		redraftMsgs: [][]anthropic.Message{{
+			{Role: "assistant", Content: []json.RawMessage{json.RawMessage(
+				`{"type":"tool_use","id":"t-redraft","name":"web_fetch","input":{"url":"https://arxiv.org/abs/2604.14228"}}`)}},
+			{Role: "user", Content: []anthropic.ToolResultBlock{
+				anthropic.NewToolResultBlock("t-redraft", "HTTP 200: título real", false)}},
 		}},
 	}
-	snapshot := history.Snapshot{Turns: []history.Turn{{
-		UserText:      "oi",
-		AssistantText: draft,
-		ToolCalls:     []history.ToolCall{{ID: "t-orig", Name: "web_search", Input: `{"query":"arxiv"}`, Result: "resultados"}},
-		Completed:     true,
-	}}}
+	// The core's own array for the turn (excluding the final draft): a user turn,
+	// then the original turn's web_search tool_use + tool_result blocks.
+	messages := []anthropic.Message{
+		{Role: "user", Content: "oi"},
+		{Role: "assistant", Content: []json.RawMessage{json.RawMessage(
+			`{"type":"tool_use","id":"t-orig","name":"web_search","input":{"query":"arxiv"}}`)}},
+		{Role: "user", Content: []anthropic.ToolResultBlock{
+			anthropic.NewToolResultBlock("t-orig", "resultados", false)}},
+	}
 
-	text, held := gov.GovernOutput(context.Background(), 0, snapshot, draft, rd.fn)
+	text, held := gov.GovernOutput(context.Background(), 0, messages, draft, rd.fn)
 
 	if held || text != "rev2 com evidência" {
 		t.Fatalf("GovernOutput = (%q, %v), want the approved redraft", text, held)
@@ -320,22 +353,33 @@ func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
 	if len(co.gotMessages) != 2 {
 		t.Fatalf("superego reviewed %d times, want 2", len(co.gotMessages))
 	}
-	round1 := co.gotMessages[0][len(co.gotMessages[0])-1].Content
-	round2 := co.gotMessages[1][len(co.gotMessages[1])-1].Content
-	// Round 1 sees the original turn's provenance only.
-	if !strings.Contains(round1, "FERRAMENTAS_EXECUTADAS") || !strings.Contains(round1, "web_search") {
-		t.Errorf("round 1 missing the original turn's tool provenance:\n%s", round1)
+	round1, round2 := co.gotMessages[0], co.gotMessages[1]
+	// Round 1 sees the original turn's tool blocks only.
+	if !messagesContain(round1, "web_search") {
+		t.Errorf("round 1 missing the original turn's tool provenance: %+v", round1)
 	}
-	if strings.Contains(round1, "web_fetch") {
-		t.Errorf("round 1 must not see the not-yet-run redraft tool:\n%s", round1)
+	if messagesContain(round1, "web_fetch") {
+		t.Errorf("round 1 must not see the not-yet-run redraft tool: %+v", round1)
 	}
-	// Round 2 sees the original calls PLUS the redraft's new evidence.
-	if !strings.Contains(round2, "web_search") || !strings.Contains(round2, "web_fetch") {
-		t.Errorf("round 2 missing original or redraft tool provenance:\n%s", round2)
+	// Round 2 sees the original blocks PLUS the redraft's new evidence.
+	if !messagesContain(round2, "web_search") || !messagesContain(round2, "web_fetch") {
+		t.Errorf("round 2 missing original or redraft tool provenance: %+v", round2)
 	}
-	// The caller's snapshot was never mutated by the fold.
-	if got := len(snapshot.Turns[0].ToolCalls); got != 1 {
-		t.Errorf("caller snapshot mutated: reviewed turn now has %d tool calls, want 1", got)
+	// The reviewed draft always enters as the closing draft-user message, never as
+	// an assistant message — the one preserved asymmetry (#4354).
+	for _, round := range [][]anthropic.Message{round1, round2} {
+		final := round[len(round)-1]
+		s, _ := final.Content.(string)
+		if final.Role != "user" || !strings.Contains(s, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+			t.Errorf("closing message is not the draft-user: %+v", final)
+		}
+	}
+	// The caller's message slice was never mutated by the fold.
+	if got := len(messages); got != 3 {
+		t.Errorf("caller messages mutated: now %d messages, want 3", got)
+	}
+	if messagesContain(messages, "web_fetch") {
+		t.Errorf("caller messages mutated: redraft tool leaked into the caller's slice: %+v", messages)
 	}
 }
 
@@ -350,7 +394,7 @@ func TestActiveSuperego_logsGateAndDecisions(t *testing.T) {
 		&log,
 	)
 
-	gov.GovernOutput(context.Background(), 0, govSnapshot(draft), draft, (&redrafter{}).fn)
+	gov.GovernOutput(context.Background(), 0, govMessages(), draft, (&redrafter{}).fn)
 
 	out := log.String()
 	// The gate line: active_superego facet, primary path, gateWouldFire true.
@@ -378,7 +422,7 @@ func TestActiveSuperego_panicFailsOpen(t *testing.T) {
 	})
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus"})
 
-	text, held := gov.GovernOutput(context.Background(), 0, govSnapshot(draft), draft, (&redrafter{}).fn)
+	text, held := gov.GovernOutput(context.Background(), 0, govMessages(), draft, (&redrafter{}).fn)
 	if text != draft || held {
 		t.Errorf("panic must fail open to the original draft: text=%q held=%v", text, held)
 	}

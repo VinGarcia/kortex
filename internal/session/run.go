@@ -55,24 +55,34 @@ type ToneDigester interface {
 // decides the text to deliver. Given the core's draft, it runs the blocking
 // evaluate→review→revise ladder and returns the governed text (an approved
 // draft, a later redraft, or — when held is true — a hold-and-ask message
-// delivered instead of the draft). redraft lets the governor ask the CORE model
-// for a new draft, given an ephemeral message tail (the rejected drafts and the
-// superego critiques) appended to the turn's canonical messages; that tail is
-// never persisted and never emitted. Alongside the new text, redraft returns
-// the tool calls the redraft itself executed (#4753 lets a redraft act), so the
-// governor can extend the reviewed turn's provenance before re-reviewing — the
-// superego must see the evidence a redraft gathered, or it keeps rejecting the
-// redraft for the very facts it just verified. This interface is defined here
-// with an inline func type and only shared types (context/history/anthropic),
-// so facet.ActiveSuperego satisfies it structurally without session importing
-// facet. A nil Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
+// delivered instead of the draft).
+//
+// messages is the core's OWN conversation array for this turn, EXCLUDING the
+// final assistant draft (passed separately as draft): the exact
+// []anthropic.Message the core consumed, tool_use/tool_result blocks and all, so
+// the superego reviews from context identical to the core's (design #4351). The
+// draft re-enters the review as a draft-user message inside the facet, the one
+// preserved asymmetry (#4354).
+//
+// redraft lets the governor ask the CORE model for a new draft, given an
+// ephemeral message tail (the rejected drafts and the superego critiques)
+// appended to the turn's canonical messages; that tail is never persisted and
+// never emitted. Alongside the new text, redraft returns the message blocks the
+// redraft itself appended while acting — its own tool_use/tool_result traffic,
+// EXCLUDING the redraft's draft (#4753 lets a redraft act) — so the governor can
+// fold that evidence into the review view before re-reviewing; the superego must
+// see what a redraft gathered, or it keeps rejecting the redraft for the very
+// facts it just verified. This interface is defined here with an inline func
+// type and only shared types (context/anthropic), so facet.ActiveSuperego
+// satisfies it structurally without session importing facet. A nil
+// Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
 type OutputGovernor interface {
 	GovernOutput(
 		ctx context.Context,
 		turnIndex int,
-		snapshot history.Snapshot,
+		messages []anthropic.Message,
 		draft string,
-		redraft func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error),
+		redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 	) (text string, held bool)
 }
 
@@ -369,17 +379,17 @@ func runTurn(
 		return msgs, nil, nil
 	}
 
-	// This turn's tool calls, derived once from the messages RunLoop appended for
-	// the turn (res.Messages is the whole conversation; the prior history is
-	// msgs). The same value feeds both the governor's reviewed turn — so the
-	// superego's FERRAMENTAS_EXECUTADAS provenance block (#4749) sees what the
-	// core actually ran this turn — and the canonical Turn returned below.
+	// This turn's tool calls, derived from the messages RunLoop appended for the
+	// turn (res.Messages is the whole conversation; the prior history is msgs).
+	// This backs the canonical Turn returned below. The governor no longer needs a
+	// flattened copy: it reviews from res.Messages directly, whose tool_use/
+	// tool_result blocks already carry what the core ran this turn.
 	turnToolCalls := toolCallsFromMessages(res.Messages[len(msgs):])
 
 	finalText := res.FinalText
 	finalMessages := res.Messages
 	if cfg.Governor != nil {
-		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, userText, turnToolCalls, res)
+		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, res)
 		if govErr != nil {
 			return nil, nil, govErr
 		}
@@ -505,23 +515,18 @@ func governTurn(
 	emitter *tools.StreamEmitter,
 	systemPrompt string,
 	priorTurns []history.Turn,
-	userText string,
-	turnToolCalls []history.ToolCall,
 	res tools.LoopResult,
 ) (string, []anthropic.Message, []history.ToolCall, error) {
 	turnIndex := len(priorTurns)
-	// ToolCalls on the reviewed turn is what feeds the superego's
-	// FERRAMENTAS_EXECUTADAS provenance block (#4749): without it the superego
-	// cannot distinguish a fact the core actually fetched this turn from a
-	// fabricated one, and it rejects well-sourced drafts as unverifiable.
-	reviewTurns := append(append([]history.Turn(nil), priorTurns...), history.Turn{
-		UserText:      userText,
-		AssistantText: res.FinalText,
-		ToolCalls:     turnToolCalls,
-		StopReason:    res.StopReason,
-		Completed:     true,
-	})
-	snapshot := history.Snapshot{SessionID: cfg.SessionID, Turns: reviewTurns}
+	// reviewMessages is the core's OWN conversation array for this turn, minus the
+	// final assistant draft (res.Messages always ends with that draft; it re-enters
+	// the review as a draft-user message, #4354). This IS the context the core
+	// consumed — tool_use/tool_result blocks and all — so the superego reviews from
+	// an identical view (#4351), not a lossy re-render of the flattened snapshot.
+	reviewMessages := res.Messages
+	if len(reviewMessages) > 0 {
+		reviewMessages = reviewMessages[:len(reviewMessages)-1]
+	}
 
 	// redraft asks the core model for a new draft over the turn's canonical
 	// messages plus the ephemeral tail. Unlike the pre-#4753 behavior (a pure
@@ -545,7 +550,7 @@ func governTurn(
 	// the redraft returns an error, so acting can never break the turn.
 	var redraftUsage anthropic.Usage
 	var allRedraftCalls []history.ToolCall
-	redraft := func(ctx context.Context, tail []anthropic.Message) (string, []history.ToolCall, error) {
+	redraft := func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error) {
 		redraftTimeout := cfg.RedraftTimeout
 		if redraftTimeout <= 0 {
 			redraftTimeout = DefaultRedraftTimeout
@@ -605,7 +610,8 @@ func governTurn(
 				// whose events never reach the wire (Emitter is nil above). Each
 				// audit line carries the tool id, name, error flag, and a
 				// length-capped result marker, never full output.
-				redraftCalls := toolCallsFromMessages(loopRes.Messages[len(loopHistory):])
+				appended := loopRes.Messages[len(loopHistory):]
+				redraftCalls := toolCallsFromMessages(appended)
 				allRedraftCalls = append(allRedraftCalls, redraftCalls...)
 				for _, call := range redraftCalls {
 					diagf(cfg.Diag, "session: redraft tool call id=%s name=%s is_error=%t result=%q",
@@ -617,7 +623,18 @@ func governTurn(
 				if strings.TrimSpace(tools.StripToolMarkup(loopRes.FinalText)) == "" {
 					return "", nil, fmt.Errorf("redraft tool loop returned no deliverable text (stop_reason %q)", loopRes.StopReason)
 				}
-				return loopRes.FinalText, redraftCalls, nil
+				// The blocks to fold into the review view are the redraft's TOOL
+				// traffic only: appended[0] is the ephemeral critique+guard-rail user
+				// message (loop scaffolding the superego must never see as
+				// conversation — it already gets prior critiques structurally), and
+				// the last element is the redraft's own draft (which re-enters as a
+				// draft-user message, never as history). The middle is the
+				// tool_use/tool_result pairs this redraft ran; empty when it ran none.
+				// RunLoop always appends at least those two (the user message it is
+				// handed and the final assistant turn it stops on), so len(appended) >= 2
+				// and this slice is always valid — never a negative or out-of-range bound.
+				redraftMessages := appended[1 : len(appended)-1]
+				return loopRes.FinalText, redraftMessages, nil
 			}
 			// The overall redraft deadline already fired: the text-only fallback
 			// cannot succeed on a dead context and would only burn another blocked
@@ -648,7 +665,7 @@ func governTurn(
 	// where the hold decision is recorded). It is part of the port contract for
 	// callers that may want to signal a held turn differently; the native path
 	// does not.
-	finalText, _ := cfg.Governor.GovernOutput(ctx, turnIndex, snapshot, res.FinalText, redraft)
+	finalText, _ := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, res.FinalText, redraft)
 	stopKeepalive()
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
