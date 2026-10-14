@@ -77,6 +77,24 @@ func (r *redrafter) fn(_ context.Context, tail []anthropic.Message) (string, []a
 	return r.drafts[min(i, len(r.drafts)-1)], msgs, nil
 }
 
+// finalizer is the core finalize callback double for the spent-ladder final
+// round (a residual revise at the round cap): it records every ephemeral tail it
+// was handed and returns a fixed final message (or an error), so a test can
+// prove the CORE — not the superego — authors the final text, with no further
+// review after it.
+type finalizer struct {
+	text  string
+	err   error
+	calls int
+	tails [][]anthropic.Message
+}
+
+func (f *finalizer) fn(_ context.Context, tail []anthropic.Message) (string, error) {
+	f.tails = append(f.tails, tail)
+	f.calls++
+	return f.text, f.err
+}
+
 // messagesContain reports whether any message's content carries substr, flattening
 // string content directly and JSON-marshaling block content (tool_use raw blocks,
 // tool_result blocks) so a test can assert on the tool provenance the superego saw.
@@ -146,6 +164,7 @@ func govMessages() []anthropic.Message {
 
 func TestActiveSuperego_ladder(t *testing.T) {
 	const draft = "rascunho original"
+	const coreFinal = "mensagem final do core"
 	tests := []struct {
 		desc       string
 		evalSteps  []scriptStep
@@ -153,9 +172,9 @@ func TestActiveSuperego_ladder(t *testing.T) {
 		redrafts   []string
 		redraftErr []error
 		wantText   string
-		wantHeld   bool
 		wantRedraw int
 		wantReview int
+		wantFinal  int
 	}{
 		{
 			desc:       "gate quiet delivers the draft without any review",
@@ -181,21 +200,14 @@ func TestActiveSuperego_ladder(t *testing.T) {
 			wantReview: 2,
 		},
 		{
-			desc:       "hold_ask_human delivers the hold message, not the draft",
-			evalSteps:  []scriptStep{gateFires()},
-			seSteps:    []scriptStep{superegoVerdictStep("hold_ask_human")},
-			wantText:   "[kortex] Segurei",
-			wantHeld:   true,
-			wantReview: 1,
-		},
-		{
-			desc:       "revise every round overruns at the cap and delivers the last redraft",
+			desc:       "revise every round spends the ladder and the core authors the final message",
 			evalSteps:  []scriptStep{gateFires(), gateFires(), gateFires(), gateFires()},
 			seSteps:    []scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise")},
 			redrafts:   []string{"rev2", "rev3", "rev4"},
-			wantText:   "rev4",
+			wantText:   coreFinal,
 			wantRedraw: 3,
 			wantReview: 4,
+			wantFinal:  1,
 		},
 		{
 			desc:       "exact-identity redraft trips the anti-cycle guard and delivers it",
@@ -242,14 +254,12 @@ func TestActiveSuperego_ladder(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			gov, _, co := newTestGovernor(test.evalSteps, test.seSteps, nil)
 			rd := &redrafter{drafts: test.redrafts, errs: test.redraftErr}
+			fin := &finalizer{text: coreFinal}
 
-			text, held := gov.GovernOutput(context.Background(), 0, govMessages(), draft, rd.fn)
+			text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
 
 			if !strings.Contains(text, test.wantText) {
 				t.Errorf("delivered text = %q, want containing %q", text, test.wantText)
-			}
-			if held != test.wantHeld {
-				t.Errorf("held = %v, want %v", held, test.wantHeld)
 			}
 			if rd.calls != test.wantRedraw {
 				t.Errorf("redraft called %d times, want %d", rd.calls, test.wantRedraw)
@@ -257,14 +267,19 @@ func TestActiveSuperego_ladder(t *testing.T) {
 			if co.calls != test.wantReview {
 				t.Errorf("superego reviewed %d times, want %d", co.calls, test.wantReview)
 			}
+			if fin.calls != test.wantFinal {
+				t.Errorf("finalize called %d times, want %d", fin.calls, test.wantFinal)
+			}
 		})
 	}
 }
 
-// TestActiveSuperego_ephemeralTailGrows asserts the redraft tail accumulates the
-// prior critiques as user feedback interleaved with the prior redrafts as
-// assistant turns, and that the original draft is NOT repeated in the tail (it is
-// already the last canonical assistant message the callback appends to).
+// TestActiveSuperego_ephemeralTailGrows asserts the redraft tail accumulates, per
+// round, the TAGGED draft-under-review the superego judged, then that round's
+// critique as user feedback, then — for answered rounds — the redraft as an
+// assistant turn (change #2: the core and the superego discuss the same tagged
+// facts). The turn's own untagged draft is NOT repeated verbatim in the tail (it
+// is already the last canonical assistant message the callback appends to).
 func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 	const draft = "rascunho original"
 	gov, _, _ := newTestGovernor(
@@ -273,16 +288,18 @@ func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 		nil,
 	)
 	rd := &redrafter{drafts: []string{"rev2", "rev3", "rev4"}}
+	fin := &finalizer{text: "mensagem final do core"}
 
-	gov.GovernOutput(context.Background(), 0, govMessages(), draft, rd.fn)
+	gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
 
 	if len(rd.tails) != 3 {
 		t.Fatalf("expected 3 redraft tails, got %d", len(rd.tails))
 	}
-	// Tail lengths grow 1, 3, 5: each round adds a (user critique, assistant
-	// redraft) pair, and the newest critique closes the tail with no assistant
-	// after it (that is what the next redraft answers).
-	wantLens := []int{1, 3, 5}
+	// Tail lengths grow 2, 5, 8: each round contributes a (user tagged-draft, user
+	// critique) pair plus — for already-answered rounds — an assistant redraft, and
+	// the newest critique closes the tail with no assistant after it (that is what
+	// the next redraft answers).
+	wantLens := []int{2, 5, 8}
 	for i, tail := range rd.tails {
 		if len(tail) != wantLens[i] {
 			t.Errorf("tail %d length = %d, want %d: %+v", i, len(tail), wantLens[i], tail)
@@ -291,22 +308,30 @@ func TestActiveSuperego_ephemeralTailGrows(t *testing.T) {
 			t.Errorf("tail %d must end with the critique as a user message, got role %q", i, tail[len(tail)-1].Role)
 		}
 	}
-	// The original draft must never appear verbatim in any tail — it lives only
-	// in the canonical messages the callback appends the tail to.
+	// The untagged original draft must never appear verbatim in any tail — it lives
+	// only in the canonical messages the callback appends the tail to; the tail
+	// carries the TAGGED rendering instead.
 	for i, tail := range rd.tails {
 		for _, msg := range tail {
 			if content, ok := msg.Content.(string); ok && content == draft {
-				t.Errorf("tail %d leaked the original draft as a message: %+v", i, msg)
+				t.Errorf("tail %d leaked the untagged original draft as a message: %+v", i, msg)
 			}
 		}
 	}
-	// The second tail interleaves: [user crit1, assistant rev2, user crit2].
+	// The second tail interleaves, per round group:
+	// [user tagged-draft1, user crit1, assistant rev2, user tagged-draft2, user crit2].
 	second := rd.tails[1]
-	if second[0].Role != "user" || !strings.Contains(second[0].Content.(string), "Revisão do superego") {
-		t.Errorf("tail 1 position 0 should be the round-1 critique: %+v", second[0])
+	if second[0].Role != "user" || !strings.Contains(second[0].Content.(string), "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+		t.Errorf("tail 1 position 0 should be the round-1 tagged draft-under-review: %+v", second[0])
 	}
-	if second[1].Role != "assistant" || second[1].Content.(string) != "rev2" {
-		t.Errorf("tail 1 position 1 should be the first redraft rev2: %+v", second[1])
+	if second[1].Role != "user" || !strings.Contains(second[1].Content.(string), "Revisão do superego") {
+		t.Errorf("tail 1 position 1 should be the round-1 critique: %+v", second[1])
+	}
+	if second[2].Role != "assistant" || second[2].Content.(string) != "rev2" {
+		t.Errorf("tail 1 position 2 should be the first redraft rev2: %+v", second[2])
+	}
+	if second[3].Role != "user" || !strings.Contains(second[3].Content.(string), "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+		t.Errorf("tail 1 position 3 should be the round-2 tagged draft-under-review: %+v", second[3])
 	}
 }
 
@@ -345,10 +370,10 @@ func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
 			anthropic.NewToolResultBlock("t-orig", "resultados", false)}},
 	}
 
-	text, held := gov.GovernOutput(context.Background(), 0, messages, draft, rd.fn)
+	text := gov.GovernOutput(context.Background(), 0, messages, "", draft, rd.fn, (&finalizer{}).fn)
 
-	if held || text != "rev2 com evidência" {
-		t.Fatalf("GovernOutput = (%q, %v), want the approved redraft", text, held)
+	if text != "rev2 com evidência" {
+		t.Fatalf("GovernOutput = %q, want the approved redraft", text)
 	}
 	if len(co.gotMessages) != 2 {
 		t.Fatalf("superego reviewed %d times, want 2", len(co.gotMessages))
@@ -394,7 +419,7 @@ func TestActiveSuperego_logsGateAndDecisions(t *testing.T) {
 		&log,
 	)
 
-	gov.GovernOutput(context.Background(), 0, govMessages(), draft, (&redrafter{}).fn)
+	gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 
 	out := log.String()
 	// The gate line: active_superego facet, primary path, gateWouldFire true.
@@ -422,8 +447,102 @@ func TestActiveSuperego_panicFailsOpen(t *testing.T) {
 	})
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus"})
 
-	text, held := gov.GovernOutput(context.Background(), 0, govMessages(), draft, (&redrafter{}).fn)
-	if text != draft || held {
-		t.Errorf("panic must fail open to the original draft: text=%q held=%v", text, held)
+	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	if text != draft {
+		t.Errorf("panic must fail open to the original draft: text=%q", text)
+	}
+}
+
+// TestActiveSuperego_spentLadderFinalRound locks in change #3: when the round cap
+// is reached with a residual revise, the ladder is spent and the EGO (the core),
+// not the superego, authors the final message. The core is handed the ephemeral
+// tail closed by the deterministic finalRoundInstruction and its text is
+// delivered WITHOUT any further superego review; hold_ask_human is gone entirely.
+func TestActiveSuperego_spentLadderFinalRound(t *testing.T) {
+	const draft = "rascunho original"
+	const coreFinal = "Vini, fiquei insegura sobre um ponto e não consegui resolver sozinha."
+	gov, _, co := newTestGovernor(
+		[]scriptStep{gateFires(), gateFires(), gateFires(), gateFires()},
+		[]scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise")},
+		nil,
+	)
+	rd := &redrafter{drafts: []string{"rev2", "rev3", "rev4"}}
+	fin := &finalizer{text: coreFinal}
+
+	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
+
+	// The delivered text is the core's own final message, verbatim.
+	if text != coreFinal {
+		t.Errorf("delivered text = %q, want the core-authored final message %q", text, coreFinal)
+	}
+	// Authored by the core exactly once, with NO superego review after it: four
+	// revise rounds reviewed, then finalize — never a fifth review.
+	if fin.calls != 1 {
+		t.Errorf("finalize called %d times, want 1", fin.calls)
+	}
+	if co.calls != 4 {
+		t.Errorf("superego reviewed %d times, want 4 (no review follows the final round)", co.calls)
+	}
+	if rd.calls != 3 {
+		t.Errorf("redraft called %d times, want 3 (rounds 1-3; round 4 authors the final message)", rd.calls)
+	}
+	// The finalize tail ends with the deterministic final-round instruction as a
+	// user message (the core reads it to author the impasse message).
+	if len(fin.tails) != 1 {
+		t.Fatalf("finalize handed %d tails, want 1", len(fin.tails))
+	}
+	tail := fin.tails[0]
+	if len(tail) == 0 {
+		t.Fatal("finalize tail is empty")
+	}
+	last := tail[len(tail)-1]
+	lastContent, _ := last.Content.(string)
+	if last.Role != "user" || lastContent != finalRoundInstruction() {
+		t.Errorf("finalize tail must end with the deterministic final-round instruction, got role=%q content=%q", last.Role, lastContent)
+	}
+	// The tail replays the tagged draft-under-review facts (change #2), but the
+	// delivered final text must never carry the tag markers (ephemeral only).
+	if !messagesContain(tail, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+		t.Errorf("finalize tail missing the tagged draft-under-review facts: %+v", tail)
+	}
+	if strings.Contains(text, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+		t.Errorf("tag markers leaked into the delivered final text: %q", text)
+	}
+	// Change #3: the hold_ask_human verdict is gone from the valid set entirely.
+	if validVerdicts["hold_ask_human"] {
+		t.Error("hold_ask_human is still a valid verdict; it must be removed")
+	}
+}
+
+// TestActiveSuperego_digestReachesReview locks in change #1: the turn's ephemeral
+// tone digest is forwarded into the superego's review context (same block the
+// core saw), injected as a user message just before the draft-under-review so the
+// draft stays the superego's final focus.
+func TestActiveSuperego_digestReachesReview(t *testing.T) {
+	const draft = "rascunho original"
+	const digest = "<<<TOM_DA_CONVERSA_INICIO>>>\n- usuário ansioso\n<<<TOM_DA_CONVERSA_FIM>>>"
+	gov, _, co := newTestGovernor(
+		[]scriptStep{gateFires()},
+		[]scriptStep{superegoVerdictStep("approve")},
+		nil,
+	)
+
+	gov.GovernOutput(context.Background(), 0, govMessages(), digest, draft, (&redrafter{}).fn, (&finalizer{}).fn)
+
+	if len(co.gotMessages) != 1 {
+		t.Fatalf("superego reviewed %d times, want 1", len(co.gotMessages))
+	}
+	review := co.gotMessages[0]
+	if !messagesContain(review, "TOM_DA_CONVERSA") {
+		t.Errorf("tone digest did not reach the superego review context: %+v", review)
+	}
+	// The draft-under-review always closes the array; the digest precedes it.
+	last := review[len(review)-1]
+	lastContent, _ := last.Content.(string)
+	if last.Role != "user" || !strings.Contains(lastContent, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+		t.Errorf("draft-under-review must stay the final message: %+v", last)
+	}
+	if strings.Contains(lastContent, "TOM_DA_CONVERSA") {
+		t.Errorf("digest must be a separate message before the draft, not fused into it: %q", lastContent)
 	}
 }

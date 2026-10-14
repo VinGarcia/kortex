@@ -70,8 +70,9 @@ package differs — `proxy` versus `session`.
   `session.OutputGovernor`: it gates the core's draft (output evaluator →
   deterministic gate) and, on a gate hit, runs the superego ladder
   (`ReviewDraft`, up to `DefaultLadderRounds` rounds) — approve delivers
-  the draft, `hold_ask_human` delivers a hold-and-ask message instead,
-  `revise` feeds the critique back to the core for a redraft. The active
+  the draft, `revise` feeds the critique back to the core for a redraft; a
+  residual `revise` at the round cap spends the ladder and hands the core the
+  final message to author in its own words, with no further review. The active
   governor reviews from the core's OWN message array — the identical
   `[]anthropic.Message` the core consumed this turn, `tool_use`/`tool_result`
   blocks and all, with only the turn under review reframed as a draft-user

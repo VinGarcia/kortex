@@ -99,18 +99,16 @@ func draftUnderReviewMessage(paragraphs []string, tags []ParagraphAnnotation) st
 
 // activeDraftMessage renders the draft-under-review for the active loop: the
 // deterministic draftUnderReviewMessage, prefixed with the ladder round number
-// and the annotations from previous rounds. The superego prompt expects both
-// (it is told "the review round number (1 to 4) and the annotations from
-// previous rounds"), and the round number is what enforces the 3+1 contract —
-// revise only in rounds 1-3, hold-and-ask only in round 4. prior is the
-// critiques of the earlier rounds in order; empty on round 1. The header is
-// deterministic (fixed strings), never model-generated.
+// and the annotations from previous rounds. The superego prompt reads the round
+// number to see the revision progress; its verdict is always approve or revise
+// (there is no hold — when the round cap is reached with a residual revise the
+// ladder is spent and the core authors the final message, see
+// ActiveSuperego.GovernOutput). prior is the critiques of the earlier rounds in
+// order; empty on round 1. The header is deterministic (fixed strings), never
+// model-generated.
 func activeDraftMessage(paragraphs []string, tags []ParagraphAnnotation, round int, prior []SuperegoCritique) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Rodada de revisão: %d de 4.\n", round)
-	if round >= 4 {
-		b.WriteString("Esta é a última rodada: você só pode APROVAR ou RETER-E-PERGUNTAR-AO-HUMANO (hold_ask_human); não emita novas anotações de revisão.\n")
-	}
+	fmt.Fprintf(&b, "Rodada de revisão: %d.\n", round)
 	if len(prior) > 0 {
 		b.WriteString("\nAnotações das rodadas anteriores (o rascunho abaixo já tentou incorporá-las):\n")
 		for i, crit := range prior {

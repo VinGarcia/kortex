@@ -54,8 +54,9 @@ type ToneDigester interface {
 // SYNCHRONOUSLY before the turn's final assistant/result events are emitted and
 // decides the text to deliver. Given the core's draft, it runs the blocking
 // evaluate→review→revise ladder and returns the governed text (an approved
-// draft, a later redraft, or — when held is true — a hold-and-ask message
-// delivered instead of the draft).
+// draft, a later redraft, or — when the ladder is spent — a core-authored final
+// message explaining the impasse). It never holds a reply: superego aconselha,
+// ego decide.
 //
 // messages is the core's OWN conversation array for this turn, EXCLUDING the
 // final assistant draft (passed separately as draft): the exact
@@ -64,16 +65,26 @@ type ToneDigester interface {
 // draft re-enters the review as a draft-user message inside the facet, the one
 // preserved asymmetry (#4354).
 //
+// ephemeralDigest is the turn's tone digest — the SAME ephemeral block injected
+// into the core's own call (never persisted, never emitted) — forwarded so the
+// superego judges against the user's emotional tone as well as the draft's own
+// output tags. "" when no digest is wired.
+//
 // redraft lets the governor ask the CORE model for a new draft, given an
-// ephemeral message tail (the rejected drafts and the superego critiques)
-// appended to the turn's canonical messages; that tail is never persisted and
-// never emitted. Alongside the new text, redraft returns the message blocks the
-// redraft itself appended while acting — its own tool_use/tool_result traffic,
-// EXCLUDING the redraft's draft (#4753 lets a redraft act) — so the governor can
-// fold that evidence into the review view before re-reviewing; the superego must
-// see what a redraft gathered, or it keeps rejecting the redraft for the very
-// facts it just verified. This interface is defined here with an inline func
-// type and only shared types (context/anthropic), so facet.ActiveSuperego
+// ephemeral message tail (the rejected drafts, the superego critiques, and each
+// critique's tagged draft) appended to the turn's canonical messages; that tail
+// is never persisted and never emitted. Alongside the new text, redraft returns
+// the message blocks the redraft itself appended while acting — its own
+// tool_use/tool_result traffic, EXCLUDING the redraft's draft (#4753 lets a
+// redraft act) — so the governor can fold that evidence into the review view
+// before re-reviewing; the superego must see what a redraft gathered, or it
+// keeps rejecting the redraft for the very facts it just verified.
+//
+// finalize lets the governor ask the CORE model for the final message when the
+// ladder is spent: it is handed the ephemeral tail (ending with the governor's
+// deterministic final-round instruction) and returns the text to deliver, with
+// NO tools and NO further review. This interface is defined here with inline
+// func types and only shared types (context/anthropic), so facet.ActiveSuperego
 // satisfies it structurally without session importing facet. A nil
 // Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
 type OutputGovernor interface {
@@ -81,9 +92,11 @@ type OutputGovernor interface {
 		ctx context.Context,
 		turnIndex int,
 		messages []anthropic.Message,
+		ephemeralDigest string,
 		draft string,
 		redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
-	) (text string, held bool)
+		finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+	) (text string)
 }
 
 // maxLineBytes bounds one NDJSON input line. The default bufio.Scanner cap
@@ -353,20 +366,23 @@ func runTurn(
 	priorUserTexts []string,
 	userText string,
 ) ([]anthropic.Message, *history.Turn, error) {
+	// The ephemeral tone digest is computed once per turn and shared: it is
+	// injected as the last item of the core's context (EphemeralContext below) and
+	// forwarded to the governor so the superego reviews against the same tone
+	// signal (governTurn → GovernOutput). It draws from priorUserTexts, not
+	// priorTurns, so it stays independent of the governor's turn view, and it is
+	// never persisted.
+	digest := toneDigest(cfg, priorUserTexts, userText)
 	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
-		Model:       cfg.Model,
-		System:      systemPrompt,
-		MaxTokens:   cfg.MaxTokens,
-		Effort:      cfg.Effort,
-		History:     msgs,
-		UserMessage: userText,
-		CallTimeout: cfg.LoopCallTimeout,
-		Emitter:     emitter,
-		// The ephemeral tone digest is injected as the last item of the core's
-		// context for this turn and never persisted (see toneDigest). It draws from
-		// priorUserTexts, not priorTurns, so it stays independent of the governor's
-		// turn view.
-		EphemeralContext: toneDigest(cfg, priorUserTexts, userText),
+		Model:            cfg.Model,
+		System:           systemPrompt,
+		MaxTokens:        cfg.MaxTokens,
+		Effort:           cfg.Effort,
+		History:          msgs,
+		UserMessage:      userText,
+		CallTimeout:      cfg.LoopCallTimeout,
+		Emitter:          emitter,
+		EphemeralContext: digest,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
 		DeferFinal: cfg.Governor != nil,
@@ -389,7 +405,7 @@ func runTurn(
 	finalText := res.FinalText
 	finalMessages := res.Messages
 	if cfg.Governor != nil {
-		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, res)
+		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, res, digest)
 		if govErr != nil {
 			return nil, nil, govErr
 		}
@@ -501,6 +517,18 @@ func toolCallsFromMessages(messages []anthropic.Message) []history.ToolCall {
 	return calls
 }
 
+// redraftBoundedCtx derives a child context bounded by the redraft timeout
+// (Config.RedraftTimeout, or DefaultRedraftTimeout when unset/non-positive).
+// Both the redraft tool loop and the spent-ladder finalize call share this bound
+// so a hung or runaway core call can never block the turn.
+func redraftBoundedCtx(ctx context.Context, cfg Config) (context.Context, context.CancelFunc) {
+	redraftTimeout := cfg.RedraftTimeout
+	if redraftTimeout <= 0 {
+		redraftTimeout = DefaultRedraftTimeout
+	}
+	return context.WithTimeout(ctx, redraftTimeout)
+}
+
 // governTurn runs the active superego loop over the deferred final draft and
 // emits the delivered turn. It returns the delivered text, the canonical
 // messages to persist, and the tool calls the loop's redrafts executed (for the
@@ -516,6 +544,7 @@ func governTurn(
 	systemPrompt string,
 	priorTurns []history.Turn,
 	res tools.LoopResult,
+	ephemeralDigest string,
 ) (string, []anthropic.Message, []history.ToolCall, error) {
 	turnIndex := len(priorTurns)
 	// reviewMessages is the core's OWN conversation array for this turn, minus the
@@ -551,11 +580,7 @@ func governTurn(
 	var redraftUsage anthropic.Usage
 	var allRedraftCalls []history.ToolCall
 	redraft := func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error) {
-		redraftTimeout := cfg.RedraftTimeout
-		if redraftTimeout <= 0 {
-			redraftTimeout = DefaultRedraftTimeout
-		}
-		ctx, cancel := context.WithTimeout(ctx, redraftTimeout)
+		ctx, cancel := redraftBoundedCtx(ctx, cfg)
 		defer cancel()
 
 		// Clamp at the consumption point, like the RedraftTimeout floor above
@@ -652,6 +677,21 @@ func governTurn(
 		return text, nil, err
 	}
 
+	// finalize authors the turn's final message when the superego ladder is spent
+	// (a residual revise at the round cap): the core model writes an honest message
+	// to the user explaining the impasse, guided by the governor's deterministic
+	// final-round instruction that closes the tail. It is a plain text-only core
+	// call — no tools and no bounded-action guard-rail (this is not a revision, and
+	// no further review follows), bounded by RedraftTimeout like the redraft so a
+	// hung call can never block the turn. Its usage is accumulated into the same
+	// running total so the re-emitted result bills this call too; GovernOutput
+	// delivers its text verbatim and fails open to the best draft in hand on error.
+	finalize := func(ctx context.Context, tail []anthropic.Message) (string, error) {
+		ctx, cancel := redraftBoundedCtx(ctx, cfg)
+		defer cancel()
+		return textOnlyRedraft(ctx, cfg, systemPrompt, res.Messages, tail, &redraftUsage)
+	}
+
 	// The ladder below is the turn's one long silent span (model call after
 	// model call, nothing emitted), so a keepalive ticker brackets exactly it.
 	// stopKeepalive waits for the goroutine to exit before returning: the line
@@ -659,13 +699,14 @@ func governTurn(
 	// the terminal result. (The emitter serializes its own writes; data-race
 	// safety is its contract, not this caller's.)
 	stopKeepalive := startGovernorKeepalive(cfg, emitter)
-	// The held bool is intentionally not consumed here: when a turn is held,
-	// GovernOutput already returns the hold-and-ask text as finalText, which this
-	// seam delivers and persists like any other assistant turn (the facet log is
-	// where the hold decision is recorded). It is part of the port contract for
-	// callers that may want to signal a held turn differently; the native path
-	// does not.
-	finalText, _ := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, res.FinalText, redraft)
+	// GovernOutput returns the single text to deliver: the approved draft, a
+	// redraft, or — when the ladder is spent at the round cap with a residual
+	// revise — the core's own final message authored through finalize. The
+	// governor decides; this seam delivers and persists that text like any other
+	// assistant turn (superego aconselha, ego decide). ephemeralDigest carries the
+	// tone digest into the superego's review context (same digest the core saw,
+	// never persisted); finalize is the text-only core call for the final round.
+	finalText := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, ephemeralDigest, res.FinalText, redraft, finalize)
 	stopKeepalive()
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {

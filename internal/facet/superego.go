@@ -131,9 +131,9 @@ func (c *AnthropicConversant) Converse(ctx context.Context, system string, messa
 type SuperegoCritique struct {
 	TurnIndex int    `json:"turnIndex"`
 	Critique  string `json:"critique"`
-	// Verdict is "approve", "revise" or "hold_ask_human" when parsed; ""
-	// when the response carried no valid verdict object (the critique text
-	// is still retained — shadow mode never discards the model's judgment).
+	// Verdict is "approve" or "revise" when parsed; "" when the response
+	// carried no valid verdict object (the critique text is still retained —
+	// shadow mode never discards the model's judgment).
 	Verdict     string               `json:"verdict,omitempty"`
 	Annotations []SuperegoAnnotation `json:"annotations,omitempty"`
 	Why         string               `json:"why,omitempty"`
@@ -229,18 +229,30 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 // tool_use/tool_result blocks are carried verbatim, so the superego sees the
 // same evidence the core did.
 //
-// round is the ladder round (1-4), surfaced to the model alongside the prior
-// rounds' critiques so it honors the 3+1 contract (revise only in rounds 1-3,
-// hold only in round 4). ok is false (with a logged reason) only when the
-// review could not run at all (bad input, API error, timeout); the loop fails
-// open on false. A successful call with an unparseable verdict returns ok=true
-// and an empty Verdict — the loop treats that as fail-open too. draftParagraphs
-// and tags come from the SAME segmentation the evaluator committed to, so index
-// i tags paragraph i. The caller owns the context deadline.
+// ephemeralDigest is the turn's tone digest (the SAME block the core received
+// as ephemeral context): a signal about the INPUT — the user's emotions across
+// the conversation — complementary to the F2c output tags the superego already
+// sees interleaved on the draft. It is injected as one user message just BEFORE
+// the draft-under-review message so the draft stays the superego's final focus,
+// and it is EPHEMERAL exactly as in the core: appended to a clone, never
+// persisted, never emitted. "" injects nothing (the no-digest path).
+//
+// round is the ladder round, surfaced to the model alongside the prior rounds'
+// critiques so it sees the revision progress. Verdicts are approve/revise in
+// EVERY round (there is no hold): when the round cap is reached with a residual
+// revise, the ladder is spent and the core — not the superego — authors the
+// final message (see ActiveSuperego.GovernOutput). ok is false (with a logged
+// reason) only when the review could not run at all (bad input, API error,
+// timeout); the loop fails open on false. A successful call with an unparseable
+// verdict returns ok=true and an empty Verdict — the loop treats that as
+// fail-open too. draftParagraphs and tags come from the SAME segmentation the
+// evaluator committed to, so index i tags paragraph i. The caller owns the
+// context deadline.
 func (s *Superego) ReviewDraft(
 	ctx context.Context,
 	turnIndex int,
 	messages []anthropic.Message,
+	ephemeralDigest string,
 	round int,
 	prior []SuperegoCritique,
 	draftParagraphs []string,
@@ -252,9 +264,15 @@ func (s *Superego) ReviewDraft(
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	// The draft enters as the final user-role message; the core's array is the
-	// durable view, so it is cloned before the append and never mutated.
-	view := append(slices.Clone(messages), anthropic.Message{
+	// The core's array is the durable view, so it is cloned before any append and
+	// never mutated. The ephemeral tone digest (when present) enters as a user
+	// message before the draft; the draft itself always closes the array as the
+	// final user-role message (the one preserved asymmetry, #4354).
+	view := slices.Clone(messages)
+	if ephemeralDigest != "" {
+		view = append(view, anthropic.Message{Role: "user", Content: ephemeralDigest})
+	}
+	view = append(view, anthropic.Message{
 		Role:    "user",
 		Content: activeDraftMessage(draftParagraphs, tags, round, prior),
 	})
@@ -330,15 +348,13 @@ type superegoVerdict struct {
 // switch from drifting: a rename touches one place, and a typo in the loop is a
 // compile error instead of a silent fall-through to fail-open delivery.
 const (
-	VerdictApprove      = "approve"
-	VerdictRevise       = "revise"
-	VerdictHoldAskHuman = "hold_ask_human"
+	VerdictApprove = "approve"
+	VerdictRevise  = "revise"
 )
 
 var validVerdicts = map[string]bool{
-	VerdictApprove:      true,
-	VerdictRevise:       true,
-	VerdictHoldAskHuman: true,
+	VerdictApprove: true,
+	VerdictRevise:  true,
 }
 
 // parseSuperegoVerdict best-effort extracts the verdict object from the raw

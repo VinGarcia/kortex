@@ -25,36 +25,49 @@ import (
 // callback's result, so a test can prove the tail reaches the core model yet
 // never persists.
 type fakeGovernor struct {
-	gotDraft        string
-	gotTurnIndex    int
-	gotMessages     []anthropic.Message
-	deliver         string
-	held            bool
-	callRedraftWith []anthropic.Message
-	redraftResult   string
-	redraftMessages []anthropic.Message
+	gotDraft         string
+	gotTurnIndex     int
+	gotMessages      []anthropic.Message
+	gotDigest        string
+	deliver          string
+	callRedraftWith  []anthropic.Message
+	redraftResult    string
+	redraftMessages  []anthropic.Message
+	callFinalizeWith []anthropic.Message
+	finalizeResult   string
 }
 
 func (f *fakeGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
 	messages []anthropic.Message,
+	ephemeralDigest string,
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
-) (string, bool) {
+	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+) string {
 	f.gotDraft = draft
 	f.gotTurnIndex = turnIndex
 	f.gotMessages = messages
+	f.gotDigest = ephemeralDigest
 	if f.callRedraftWith != nil {
 		text, msgs, err := redraft(ctx, f.callRedraftWith)
 		if err != nil {
-			return draft, false
+			return draft
 		}
 		f.redraftResult = text
 		f.redraftMessages = msgs
-		return text, f.held
+		return text
 	}
-	return f.deliver, f.held
+	if f.callFinalizeWith != nil {
+		text, err := finalize(ctx, f.callFinalizeWith)
+		if err != nil {
+			return draft
+		}
+		f.finalizeResult = text
+		return text
+	}
+	return f.deliver
 }
 
 // sequencedResponder replies to each Messages API call with the next text in
@@ -86,6 +99,7 @@ type recordingGovernor struct {
 	turnIndices []int
 	messageLens []int
 	gotMessages [][]anthropic.Message
+	gotDigests  []string
 	deliver     string
 }
 
@@ -93,13 +107,16 @@ func (g *recordingGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
 	messages []anthropic.Message,
+	ephemeralDigest string,
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
-) (string, bool) {
+	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+) string {
 	g.turnIndices = append(g.turnIndices, turnIndex)
 	g.messageLens = append(g.messageLens, len(messages))
 	g.gotMessages = append(g.gotMessages, messages)
-	return g.deliver, false
+	g.gotDigests = append(g.gotDigests, ephemeralDigest)
+	return g.deliver
 }
 
 // messageText renders one message's content for substring assertions: a plain
@@ -119,8 +136,9 @@ func messageText(t *testing.T, m anthropic.Message) string {
 }
 
 // TestRun_ToneDigestInvisibleToGovernor locks in FIX 1: wiring the tone digest
-// must NOT change what the active superego/governor receives. The digest is
-// ephemeral — injected only into the core's single API call via
+// must NOT change the governor's review ARRAY — it reaches the superego only via
+// the dedicated ephemeralDigest param (change #1), never fused into the messages.
+// The digest is ephemeral — injected into the core's single API call via
 // EphemeralContext and never written into res.Messages — so the governor's
 // review array (res.Messages minus the final draft) must be byte-for-byte the
 // same with or without the digest, and must never contain the digest block. The
@@ -182,12 +200,25 @@ func TestRun_ToneDigestInvisibleToGovernor(t *testing.T) {
 			}
 		}
 	}
-	// And the two runs are identical in the SIZE of what the governor saw: the
-	// digest is invisible to the superego.
+	// And the two runs are identical in the SIZE of what the governor saw in its
+	// review array: the digest is invisible to that array.
 	if !slices.Equal(withDigest.turnIndices, baseline.turnIndices) ||
 		!slices.Equal(withDigest.messageLens, baseline.messageLens) {
 		t.Errorf("digest changed governor input: with-digest (idx=%v lens=%v) vs baseline (idx=%v lens=%v)",
 			withDigest.turnIndices, withDigest.messageLens, baseline.turnIndices, baseline.messageLens)
+	}
+	// Change #1: the digest IS forwarded to the governor via its dedicated
+	// ephemeralDigest param on every turn — the same block the core saw — while the
+	// no-digest baseline forwards an empty string.
+	for turn, d := range withDigest.gotDigests {
+		if !strings.Contains(d, "TOM_DA_CONVERSA") {
+			t.Errorf("turn %d: wired digest did not reach the governor's ephemeralDigest param: %q", turn, d)
+		}
+	}
+	for turn, d := range baseline.gotDigests {
+		if d != "" {
+			t.Errorf("turn %d: no-digest baseline must forward an empty digest param, got %q", turn, d)
+		}
 	}
 }
 
@@ -330,11 +361,13 @@ func (g *slowGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
 	messages []anthropic.Message,
+	ephemeralDigest string,
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
-) (string, bool) {
+	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+) string {
 	time.Sleep(g.delay)
-	return g.deliver, false
+	return g.deliver
 }
 
 // TestRun_GovernorKeepaliveDuringLadder locks in the no-output-watchdog fix: a
@@ -944,23 +977,43 @@ func TestRun_ActiveGovernorEmptyRedraftFailsOpen(t *testing.T) {
 	}
 }
 
-// TestRun_ActiveGovernorHoldDeliversHoldMessage proves a held turn delivers the
-// governor's hold-and-ask text instead of the draft, and persists that text.
-func TestRun_ActiveGovernorHoldDeliversHoldMessage(t *testing.T) {
-	server, _ := sequencedResponder(t, "raw-draft")
+// TestRun_ActiveGovernorFinalizeAuthorsFinalMessage proves the spent-ladder final
+// round at the session seam (change #3): when the governor drives the finalize
+// callback, that callback makes a text-only CORE call carrying the ephemeral tail
+// (ending with the governor's final-round instruction) and the core-authored text
+// is delivered and persisted — the raw draft and the ephemeral tail never reach
+// the wire or canonical history.
+func TestRun_ActiveGovernorFinalizeAuthorsFinalMessage(t *testing.T) {
+	server, calls := sequencedResponder(t, "raw-draft", "core final message")
 	client := anthropic.NewClient("secret", server.URL, time.Second)
 	store := NewStore(t.TempDir())
-	gov := &fakeGovernor{deliver: "[kortex] held — como seguir?", held: true}
+	gov := &fakeGovernor{
+		callFinalizeWith: []anthropic.Message{{Role: "user", Content: "FINAL-ROUND-INSTRUCTION-TAIL"}},
+	}
 
 	var out strings.Builder
 	err := Run(context.Background(), Config{
 		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
 		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
 		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
-		Governor: gov,
+		RedraftTimeout: time.Second, Governor: gov,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+
+	// Two core calls: the initial draft and the finalize (text-only) call. The
+	// finalize call must carry the governor's instruction tail as its last message.
+	if len(*calls) != 2 {
+		t.Fatalf("core model calls = %d, want 2 (draft + finalize)", len(*calls))
+	}
+	finalizeMsgs := (*calls)[1]
+	last := finalizeMsgs[len(finalizeMsgs)-1]
+	if content, ok := last.Content.(string); !ok || !strings.Contains(content, "FINAL-ROUND-INSTRUCTION-TAIL") {
+		t.Errorf("finalize call did not carry the instruction tail as its last message: %+v", finalizeMsgs)
+	}
+	if gov.finalizeResult != "core final message" {
+		t.Errorf("finalize result = %q, want the core-authored final message", gov.finalizeResult)
 	}
 
 	var resultText string
@@ -969,10 +1022,27 @@ func TestRun_ActiveGovernorHoldDeliversHoldMessage(t *testing.T) {
 			resultText = ev.Result.Text
 		}
 	}
-	if resultText != "[kortex] held — como seguir?" {
-		t.Errorf("held turn delivered %q, want the hold-and-ask message", resultText)
+	if resultText != "core final message" {
+		t.Errorf("delivered result = %q, want the core-authored final message", resultText)
 	}
-	if strings.Contains(out.String(), "raw-draft") {
-		t.Errorf("held turn leaked the draft onto the wire:\n%s", out.String())
+	// Neither the raw draft nor the ephemeral instruction tail may reach the wire.
+	if strings.Contains(out.String(), "raw-draft") || strings.Contains(out.String(), "FINAL-ROUND-INSTRUCTION-TAIL") {
+		t.Errorf("final round leaked the draft or the ephemeral tail onto the wire:\n%s", out.String())
+	}
+	// Persisted history carries only user + the delivered final message.
+	msgs, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("persisted %d messages, want 2 (user + final): %+v", len(msgs), msgs)
+	}
+	if content, ok := msgs[1].Content.(string); !ok || content != "core final message" {
+		t.Errorf("persisted final assistant = %+v, want the core-authored final message", msgs[1].Content)
+	}
+	for _, m := range msgs {
+		if content, ok := m.Content.(string); ok && strings.Contains(content, "FINAL-ROUND-INSTRUCTION-TAIL") {
+			t.Errorf("ephemeral final-round tail leaked into canonical history: %+v", m)
+		}
 	}
 }
