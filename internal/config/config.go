@@ -158,6 +158,24 @@ type Superego struct {
 	// (the single operational source). Keep it small: the redraft should resolve
 	// the specific finding, never open an unbounded tool loop.
 	RedraftToolBudget int `json:"redraftToolBudget"`
+	// DebateMetaMessage is an independent feature flag (default false = off):
+	// when true, the active-mode revision instruction invites the core to attach
+	// a delimited meta-message to its redraft that the superego READS but that
+	// never reaches the client and never persists (ephemeral like the rest of the
+	// ladder). It lets the two DEBATE a point — the core can argue, e.g., "I
+	// verified X via a tool, the critique is unfounded" — instead of only
+	// rewording. Only meaningful in mode "active"; harmless (inert) otherwise.
+	DebateMetaMessage bool `json:"debateMetaMessage"`
+	// CalibratedLeniency is an independent feature flag (default false = off):
+	// when true, the ACTIVE-mode superego review prompt gains two calibrations —
+	// (a) a standing instruction NOT to reject for an irrelevant reason (a false
+	// positive is costly), applied on every active review; and (b) on the LAST
+	// ladder round, an instruction to approve a draft that improved and is
+	// passable instead of seeking perfection (a residual revise there only spends
+	// the ladder and forces a worse impasse message). Scoped to mode "active"
+	// only: shadow mode is left uncalibrated so its log-only baseline critiques
+	// stay an honest, unbiased signal.
+	CalibratedLeniency bool `json:"calibratedLeniency"`
 }
 
 // Load reads and validates the config file at path.

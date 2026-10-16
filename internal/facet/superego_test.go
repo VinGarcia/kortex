@@ -208,10 +208,10 @@ func TestDraftUnderReviewMessage_noEmotionsOmitsAboutsBlock(t *testing.T) {
 	}
 }
 
-// TestSuperego_datedSystemPromptAdvancesWithClock proves the date line is
+// TestSuperego_reviewSystemPromptAdvancesWithClock proves the date line is
 // rendered per call, not captured at construction: a long-lived session whose
 // clock crosses midnight must hand the superego the NEW day on the next review.
-func TestSuperego_datedSystemPromptAdvancesWithClock(t *testing.T) {
+func TestSuperego_reviewSystemPromptAdvancesWithClock(t *testing.T) {
 	conversant := &fakeConversant{response: evalText("ok")}
 	days := []time.Time{
 		time.Date(2026, 10, 5, 23, 0, 0, 0, time.UTC),
@@ -233,6 +233,56 @@ func TestSuperego_datedSystemPromptAdvancesWithClock(t *testing.T) {
 	reviewAndWait(s, 0, snapshot, []string{"resposta"}, tags)
 	if !strings.HasSuffix(conversant.gotSys, "Data de hoje: 2026-10-06.") {
 		t.Errorf("second review system prompt = %q, want the advanced day", conversant.gotSys)
+	}
+}
+
+// TestSuperego_reviewSystemPrompt_calibratedLeniency locks in change #2: the
+// calibrated-leniency flag appends the leniency guidance to the ACTIVE review
+// system prompt (and the extra last-round block only on the final ladder round),
+// never to the shadow path, while the date line ALWAYS stays the final suffix
+// and the flag-off prompt is exactly base+date (what the other tests and the
+// temporal-claim logic depend on).
+func TestSuperego_reviewSystemPrompt_calibratedLeniency(t *testing.T) {
+	const base = "você é o superego"
+	const dateSuffix = "\n\nData de hoje: 2026-10-05."
+	tests := []struct {
+		desc              string
+		leniency          bool
+		active            bool
+		lastRound         bool
+		wantLeniency      bool
+		wantLastRound     bool
+		wantExactBaseDate bool
+	}{
+		{desc: "flag off, active: base + date only", leniency: false, active: true, wantExactBaseDate: true},
+		{desc: "flag off, active, lastRound ignored", leniency: false, active: true, lastRound: true, wantExactBaseDate: true},
+		{desc: "flag on, shadow (not active): no leniency", leniency: true, active: false, wantExactBaseDate: true},
+		{desc: "flag on, active, not last round: leniency only", leniency: true, active: true, wantLeniency: true},
+		{desc: "flag on, active, last round: leniency plus last-round block", leniency: true, active: true, lastRound: true, wantLeniency: true, wantLastRound: true},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			s := newTestSuperego(&fakeConversant{response: evalText("ok")}, nil)
+			s.calibratedLeniency = test.leniency
+
+			got := s.reviewSystemPrompt(test.active, test.lastRound)
+
+			if !strings.HasPrefix(got, base) {
+				t.Errorf("prompt must start with the base system prompt:\n%s", got)
+			}
+			if !strings.HasSuffix(got, dateSuffix) {
+				t.Errorf("date line must stay the final suffix:\n%s", got)
+			}
+			if test.wantExactBaseDate && got != base+dateSuffix {
+				t.Errorf("want exactly base+date, got:\n%q", got)
+			}
+			if gotLeniency := strings.Contains(got, leniencyGuidance); gotLeniency != test.wantLeniency {
+				t.Errorf("leniency guidance present = %v, want %v:\n%s", gotLeniency, test.wantLeniency, got)
+			}
+			if gotLast := strings.Contains(got, lastRoundLeniencyGuidance); gotLast != test.wantLastRound {
+				t.Errorf("last-round guidance present = %v, want %v:\n%s", gotLast, test.wantLastRound, got)
+			}
+		})
 	}
 }
 

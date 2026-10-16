@@ -213,12 +213,13 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 				return built, err
 			}
 			built.superego = facet.NewSuperego(facet.SuperegoParams{
-				Conversant:      facet.NewAnthropicConversant(client, model),
-				SystemPrompt:    systemPrompt,
-				Timeout:         timeout,
-				Model:           model,
-				MaxHistoryTurns: seCfg.MaxHistoryTurns,
-				LogSink:         logSink,
+				Conversant:         facet.NewAnthropicConversant(client, model),
+				SystemPrompt:       systemPrompt,
+				Timeout:            timeout,
+				Model:              model,
+				MaxHistoryTurns:    seCfg.MaxHistoryTurns,
+				CalibratedLeniency: seCfg.CalibratedLeniency,
+				LogSink:            logSink,
 			})
 		}
 		client, systemPrompt, timeout, err := buildFacetDeps("outputEvaluator", evalCfg.TokenEnv,
@@ -249,10 +250,11 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 	}
 	if active {
 		built.governor = facet.NewActiveSuperego(facet.ActiveSuperegoParams{
-			Evaluator: built.outputEvaluator,
-			Superego:  built.superego,
-			Model:     resolveSuperegoModel(seCfg.Model),
-			LogSink:   logSink,
+			Evaluator:         built.outputEvaluator,
+			Superego:          built.superego,
+			Model:             resolveSuperegoModel(seCfg.Model),
+			DebateMetaMessage: seCfg.DebateMetaMessage,
+			LogSink:           logSink,
 		})
 		// The redraft's bounded tool loop runs in the session (it owns the
 		// dispatcher/RunLoop); resolve the budget here and carry the concrete value

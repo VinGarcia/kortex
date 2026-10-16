@@ -33,8 +33,11 @@ type Superego struct {
 	timeout         time.Duration
 	model           string // logged with each call; the conversant owns the actual routing
 	maxHistoryTurns int
-	now             func() time.Time // injectable clock for the dated system prompt; time.Now in production
-	log             *facetLogger
+	// calibratedLeniency, when true, appends the leniency calibrations to the
+	// review system prompt (config.Superego.CalibratedLeniency, default off).
+	calibratedLeniency bool
+	now                func() time.Time // injectable clock for the dated system prompt; time.Now in production
+	log                *facetLogger
 
 	inFlight sync.WaitGroup
 	mu       sync.Mutex
@@ -45,15 +48,16 @@ type Superego struct {
 // required; a nil LogSink disables the structured facet log (the facet still
 // runs). The composition root owns opening/closing the sink. MaxHistoryTurns 0
 // means the whole history. Now is the clock behind the dated system prompt
-// (datedSystemPrompt); nil means time.Now — only tests set it.
+// (reviewSystemPrompt); nil means time.Now — only tests set it.
 type SuperegoParams struct {
-	Conversant      Conversant
-	SystemPrompt    string
-	Timeout         time.Duration
-	Model           string
-	MaxHistoryTurns int
-	Now             func() time.Time
-	LogSink         io.Writer
+	Conversant         Conversant
+	SystemPrompt       string
+	Timeout            time.Duration
+	Model              string
+	MaxHistoryTurns    int
+	CalibratedLeniency bool
+	Now                func() time.Time
+	LogSink            io.Writer
 }
 
 func NewSuperego(params SuperegoParams) *Superego {
@@ -62,14 +66,15 @@ func NewSuperego(params SuperegoParams) *Superego {
 		now = time.Now
 	}
 	return &Superego{
-		conversant:      params.Conversant,
-		systemPrompt:    params.SystemPrompt,
-		timeout:         params.Timeout,
-		model:           params.Model,
-		maxHistoryTurns: params.MaxHistoryTurns,
-		now:             now,
-		log:             &facetLogger{sink: params.LogSink},
-		turns:           map[int]SuperegoCritique{},
+		conversant:         params.Conversant,
+		systemPrompt:       params.SystemPrompt,
+		timeout:            params.Timeout,
+		model:              params.Model,
+		maxHistoryTurns:    params.MaxHistoryTurns,
+		calibratedLeniency: params.CalibratedLeniency,
+		now:                now,
+		log:                &facetLogger{sink: params.LogSink},
+		turns:              map[int]SuperegoCritique{},
 	}
 }
 
@@ -204,7 +209,9 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 	defer cancel()
 
 	messages := superegoMessages(snapshot, turnIndex, draftUnderReviewMessage(draftParagraphs, tags), s.maxHistoryTurns)
-	critique, entry, err := s.converse(ctx, turnIndex, 0, messages)
+	// Shadow mode is NOT active (active=false): calibrated leniency never shapes the
+	// log-only baseline critiques, and there is no last-round leniency to apply.
+	critique, entry, err := s.converse(ctx, turnIndex, 0, false, false, messages)
 	s.log.record(entry)
 	if err != nil {
 		return
@@ -237,6 +244,20 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 // and it is EPHEMERAL exactly as in the core: appended to a clone, never
 // persisted, never emitted. "" injects nothing (the no-digest path).
 //
+// coreMeta is the core's debate meta-message attached to the draft under review
+// (the DebateMetaMessage feature; the governor extracts and strips it from the
+// redraft before this call). When non-empty it is injected as one user message
+// right before the draft-under-review message — alongside the tagged draft, but
+// not fused into it so the draft stays the final focus — letting the core argue
+// a point to the superego. EPHEMERAL exactly like the digest: appended to a
+// clone, never persisted, never emitted. "" injects nothing (the common path,
+// and the only path when the feature is off).
+//
+// lastRound is true on the final ladder round (the last review the superego
+// runs this turn): with calibrated leniency on it switches the review prompt to
+// its lenient variant (approve a passable, improved draft rather than seek
+// perfection). Always false on the shadow path.
+//
 // round is the ladder round, surfaced to the model alongside the prior rounds'
 // critiques so it sees the revision progress. Verdicts are approve/revise in
 // EVERY round (there is no hold): when the round cap is reached with a residual
@@ -253,7 +274,9 @@ func (s *Superego) ReviewDraft(
 	turnIndex int,
 	messages []anthropic.Message,
 	ephemeralDigest string,
+	coreMeta string,
 	round int,
+	lastRound bool,
 	prior []SuperegoCritique,
 	draftParagraphs []string,
 	tags []ParagraphAnnotation,
@@ -265,18 +288,22 @@ func (s *Superego) ReviewDraft(
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 	// The core's array is the durable view, so it is cloned before any append and
-	// never mutated. The ephemeral tone digest (when present) enters as a user
-	// message before the draft; the draft itself always closes the array as the
-	// final user-role message (the one preserved asymmetry, #4354).
+	// never mutated. The ephemeral tone digest and the core's debate meta-message
+	// (each when present) enter as user messages before the draft; the draft
+	// itself always closes the array as the final user-role message (the one
+	// preserved asymmetry, #4354).
 	view := slices.Clone(messages)
 	if ephemeralDigest != "" {
 		view = append(view, anthropic.Message{Role: "user", Content: ephemeralDigest})
+	}
+	if coreMeta != "" {
+		view = append(view, anthropic.Message{Role: "user", Content: coreDebateMessage(coreMeta)})
 	}
 	view = append(view, anthropic.Message{
 		Role:    "user",
 		Content: activeDraftMessage(draftParagraphs, tags, round, prior),
 	})
-	critique, entry, err := s.converse(ctx, turnIndex, round, view)
+	critique, entry, err := s.converse(ctx, turnIndex, round, true, lastRound, view)
 	s.log.record(entry)
 	if err != nil {
 		return SuperegoCritique{}, false
@@ -288,9 +315,14 @@ func (s *Superego) ReviewDraft(
 // the log entry, shared by the shadow (Review) and active (ReviewDraft) paths.
 // It never records the entry itself — the caller does, after deciding what
 // else to do with the result. round 0 means the shadow path (no ladder round).
-func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
+// active is true only on the blocking ladder (ReviewDraft) and false on the
+// shadow path (Review); it gates calibrated leniency so the leniency calibration
+// never touches shadow-mode baseline critiques. lastRound switches the review
+// prompt to its lenient variant on the final ladder round (both only when
+// calibrated leniency is on; see reviewSystemPrompt).
+func (s *Superego) converse(ctx context.Context, turnIndex int, round int, active bool, lastRound bool, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
 	start := time.Now()
-	eval, err := s.conversant.Converse(ctx, s.datedSystemPrompt(), messages)
+	eval, err := s.conversant.Converse(ctx, s.reviewSystemPrompt(active, lastRound), messages)
 	entry := callLog{
 		Facet:           superegoFacet,
 		Model:           s.model,
@@ -320,19 +352,77 @@ func (s *Superego) converse(ctx context.Context, turnIndex int, round int, messa
 	return critique, entry, nil
 }
 
-// datedSystemPrompt returns the superego system prompt with today's date
-// appended as one deterministic line (fixed formatting, never
-// model-generated). The superego judges temporal claims in the reviewed draft
-// — publication dates, identifiers that encode a date (e.g. arXiv YYMM) — and
-// without an anchored "today" it falls back to its own training cutoff,
-// misjudging genuinely recent facts as impossible futures. The date is
-// rendered per call, so a long-lived session never carries a stale day, and
-// deliberately in the process's LOCAL zone: kortex runs on the user's own
-// machine, so local time IS the user's "today" — the day the superego must
-// judge temporal claims against (a fixed UTC would be a day behind the user
-// every evening west of it).
-func (s *Superego) datedSystemPrompt() string {
-	return s.systemPrompt + "\n\nData de hoje: " + s.now().Format("2006-01-02") + "."
+// reviewSystemPrompt returns the superego system prompt, optionally extended
+// with the calibrated-leniency guidance, and always closed by today's date as
+// one deterministic line.
+//
+// The date line is rendered per call (fixed formatting, never model-generated)
+// and kept as the FINAL suffix: the superego judges temporal claims in the
+// reviewed draft — publication dates, identifiers that encode a date (e.g.
+// arXiv YYMM) — and without an anchored "today" it falls back to its own
+// training cutoff, misjudging genuinely recent facts as impossible futures.
+// Rendering it per call means a long-lived session never carries a stale day,
+// and deliberately in the process's LOCAL zone: kortex runs on the user's own
+// machine, so local time IS the user's "today" (a fixed UTC would be a day
+// behind the user every evening west of it).
+//
+// When calibratedLeniency is on (config.Superego.CalibratedLeniency, default
+// off) AND this is an active-mode review (active=true), the leniencyGuidance
+// block is inserted before the date: it curbs false-positive rejections (Vini
+// #4749 — the cost of blocking a sound draft for an irrelevant reason is high).
+// On the final ladder round (lastRound) it additionally inserts
+// lastRoundLeniencyGuidance: the next revise would spend the ladder and hand
+// authorship to the core's impasse message, so a passable draft that genuinely
+// improved should be approved rather than held out for perfection. Leniency is
+// scoped to active mode so it never calibrates the shadow-mode log-only
+// baseline critiques. The blocks go BEFORE the date so the date stays the suffix
+// the other paths (and tests) rely on.
+func (s *Superego) reviewSystemPrompt(active bool, lastRound bool) string {
+	prompt := s.systemPrompt
+	if s.calibratedLeniency && active {
+		prompt += leniencyGuidance
+		if lastRound {
+			prompt += lastRoundLeniencyGuidance
+		}
+	}
+	return prompt + "\n\nData de hoje: " + s.now().Format("2006-01-02") + "."
+}
+
+// leniencyGuidance calibrates the superego against false-positive rejections
+// (config.Superego.CalibratedLeniency). Appended to the review system prompt on
+// every round when the flag is on.
+const leniencyGuidance = "\n\n" +
+	"Calibração de rigor: rejeitar um rascunho correto por um motivo irrelevante " +
+	"tem custo alto — atrasa a resposta ao usuário e trata um acerto como erro. " +
+	"Só peça revisão por um problema real e relevante para esta conversa: algo " +
+	"que o usuário notaria e que prejudica a resposta (erro factual, promessa não " +
+	"cumprida, tom inadequado, risco concreto). Não bloqueie por preferência " +
+	"estilística, por formatação menor, nem por detalhe que não muda o que o " +
+	"usuário recebe. Na dúvida entre um problema real e um incômodo irrelevante, aprove."
+
+// lastRoundLeniencyGuidance adds extra leniency on the final ladder round
+// (config.Superego.CalibratedLeniency). Appended after leniencyGuidance only
+// when lastRound is true.
+const lastRoundLeniencyGuidance = "\n\n" +
+	"Esta é a última rodada de revisão deste turno: se pedir revisão agora, o " +
+	"núcleo não terá outra chance de corrigir e a resposta final será redigida sob " +
+	"impasse, tipicamente pior para o usuário do que este rascunho. Portanto, se o " +
+	"rascunho melhorou em relação às rodadas anteriores e já está aceitável — mesmo " +
+	"sem estar perfeito —, aprove. Reserve a revisão nesta rodada para um problema " +
+	"grave que seja claramente pior entregar do que o impasse."
+
+// coreDebateMessage frames the core's debate meta-message
+// (config.Superego.DebateMetaMessage) as one user-role message for the review.
+// The core attaches this note to its draft to argue a point directly to the
+// superego — for example that a critique is unfounded because it already
+// verified the fact with a tool. The note is addressed to the reviewer only: it
+// is ephemeral (never persisted, never delivered to the client) and is framed
+// here as the core's own voice so the superego weighs the argument without
+// confusing it for part of the draft under review.
+func coreDebateMessage(meta string) string {
+	return "Nota do núcleo para a revisão (não faz parte do rascunho, não vai ao " +
+		"usuário) — um argumento do autor sobre este rascunho, a ser considerado no " +
+		"seu julgamento:\n\n" + meta
 }
 
 // superegoVerdict is the JSON object of the superego prompt contract.

@@ -439,7 +439,7 @@ func TestActiveSuperego_logsGateAndDecisions(t *testing.T) {
 func TestActiveSuperego_panicFailsOpen(t *testing.T) {
 	const draft = "rascunho original"
 	eval := NewOutputEvaluator(OutputEvaluatorParams{
-		Evaluator: &scriptedEvaluator{steps: []scriptStep{gateFires()}},
+		Evaluator:    &scriptedEvaluator{steps: []scriptStep{gateFires()}},
 		SystemPrompt: "avalie", Timeout: time.Second, Model: "haiku", GateMinInvestment: 4,
 	})
 	se := NewSuperego(SuperegoParams{
@@ -511,6 +511,202 @@ func TestActiveSuperego_spentLadderFinalRound(t *testing.T) {
 	// Change #3: the hold_ask_human verdict is gone from the valid set entirely.
 	if validVerdicts["hold_ask_human"] {
 		t.Error("hold_ask_human is still a valid verdict; it must be removed")
+	}
+}
+
+// metaDraft wraps a user-facing text with a core debate note using the exact
+// convention the core is instructed to follow. Single-newline separators keep
+// the whole draft one paragraph so the single-tag scripted evaluator segments it
+// identically whether or not the note is stripped — the feature under test is
+// the stripping, not the segmentation.
+func metaDraft(userText string, note string) string {
+	return userText + "\n" + coreMetaOpen + "\n" + note + "\n" + coreMetaClose
+}
+
+// metaInstructionMarker is a distinctive phrase of metaUsageInstruction, used to
+// detect the note-usage convention in a tail WITHOUT matching the bare delimiter
+// (which an unstripped draft-under-review also carries when the feature is off).
+const metaInstructionMarker = "nota apenas para quem revisa"
+
+// TestActiveSuperego_debateMetaMessage locks in change #1 of this pass: when the
+// DebateMetaMessage feature is on, the core's reviewer-only note is stripped from
+// the delivered text (never reaches the client) and fed to the review as the
+// core's own framed voice; when the feature is off the draft is delivered
+// verbatim and no framed note is injected.
+func TestActiveSuperego_debateMetaMessage(t *testing.T) {
+	const userText = "resposta ao usuário"
+	const note = "já confirmei o PR #4749 com a ferramenta; a crítica seria infundada"
+	const framing = "Nota do núcleo para a revisão"
+	draft := metaDraft(userText, note)
+
+	t.Run("on: note stripped from delivery and framed into the review", func(t *testing.T) {
+		gov, _, co := newTestGovernor([]scriptStep{gateFires()}, []scriptStep{superegoVerdictStep("approve")}, nil)
+		gov.debateMetaMessage = true
+
+		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+
+		if text != userText {
+			t.Errorf("delivered text = %q, want the draft with the note stripped (%q)", text, userText)
+		}
+		if strings.Contains(text, coreMetaOpen) || strings.Contains(text, note) {
+			t.Errorf("the debate note leaked into the delivered text: %q", text)
+		}
+		review := co.gotMessages[0]
+		if !messagesContain(review, framing) || !messagesContain(review, note) {
+			t.Errorf("the framed core note did not reach the review: %+v", review)
+		}
+		// The note is a message BEFORE the draft; the draft-under-review still closes
+		// the array and carries no note fused into it.
+		last := review[len(review)-1]
+		lastContent, _ := last.Content.(string)
+		if last.Role != "user" || !strings.Contains(lastContent, "<<<RASCUNHO_SOB_REVISAO_INICIO>>>") {
+			t.Errorf("draft-under-review must stay the final message: %+v", last)
+		}
+		if strings.Contains(lastContent, note) {
+			t.Errorf("note must be a separate message, not fused into the draft: %q", lastContent)
+		}
+	})
+
+	t.Run("off: draft delivered verbatim and no framed note injected", func(t *testing.T) {
+		gov, _, co := newTestGovernor([]scriptStep{gateFires()}, []scriptStep{superegoVerdictStep("approve")}, nil)
+
+		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+
+		if text != draft {
+			t.Errorf("feature off must deliver the draft verbatim, got %q", text)
+		}
+		if messagesContain(co.gotMessages[0], framing) {
+			t.Errorf("feature off must not inject the framed core note: %+v", co.gotMessages[0])
+		}
+	})
+}
+
+// TestActiveSuperego_debateMetaRedraftPath proves the note travels the redraft
+// path: the redraft instruction carries the usage convention (delimiters) only
+// when the feature is on, each round's note is stripped before delivery, and the
+// note is per-draft (round 2 sees the redraft's note, not round 1's).
+func TestActiveSuperego_debateMetaRedraftPath(t *testing.T) {
+	const user1, note1 = "primeira resposta", "argumento do núcleo na rodada 1"
+	const user2, note2 = "segunda resposta", "argumento do núcleo na rodada 2"
+	draft := metaDraft(user1, note1)
+	redraft2 := metaDraft(user2, note2)
+
+	t.Run("on: usage instruction in the tail, redraft note stripped and per-draft", func(t *testing.T) {
+		gov, _, co := newTestGovernor(
+			[]scriptStep{gateFires(), gateFires()},
+			[]scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("approve")},
+			nil,
+		)
+		gov.debateMetaMessage = true
+		rd := &redrafter{drafts: []string{redraft2}}
+
+		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, (&finalizer{}).fn)
+
+		if text != user2 {
+			t.Errorf("delivered redraft = %q, want the note stripped (%q)", text, user2)
+		}
+		if strings.Contains(text, coreMetaOpen) || strings.Contains(text, note2) {
+			t.Errorf("the redraft note leaked into the delivered text: %q", text)
+		}
+		if len(rd.tails) != 1 {
+			t.Fatalf("redraft handed %d tails, want 1", len(rd.tails))
+		}
+		if !messagesContain(rd.tails[0], metaInstructionMarker) || !messagesContain(rd.tails[0], coreMetaOpen) {
+			t.Errorf("redraft tail must carry the note-usage convention when the feature is on: %+v", rd.tails[0])
+		}
+		// Round 1 saw the original draft's note; round 2 saw the redraft's note; each
+		// review carries only its own draft's note (the note is per-draft).
+		if !messagesContain(co.gotMessages[0], note1) || messagesContain(co.gotMessages[0], note2) {
+			t.Errorf("round 1 review must carry note1 only: %+v", co.gotMessages[0])
+		}
+		if !messagesContain(co.gotMessages[1], note2) || messagesContain(co.gotMessages[1], note1) {
+			t.Errorf("round 2 review must carry note2 only: %+v", co.gotMessages[1])
+		}
+	})
+
+	t.Run("off: no usage instruction in the tail", func(t *testing.T) {
+		gov, _, _ := newTestGovernor(
+			[]scriptStep{gateFires(), gateFires()},
+			[]scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("approve")},
+			nil,
+		)
+		rd := &redrafter{drafts: []string{redraft2}}
+
+		gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, (&finalizer{}).fn)
+
+		if len(rd.tails) != 1 {
+			t.Fatalf("redraft handed %d tails, want 1", len(rd.tails))
+		}
+		if messagesContain(rd.tails[0], metaInstructionMarker) {
+			t.Errorf("feature off must not add the note-usage convention to the tail: %+v", rd.tails[0])
+		}
+	})
+}
+
+// TestSplitCoreMeta covers the hardened stripping (change #1): it must remove
+// EVERY well-formed note span (not only the first), join their contents, and
+// sweep any unpaired stray delimiter token so no internal marker can ever survive
+// into the delivered reply. When no marker is present the draft is returned
+// unchanged with an empty note.
+func TestSplitCoreMeta(t *testing.T) {
+	tests := []struct {
+		desc         string
+		draft        string
+		wantStripped string
+		wantMeta     string
+	}{
+		{
+			desc:         "no marker: draft unchanged, empty note",
+			draft:        "resposta simples ao usuário",
+			wantStripped: "resposta simples ao usuário",
+			wantMeta:     "",
+		},
+		{
+			desc:         "single well-formed span",
+			draft:        "olá" + "\n" + coreMetaOpen + "\nargumento\n" + coreMetaClose,
+			wantStripped: "olá",
+			wantMeta:     "argumento",
+		},
+		{
+			desc:         "two well-formed spans are both stripped and joined",
+			draft:        coreMetaOpen + "\nprimeira\n" + coreMetaClose + "\ntexto ao usuário\n" + coreMetaOpen + "\nsegunda\n" + coreMetaClose,
+			wantStripped: "texto ao usuário",
+			wantMeta:     "primeira\n\nsegunda",
+		},
+		{
+			desc:         "stray open with no close is swept from the delivered text",
+			draft:        "resposta " + coreMetaOpen + " cauda",
+			wantStripped: "resposta  cauda",
+			wantMeta:     "",
+		},
+		{
+			desc:         "stray close with no open is swept from the delivered text",
+			draft:        "resposta " + coreMetaClose + " cauda",
+			wantStripped: "resposta  cauda",
+			wantMeta:     "",
+		},
+		{
+			desc:         "well-formed span plus a trailing stray open: note kept, stray swept",
+			draft:        coreMetaOpen + "\nnota\n" + coreMetaClose + "\ntexto\n" + coreMetaOpen + "\nsem fim",
+			wantStripped: "texto\n\nsem fim",
+			wantMeta:     "nota",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			stripped, meta := splitCoreMeta(test.draft)
+			if stripped != test.wantStripped {
+				t.Errorf("stripped = %q, want %q", stripped, test.wantStripped)
+			}
+			if meta != test.wantMeta {
+				t.Errorf("meta = %q, want %q", meta, test.wantMeta)
+			}
+			// Invariant: no internal delimiter token may ever survive into the
+			// delivered text, regardless of how malformed the input was.
+			if strings.Contains(stripped, coreMetaOpen) || strings.Contains(stripped, coreMetaClose) {
+				t.Errorf("a delimiter token leaked into the stripped text: %q", stripped)
+			}
+		})
 	}
 }
 

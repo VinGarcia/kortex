@@ -125,7 +125,7 @@ func reviewBait(t *testing.T, s *Superego, priorTurns []history.Turn, reviewUser
 	t.Helper()
 	turnIndex := len(priorTurns)
 	messages := append(turnsToMessages(priorTurns), anthropic.Message{Role: "user", Content: reviewUserText})
-	critique, ok := s.ReviewDraft(context.Background(), turnIndex, messages, "", 1, nil, []string{baitDraft}, baitTags)
+	critique, ok := s.ReviewDraft(context.Background(), turnIndex, messages, "", "", 1, false, nil, []string{baitDraft}, baitTags)
 	if !ok {
 		t.Fatalf("ReviewDraft failed (API error or malformed context); critique: %+v", critique)
 	}
@@ -180,7 +180,7 @@ func TestSuperegoLive_ToolVerifiedFactIsNotFlagged(t *testing.T) {
 		{Role: "user", Content: []anthropic.ToolResultBlock{
 			anthropic.NewToolResultBlock("gh-1", "CI / build (pull_request) ... pass\n142 tests, 142 passed", false)}},
 	}
-	critique, ok := s.ReviewDraft(context.Background(), 0, messages, "", 1, nil, []string{draft}, tags)
+	critique, ok := s.ReviewDraft(context.Background(), 0, messages, "", "", 1, false, nil, []string{draft}, tags)
 	if !ok {
 		t.Fatalf("ReviewDraft failed (API error or malformed context); critique: %+v", critique)
 	}
