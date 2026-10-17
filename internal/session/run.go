@@ -217,6 +217,16 @@ type Config struct {
 	// (e.g. a history save that failed after the turn already completed). It is
 	// never the stdout wire. Nil discards them.
 	Diag io.Writer
+	// InboundTap, when non-nil, receives one JSONL line per genuine inbound user
+	// message: the raw channel text exactly as OpenClaw sent it, captured BEFORE
+	// DecodeInbound strips the echo and composeInboundUserText rewrites it. It is
+	// the native-path audit trail for what the channel actually delivered — in a
+	// resumed session the inbound echo is otherwise discarded before any log, so
+	// there is no record to diagnose against. The composition root owns the path
+	// (a sibling "<KORTEX_LOG>.native"-style file); Run reads no env. Only the
+	// channel text is written, never tokens/headers/auth (those never reach this
+	// seam). Nil is a no-op beyond a nil-check, so the no-log path is unchanged.
+	InboundTap io.Writer
 	// Annotator, when non-nil, rewrites each real user message before its turn
 	// runs (the input-annotator facet). Nil leaves the user text untouched.
 	Annotator Annotator
@@ -309,11 +319,17 @@ func Run(ctx context.Context, cfg Config) error {
 			if ev.IsReplay || ev.Message == nil {
 				continue
 			}
+			// Tap the raw channel text BEFORE any decode/rewrite: once
+			// DecodeInbound runs, a resumed session's echo is discarded and the
+			// exact bytes OpenClaw sent cannot be reconstructed from the forwarded
+			// text (see composeInboundUserText).
+			rawInbound := ev.Message.TextContent()
+			tapInbound(cfg.InboundTap, rawInbound)
 			// Decode OpenClaw's inbound echo and forward only the genuinely new
 			// message; the echo's discard-vs-bootstrap handling is keyed on
 			// len(msgs) == 0 (empty canonical history). See composeInboundUserText
 			// for the DIRETIVA #4803 rationale and the coupling of the two cases.
-			inbound := protocol.DecodeInbound(ev.Message.TextContent())
+			inbound := protocol.DecodeInbound(rawInbound)
 			userText := composeInboundUserText(inbound, len(msgs) == 0, cfg.Annotator)
 			// Observe-only: warn if the echo still looks un-stripped on a session
 			// with canonical history, which signals OpenClaw wire drift silently

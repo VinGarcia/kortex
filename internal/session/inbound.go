@@ -1,8 +1,10 @@
 package session
 
 import (
+	"encoding/json"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/vingarcia/kortex/internal/protocol"
 )
@@ -111,4 +113,34 @@ func inboundMetaLine(inbound protocol.Inbound) string {
 		return ""
 	}
 	return "[meta: " + strings.Join(parts, "; ") + "]"
+}
+
+// tapInbound appends one JSONL entry — a timestamp and the raw channel text —
+// to w for each genuine inbound user message, so a resumed session's inbound
+// echo (discarded before it reaches any other log) stays auditable. JSONL is
+// used, not the ".native" log's space-framed line shape, because the raw text is
+// routinely multi-line (the channel echo spans many lines); JSON escaping keeps
+// each inbound message on exactly one line. A nil w is the no-log path and does
+// nothing beyond the nil-check. A marshal error (never expected for a string
+// field) drops the entry rather than failing the turn: the tap is a diagnostic
+// aid, never load-bearing for the session. The content is the channel text only,
+// which carries no credential, so it is written verbatim (unlike the API client's
+// wire log, the inbound text has no Authorization header to redact).
+func tapInbound(w io.Writer, raw string) {
+	if w == nil {
+		return
+	}
+	line, err := json.Marshal(struct {
+		TS  string `json:"ts"`
+		Raw string `json:"raw"`
+	}{
+		TS:  time.Now().Format(time.RFC3339Nano),
+		Raw: raw,
+	})
+	if err != nil {
+		return
+	}
+	// json.Marshal never emits an interior newline for this struct, so appending
+	// one yields a single, self-delimiting JSONL record.
+	w.Write(append(line, '\n'))
 }

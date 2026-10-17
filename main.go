@@ -519,6 +519,17 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		}
 	}
 
+	// When KORTEX_LOG is set, tap the raw inbound channel text to a sibling
+	// "<KORTEX_LOG>.inbound" file, matching the ".native"/".facets" artifacts.
+	// The composition root owns the path (session reads no env); the open writer
+	// is injected into Run. A failed open degrades gracefully to no tap, never to
+	// a broken turn. Only the channel text is written — no tokens/headers/auth.
+	var inboundTap io.Writer
+	if tap := openInboundTap(getenv, stderr); tap != nil {
+		defer tap.Close()
+		inboundTap = tap
+	}
+
 	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
 
 	sessionID := nativeSessionID(argv, newUUIDv4)
@@ -542,12 +553,34 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		TurnEvaluator:           turnEvaluator,
 		Governor:                governor,
 		ToneDigester:            toneDigester,
+		InboundTap:              inboundTap,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// openInboundTap opens the "<KORTEX_LOG>.inbound" raw-inbound audit file for the
+// native path, mirroring the ".native" wire log's open (0600,
+// O_CREATE|O_WRONLY|O_APPEND). Reading KORTEX_LOG here keeps the path decision in
+// the composition root — session.Run receives only the opened writer and resolves
+// no path of its own. It returns an untyped nil (so a caller's `!= nil` check is
+// reliable) when KORTEX_LOG is unset — the no-log path, which must create no file
+// — or when the open fails, degrading to no tap with one stderr warning rather
+// than failing the session.
+func openInboundTap(getenv func(string) string, stderr io.Writer) io.WriteCloser {
+	logPath := getenv("KORTEX_LOG")
+	if logPath == "" {
+		return nil
+	}
+	f, err := os.OpenFile(logPath+".inbound", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintf(stderr, "kortex: inbound tap disabled: %v\n", err)
+		return nil
+	}
+	return f
 }
 
 // buildNativeDispatcher wires the tool dispatcher for the native path: the

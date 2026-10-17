@@ -188,6 +188,68 @@ func TestRunNative_guardsFailFast(t *testing.T) {
 	}
 }
 
+func TestOpenInboundTap(t *testing.T) {
+	t.Run("KORTEX_LOG unset creates no file and returns nil", func(t *testing.T) {
+		dir := t.TempDir()
+		getenv := func(string) string { return "" }
+		var stderr bytes.Buffer
+
+		if tap := openInboundTap(getenv, &stderr); tap != nil {
+			tap.Close()
+			t.Fatalf("openInboundTap must return nil when KORTEX_LOG is unset")
+		}
+		// No file: the no-log path must leave the filesystem untouched.
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("reading temp dir: %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("no-log path must create no file, found %d entries", len(entries))
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("no-log path must warn nothing, got: %s", stderr.String())
+		}
+	})
+
+	t.Run("KORTEX_LOG set opens sibling .inbound file 0600", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "kortex.log")
+		getenv := func(name string) string {
+			if name == "KORTEX_LOG" {
+				return logPath
+			}
+			return ""
+		}
+		var stderr bytes.Buffer
+
+		tap := openInboundTap(getenv, &stderr)
+		if tap == nil {
+			t.Fatalf("openInboundTap returned nil with KORTEX_LOG set; stderr: %s", stderr.String())
+		}
+		if _, err := tap.Write([]byte("hello\n")); err != nil {
+			t.Fatalf("writing to tap: %v", err)
+		}
+		if err := tap.Close(); err != nil {
+			t.Fatalf("closing tap: %v", err)
+		}
+
+		// Sibling naming and the exact perms the .native/.facets artifacts use.
+		info, err := os.Stat(logPath + ".inbound")
+		if err != nil {
+			t.Fatalf("stat .inbound file: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("inbound tap perms = %o, want 600", perm)
+		}
+		got, err := os.ReadFile(logPath + ".inbound")
+		if err != nil {
+			t.Fatalf("reading .inbound file: %v", err)
+		}
+		if string(got) != "hello\n" {
+			t.Errorf("inbound file content = %q, want %q", string(got), "hello\n")
+		}
+	})
+}
+
 func TestResolveNativeToken(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("  file-token\n"), 0o600); err != nil {
