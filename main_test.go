@@ -2,11 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/mcp"
+	"github.com/vingarcia/kortex/internal/session"
+	"github.com/vingarcia/kortex/internal/tools"
 )
 
 func TestMcpConfigPathFromArgv(t *testing.T) {
@@ -418,5 +429,140 @@ func TestBuildMCPClient(t *testing.T) {
 				t.Error("client = nil, want non-nil")
 			}
 		})
+	}
+}
+
+// bypassRecordingGovernor is a session.OutputGovernor that records whether it was
+// ever invoked (the draft and review array it saw) and otherwise delivers a fixed
+// text. A yield turn must bypass the governor entirely, so a non-empty gotDraft or
+// non-nil gotMessages after the run means the bypass failed.
+type bypassRecordingGovernor struct {
+	gotDraft    string
+	gotMessages []anthropic.Message
+	deliver     string
+}
+
+func (g *bypassRecordingGovernor) GovernOutput(
+	ctx context.Context,
+	turnIndex int,
+	messages []anthropic.Message,
+	ephemeralDigest string,
+	draft string,
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
+	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+) string {
+	g.gotDraft = draft
+	g.gotMessages = messages
+	return g.deliver
+}
+
+// wireResult is the subset of the stream-json terminal result line this test
+// asserts on. main may not import internal/protocol (it is not in main's
+// mayDependOn), so the integration test parses the wire JSON directly instead of
+// reusing the session package's protocol-typed helpers.
+type wireResult struct {
+	Type       string  `json:"type"`
+	IsError    bool    `json:"is_error"`
+	Result     string  `json:"result"`
+	StopReason *string `json:"stop_reason"`
+}
+
+// TestNativeSession_SessionsYieldBypassesGovernorAndEndsTurn is the end-to-end
+// (integration) half of the yield fix, placed at the main level because it wires a
+// real MCP-backed dispatcher: internal/session may not depend on internal/mcp
+// (see .go-arch-lint.yml — session's mayDependOn is protocol/tools/anthropic/
+// history), so a session-package test cannot build the mcp.Client this exercise
+// needs. main is the composition root and already depends on mcp/session/tools/
+// anthropic, so the full wiring belongs here.
+//
+// When the turn's only tool_use is a sessions_yield that the gateway answers with
+// {"status":"yielded"}, RunLoop ends the turn (LoopResult.Yielded) and runTurn must
+// SKIP the governor: a yield has no user-facing draft to review, and routing its
+// empty FinalText through the superego/EmitFinalTurn would do nothing useful and
+// trip the empty-text guard into a spurious error result. The round must still
+// close with exactly one success result (stop_reason end_turn), never the
+// governor's text and never an error.
+func TestNativeSession_SessionsYieldBypassesGovernorAndEndsTurn(t *testing.T) {
+	// The core model's only action this turn is to yield.
+	coreServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{}}],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer coreServer.Close()
+
+	// The MCP loopback answers the yield with the {"status":"yielded"} payload the
+	// real gateway returns.
+	mcpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"status\":\"yielded\"}"}],"isError":false}}`))
+	}))
+	defer mcpServer.Close()
+
+	client := anthropic.NewClient("secret", coreServer.URL, time.Second)
+	mcpClient := mcp.NewClient(mcp.ServerConfig{URL: mcpServer.URL}, nil)
+	dispatcher := tools.NewDispatcherWithMCP(mcpClient, []mcp.Tool{{Name: "sessions_yield"}})
+	gov := &bypassRecordingGovernor{deliver: "GOVERNED-TEXT-MUST-NOT-APPEAR"}
+
+	initialize := `{"type":"control_request","request_id":"req-1","request":{"subtype":"initialize","appendSystemPrompt":"sys"}}`
+	userMsg := `{"type":"user","session_id":"sess-1","message":{"role":"user","content":"do it then yield"}}`
+
+	uuidN := 0
+	newUUID := func() string {
+		uuidN++
+		return fmt.Sprintf("uuid-%d", uuidN)
+	}
+
+	var out strings.Builder
+	err := session.Run(context.Background(), session.Config{
+		Stdin:      strings.NewReader(initialize + "\n" + userMsg + "\n"),
+		Stdout:     &out,
+		Client:     client,
+		Dispatcher: dispatcher,
+		Store:      session.NewStore(t.TempDir()),
+		SessionID:  "sess-1",
+		Model:      "m",
+		MaxTokens:  1024,
+		NewUUID:    newUUID,
+		Governor:   gov,
+	})
+	if err != nil {
+		t.Fatalf("session.Run: %v", err)
+	}
+
+	// The governor must never have been invoked: it records the draft and review
+	// array it saw, so a non-empty gotDraft or non-nil gotMessages means it ran.
+	if gov.gotDraft != "" || gov.gotMessages != nil {
+		t.Errorf("governor ran on a yield turn (draft=%q, messages=%+v); it must be bypassed", gov.gotDraft, gov.gotMessages)
+	}
+
+	var results []wireResult
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var res wireResult
+		if err := json.Unmarshal([]byte(line), &res); err != nil {
+			continue
+		}
+		if res.Type == "result" {
+			results = append(results, res)
+		}
+	}
+	if len(results) != 1 {
+		t.Fatalf("want exactly 1 terminal result, got %d:\n%s", len(results), out.String())
+	}
+	res := results[0]
+	if res.IsError {
+		t.Errorf("yield closed with an error result: %q", res.Result)
+	}
+	if res.StopReason == nil || *res.StopReason != "end_turn" {
+		t.Errorf("result stop_reason = %v, want end_turn", res.StopReason)
+	}
+	if strings.Contains(res.Result, "GOVERNED-TEXT-MUST-NOT-APPEAR") {
+		t.Errorf("governed text leaked into a yield result: %q", res.Result)
 	}
 }

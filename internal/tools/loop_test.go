@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/mcp"
 )
 
 // TestRunLoop_bashRoundTrip simulates the F3a spike's observed sequence: the
@@ -355,6 +356,209 @@ func TestRunLoop_emptyEphemeralContextChangesNothing(t *testing.T) {
 	// Only the single user message: no extra trailing ephemeral message.
 	if len(sent) != 1 {
 		t.Fatalf("sent %d messages, want 1 (just the user turn, no ephemeral append)", len(sent))
+	}
+}
+
+// TestRunLoop_sessionsYieldEndsTurn proves the fix for the MaxTurns-kill bug: a
+// response whose ONLY tool_use is sessions_yield, executing to {"status":"yielded"},
+// ENDS the loop with a synthetic end_turn terminal instead of feeding the result
+// back and re-calling the model. Exactly one model call is made (no second call,
+// no spin to MaxTurns), the result reports end_turn and Yielded, and an empty
+// FinalText does NOT trip the empty-text guard.
+func TestRunLoop_sessionsYieldEndsTurn(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		// The model yields: a single sessions_yield tool_use, no text block.
+		w.Write([]byte(`{
+			"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}}],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 7, "output_tokens": 3}
+		}`))
+	}))
+	defer server.Close()
+
+	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: `{"status":"yielded"}`}}}}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+
+	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
+		Model:       "claude-fable-5",
+		MaxTokens:   1024,
+		UserMessage: "do the thing then yield",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error (a yield must end cleanly, not error): %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("want exactly 1 model call (the yield ends the turn), got %d", calls)
+	}
+	if fake.calledN != 1 {
+		t.Fatalf("want the yield executed exactly once, got %d", fake.calledN)
+	}
+	if !result.Yielded {
+		t.Error("result.Yielded = false, want true on a sessions_yield terminal")
+	}
+	if result.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q, want end_turn (the synthetic terminal)", result.StopReason)
+	}
+	if result.Turns != 1 {
+		t.Errorf("Turns = %d, want 1", result.Turns)
+	}
+	// Canonical history must stay valid: the assistant tool_use turn and the
+	// yield's tool_result are both appended (user turn + new user msg = the loop's
+	// usual shape), so the yield round is recorded and the tool_use is answered.
+	if last := result.Messages[len(result.Messages)-1]; last.Role != "user" {
+		t.Errorf("last message role = %q, want user (the yield tool_result)", last.Role)
+	}
+}
+
+// TestRunLoop_yieldMixedWithToolIsNotTerminal proves the yield-terminal path is
+// scoped to a LONE yield: when a response carries sessions_yield alongside another
+// tool_use, it is NOT treated as a terminal — both tools run and the loop continues
+// to a normal end_turn, exactly as before the fix.
+func TestRunLoop_yieldMixedWithToolIsNotTerminal(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			// A yield AND a bash call in the same turn: not a lone yield.
+			w.Write([]byte(`{
+				"content": [
+					{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}},
+					{"type":"tool_use","id":"toolu_b","name":"bash","input":{"command":"echo hi"},"caller":{"type":"direct"}}
+				],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 5, "output_tokens": 4}
+			}`))
+			return
+		}
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"done"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 2, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: `{"status":"yielded"}`}}}}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+
+	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
+		Model:       "m",
+		MaxTokens:   1024,
+		UserMessage: "yield plus a tool",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 model calls (mixed tools loop normally), got %d", calls)
+	}
+	if result.Yielded {
+		t.Error("result.Yielded = true, want false when the yield is not the lone tool_use")
+	}
+	if result.FinalText != "done" || result.StopReason != "end_turn" {
+		t.Errorf("unexpected result: %+v", result)
+	}
+}
+
+// TestRunLoop_loneYieldNotYieldedFallsThrough proves the result check gates the
+// terminal: a lone sessions_yield whose execution did NOT report "yielded" (an
+// error payload) is treated as an ordinary tool result — the loop feeds it back
+// and continues rather than ending the turn on a failure.
+func TestRunLoop_loneYieldNotYieldedFallsThrough(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 5, "output_tokens": 4}
+			}`))
+			return
+		}
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"recovered"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 2, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	// The yield comes back as a tool-level error, so isYieldedResult is false.
+	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: "error: yield refused"}}, IsError: true}}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+
+	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
+		Model:       "m",
+		MaxTokens:   1024,
+		UserMessage: "yield that fails",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 model calls (a failed yield loops normally), got %d", calls)
+	}
+	if result.Yielded {
+		t.Error("result.Yielded = true, want false when the yield result was not \"yielded\"")
+	}
+	if result.FinalText != "recovered" {
+		t.Errorf("FinalText = %q, want the follow-up turn's text", result.FinalText)
+	}
+}
+
+// TestRunLoop_loneYieldWrongStatusFallsThrough pins the exact status == "yielded"
+// match: a lone sessions_yield whose execution returns a clean, non-error payload
+// with a DIFFERENT status ("queued") must NOT end the turn. This guards against a
+// mutation that treats any successful sessions_yield result as terminal — only the
+// literal "yielded" status closes the loop.
+func TestRunLoop_loneYieldWrongStatusFallsThrough(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 5, "output_tokens": 4}
+			}`))
+			return
+		}
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"recovered"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 2, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	// A clean (non-error) payload whose status is NOT "yielded": isYieldedResult
+	// must return false, so the loop feeds the result back and keeps going.
+	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: `{"status":"queued"}`}}, IsError: false}}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+
+	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
+		Model:       "m",
+		MaxTokens:   1024,
+		UserMessage: "yield that is only queued",
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 model calls (a non-yielded status loops normally), got %d", calls)
+	}
+	if result.Yielded {
+		t.Error("result.Yielded = true, want false when status != \"yielded\"")
+	}
+	if result.FinalText != "recovered" {
+		t.Errorf("FinalText = %q, want the follow-up turn's text", result.FinalText)
 	}
 }
 

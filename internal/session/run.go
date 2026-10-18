@@ -420,7 +420,13 @@ func runTurn(
 
 	finalText := res.FinalText
 	finalMessages := res.Messages
-	if cfg.Governor != nil {
+	// A yield-terminal turn skips the governor entirely: the model ended the turn
+	// with a sessions_yield (no user-facing draft), RunLoop already emitted the full
+	// terminal round, and FinalText is legitimately empty — running the superego
+	// ladder over an empty draft would do nothing useful and would trip
+	// EmitFinalTurn's empty-text guard into a spurious error result. See
+	// tools.LoopResult.Yielded.
+	if cfg.Governor != nil && !res.Yielded {
 		governedText, governedMessages, redraftCalls, govErr := governTurn(ctx, cfg, emitter, systemPrompt, priorTurns, res, digest)
 		if govErr != nil {
 			return nil, nil, govErr
