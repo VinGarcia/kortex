@@ -88,6 +88,17 @@ func (e *StreamEmitter) toolResults(results []anthropic.ToolResultBlock) error {
 	return e.write(line)
 }
 
+// openClawSilentReplyToken is OpenClaw's sentinel for a deliberately silent
+// turn (its SILENT_REPLY_TOKEN). A terminal result whose text is this token is
+// accepted by OpenClaw's CLI backend as an intentional no-reply turn rather
+// than rejected as "CLI backend returned an empty response" — the rejection an
+// empty result text triggers whenever a reply is required — and OpenClaw's
+// reply normalization then suppresses the token, so nothing is delivered to the
+// user. kortex emits it on the yield-terminal path, whose final text is
+// legitimately empty (the turn paused to await events; the later resume carries
+// the real reply). See tools.LoopResult.Yielded.
+const openClawSilentReplyToken = "NO_REPLY"
+
 // result emits the terminal result line. The text is run through
 // StripToolMarkup (F3d slice-2a) to satisfy protocol.EmitResult's contract
 // that result text carry no raw tool-call markup.
@@ -95,8 +106,20 @@ func (e *StreamEmitter) result(res LoopResult, usage anthropic.Usage) error {
 	if e == nil {
 		return nil
 	}
+	text := StripToolMarkup(res.FinalText)
+	// A yield-terminal turn ends with no user-facing reply. Emitting empty
+	// result text here makes OpenClaw reject the whole (exit-0) turn as "CLI
+	// backend returned an empty response", surfacing a false "request failed" to
+	// the user on every subagent wait. Emit OpenClaw's silent-reply sentinel
+	// instead: the backend accepts the turn as an intentional no-reply, and
+	// delivery normalization suppresses the sentinel so no bogus message is sent.
+	// Only substitute when the text is genuinely empty, preserving any reply the
+	// model wrote alongside the yield.
+	if res.Yielded && strings.TrimSpace(text) == "" {
+		text = openClawSilentReplyToken
+	}
 	line, err := protocol.EmitResult(e.sessionID, protocol.Result{
-		Text:       StripToolMarkup(res.FinalText),
+		Text:       text,
 		NumTurns:   res.Turns,
 		StopReason: res.StopReason,
 	}, protocol.Usage(usage))

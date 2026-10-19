@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
+	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/protocol"
 )
 
@@ -243,6 +244,109 @@ func TestStreamEmitter_resultStripsToolMarkup(t *testing.T) {
 	}
 	if ev.Result.Text != "done " {
 		t.Errorf("result text = %q, want %q", ev.Result.Text, "done ")
+	}
+}
+
+// TestStreamEmitter_yieldedResultEmitsSilentToken proves the yield-terminal
+// path emits OpenClaw's silent-reply sentinel instead of empty result text, so
+// a yielded turn is accepted as an intentional no-reply rather than rejected as
+// "CLI backend returned an empty response". An empty-text non-yield result is
+// left empty (the sentinel is scoped to the yield path), and a yield that
+// carries real text keeps that text (the substitution is only for empty text).
+func TestStreamEmitter_yieldedResultEmitsSilentToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		res      LoopResult
+		wantText string
+	}{
+		{
+			name:     "empty yield gets the silent token",
+			res:      LoopResult{FinalText: "", StopReason: "end_turn", Turns: 1, Yielded: true},
+			wantText: openClawSilentReplyToken,
+		},
+		{
+			name:     "blank-only yield gets the silent token",
+			res:      LoopResult{FinalText: "   \n ", StopReason: "end_turn", Turns: 1, Yielded: true},
+			wantText: openClawSilentReplyToken,
+		},
+		{
+			name:     "yield with real text keeps that text",
+			res:      LoopResult{FinalText: "pausing now", StopReason: "end_turn", Turns: 1, Yielded: true},
+			wantText: "pausing now",
+		},
+		{
+			name:     "non-yield empty result stays empty",
+			res:      LoopResult{FinalText: "", StopReason: "end_turn", Turns: 1, Yielded: false},
+			wantText: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			emitter := NewStreamEmitter(&out, "sess-y", sequencedUUIDs())
+			if err := emitter.result(tc.res, anthropic.Usage{}); err != nil {
+				t.Fatalf("result emit error: %v", err)
+			}
+			ev := protocol.Parse(out.Bytes())
+			if ev.Result == nil {
+				t.Fatalf("parsed result nil: %s", out.String())
+			}
+			if ev.Result.Text != tc.wantText {
+				t.Errorf("result text = %q, want %q", ev.Result.Text, tc.wantText)
+			}
+			// The terminal result must stay a success subtype on the yield path —
+			// OpenClaw keys round failure on an "error"-prefixed subtype, and a yield
+			// is a clean turn, not a failure.
+			if ev.Subtype != "success" {
+				t.Errorf("result subtype = %q, want success", ev.Subtype)
+			}
+		})
+	}
+}
+
+// TestRunLoop_yieldEmitsSilentReplyTokenOnWire proves the whole yield-terminal
+// path, driven through RunLoop with an Emitter wired, writes a terminal result
+// line whose text is the silent-reply sentinel. This is the signal OpenClaw's
+// CLI backend reads as an intentional no-reply turn, which is what prevents the
+// false "request failed" on every subagent wait.
+func TestRunLoop_yieldEmitsSilentReplyTokenOnWire(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}}],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 7, "output_tokens": 3}
+		}`))
+	}))
+	defer server.Close()
+
+	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: `{"status":"yielded"}`}}}}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+
+	var out bytes.Buffer
+	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
+		Model:       "claude-fable-5",
+		MaxTokens:   1024,
+		UserMessage: "do the thing then yield",
+		Emitter:     NewStreamEmitter(&out, "sess-y", sequencedUUIDs()),
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+	if !result.Yielded {
+		t.Fatalf("result.Yielded = false, want true")
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	last := protocol.Parse(lines[len(lines)-1])
+	if last.Type != protocol.TypeResult || last.Result == nil {
+		t.Fatalf("last line is not a result: %s", lines[len(lines)-1])
+	}
+	if last.Result.Text != openClawSilentReplyToken {
+		t.Errorf("terminal result text = %q, want silent token %q", last.Result.Text, openClawSilentReplyToken)
+	}
+	if last.Subtype != "success" {
+		t.Errorf("terminal result subtype = %q, want success", last.Subtype)
 	}
 }
 
