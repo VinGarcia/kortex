@@ -186,6 +186,54 @@ func TestOutputEvaluator_failureModes(t *testing.T) {
 	}
 }
 
+// TestOutputEvaluator_retrySucceedsWithCorrectiveFeedback mirrors the
+// annotator's retry-success case (TestInterceptToBackend_retrySucceedsWithCorrectiveFeedback):
+// the first attempt returns the wrong COUNT of annotations (1 for a
+// 2-paragraph draft), and the retry — fed the corrective feedback — returns
+// a valid 2-element array. The draft must end up evaluated (metadata
+// retained, gate decision computed), not fail-open, and the facet log must
+// record 2 attempts.
+func TestOutputEvaluator_retrySucceedsWithCorrectiveFeedback(t *testing.T) {
+	evaluator := &fakeEvaluator{sequence: []Evaluation{
+		evalText(`[{"investment":4,"valence":"negativa","emotions":[]}]`), // count mismatch: 1 for 2
+		evalText(`[
+			{"investment":4,"valence":"negativa","emotions":[{"emotion":"recusa","level":4,"about":"não vou fazer isso"}]},
+			{"investment":0,"valence":"neutra","emotions":[]}
+		]`),
+	}}
+	var log bytes.Buffer
+	e := newTestOutputEvaluator(evaluator, &log)
+
+	evaluateAndWait(e, 0, "não vou fazer isso\n\nrodei o script, saiu verde")
+
+	if evaluator.calls != 2 {
+		t.Fatalf("evaluator calls = %d, want 2 (one retry)", evaluator.calls)
+	}
+	emotion, ok := e.TurnEmotions()[0]
+	if !ok {
+		t.Fatal("expected the retry to produce retained metadata, got none (fail-open)")
+	}
+	if emotion.Aggregate != (Aggregate{Investment: 4, Valence: "negativa"}) || !emotion.GateWouldFire {
+		t.Errorf("metadata from the corrected attempt = %+v", emotion)
+	}
+
+	if len(evaluator.gotUsers) != 2 {
+		t.Fatalf("recorded %d user messages, want 2", len(evaluator.gotUsers))
+	}
+	if strings.Contains(evaluator.gotUsers[0], "CORRECAO_OBRIGATORIA") {
+		t.Error("first attempt should not carry corrective feedback")
+	}
+	if !strings.Contains(evaluator.gotUsers[1], "CORRECAO_OBRIGATORIA") ||
+		!strings.Contains(evaluator.gotUsers[1], "EXATAMENTE 2 elementos") {
+		t.Errorf("retry missing corrective feedback:\n%s", evaluator.gotUsers[1])
+	}
+
+	entry := lastLogEntry(t, &log)
+	if entry["ok"] != true || entry["attempts"] != float64(2) {
+		t.Errorf("log entry = %v, want ok=true attempts=2", entry)
+	}
+}
+
 // TestOutputEvaluator_dispatchNeverBlocksOnSlowEvaluator is the
 // observability-mode guarantee: EvaluateCompletedTurn returns immediately
 // even when the model call is slower than the facet timeout, so the stdout

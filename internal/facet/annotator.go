@@ -144,29 +144,17 @@ func (a *InputAnnotator) annotateText(text string) (string, bool) {
 
 	start := time.Now()
 	userMessage := "<<<MENSAGEM_RECEBIDA_INICIO>>>\n" + numberParagraphs(paragraphs) + "\n<<<MENSAGEM_RECEBIDA_FIM>>>"
-	eval, err := a.evaluator.Evaluate(ctx, a.systemPrompt+segmentationContract(len(paragraphs)), userMessage)
+	annotations, eval, attempts, err := evaluateAnnotations(ctx, a.evaluator, a.systemPrompt+segmentationContract(len(paragraphs)), userMessage, len(paragraphs))
 	entry := callLog{
 		Facet:        inputAnnotatorFacet,
 		Model:        a.model,
 		LatencyMs:    time.Since(start).Milliseconds(),
 		Paragraphs:   len(paragraphs),
+		Attempts:     attempts,
 		StopReason:   eval.StopReason,
 		InputTokens:  eval.InputTokens,
 		OutputTokens: eval.OutputTokens,
 	}
-	if err != nil {
-		entry.Err = err.Error()
-		a.log.record(entry)
-		return "", false
-	}
-
-	jsonArray := extractJSONArray(eval.Text)
-	if jsonArray == "" {
-		entry.Err = "no JSON array in evaluator output"
-		a.log.record(entry)
-		return "", false
-	}
-	annotations, err := parseAnnotations(jsonArray, len(paragraphs))
 	if err != nil {
 		entry.Err = err.Error()
 		a.log.record(entry)
@@ -187,6 +175,7 @@ type callLog struct {
 	Model        string `json:"model"`
 	LatencyMs    int64  `json:"latencyMs,omitempty"`
 	Paragraphs   int    `json:"paragraphs,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
 	InputTokens  int    `json:"inputTokens,omitempty"`
 	OutputTokens int    `json:"outputTokens,omitempty"`
 	StopReason   string `json:"stopReason,omitempty"`

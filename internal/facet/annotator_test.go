@@ -21,18 +21,33 @@ type fakeEvaluator struct {
 	calls    int
 	gotSys   string
 	gotUser  string
+	// sequence, when non-nil, overrides response/err per call: call N (1-based)
+	// returns sequence[N-1]. Lets a test model "first attempt malformed, retry
+	// good". A call past the end reuses the last element. gotUsers records the
+	// user message of every call so a test can assert the retry carried the
+	// corrective feedback.
+	sequence []Evaluation
+	gotUsers []string
 }
 
 func (f *fakeEvaluator) Evaluate(ctx context.Context, system string, userMessage string) (Evaluation, error) {
 	f.calls++
 	f.gotSys = system
 	f.gotUser = userMessage
+	f.gotUsers = append(f.gotUsers, userMessage)
 	if f.delay > 0 {
 		select {
 		case <-ctx.Done():
 			return Evaluation{}, ctx.Err()
 		case <-time.After(f.delay):
 		}
+	}
+	if f.sequence != nil {
+		idx := f.calls - 1
+		if idx >= len(f.sequence) {
+			idx = len(f.sequence) - 1
+		}
+		return f.sequence[idx], nil
 	}
 	return f.response, f.err
 }
@@ -241,13 +256,17 @@ func TestInterceptToBackend_failOpen(t *testing.T) {
 	tests := []struct {
 		desc      string
 		evaluator *fakeEvaluator
+		// wantCalls: transport errors (api error, timeout) are not fixable by
+		// re-prompting, so they fail open after 1 call; malformed OUTPUT is
+		// retried once (annotationRetries), so 2 calls before fail-open.
+		wantCalls int
 	}{
-		{desc: "api error", evaluator: &fakeEvaluator{err: errors.New("anthropic: http 529")}},
-		{desc: "timeout", evaluator: &fakeEvaluator{delay: time.Minute, response: oneParagraphEval()}},
-		{desc: "no json array in output", evaluator: &fakeEvaluator{response: evalText("desculpa, não posso ajudar")}},
-		{desc: "malformed json array", evaluator: &fakeEvaluator{response: evalText(`[{"investment":`)}},
-		{desc: "count mismatch", evaluator: &fakeEvaluator{response: evalText(`[]`)}},
-		{desc: "schema violation", evaluator: &fakeEvaluator{response: evalText(`[{"investment":9,"valence":"neutra","emotions":[]}]`)}},
+		{desc: "api error", evaluator: &fakeEvaluator{err: errors.New("anthropic: http 529")}, wantCalls: 1},
+		{desc: "timeout", evaluator: &fakeEvaluator{delay: time.Minute, response: oneParagraphEval()}, wantCalls: 1},
+		{desc: "no json array in output", evaluator: &fakeEvaluator{response: evalText("desculpa, não posso ajudar")}, wantCalls: 2},
+		{desc: "malformed json array", evaluator: &fakeEvaluator{response: evalText(`[{"investment":`)}, wantCalls: 2},
+		{desc: "count mismatch", evaluator: &fakeEvaluator{response: evalText(`[]`)}, wantCalls: 2},
+		{desc: "schema violation", evaluator: &fakeEvaluator{response: evalText(`[{"investment":9,"valence":"neutra","emotions":[]}]`)}, wantCalls: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
@@ -264,10 +283,49 @@ func TestInterceptToBackend_failOpen(t *testing.T) {
 			if elapsed := time.Since(start); elapsed > 5*time.Second {
 				t.Errorf("fail-open took %v; timeout not applied", elapsed)
 			}
-			if test.evaluator.calls != 1 {
-				t.Errorf("evaluator calls = %d, want 1", test.evaluator.calls)
+			if test.evaluator.calls != test.wantCalls {
+				t.Errorf("evaluator calls = %d, want %d", test.evaluator.calls, test.wantCalls)
 			}
 		})
+	}
+}
+
+func TestInterceptToBackend_retrySucceedsWithCorrectiveFeedback(t *testing.T) {
+	// The dominant production failure: the model returns the wrong COUNT of
+	// annotations (here 1 for a 2-paragraph message) on the first attempt.
+	// The retry must feed the error back and accept the corrected second
+	// attempt — turning a would-be fail-open passthrough into a real
+	// annotation.
+	evaluator := &fakeEvaluator{sequence: []Evaluation{
+		evalText(`[{"investment":2,"valence":"positiva","emotions":[]}]`), // count mismatch: 1 for 2
+		evalText(`[
+			{"investment":2,"valence":"positiva","emotions":[{"emotion":"alegria","level":2,"about":"novidade"}]},
+			{"investment":0,"valence":"neutra","emotions":[]}
+		]`),
+	}}
+	a := newTestAnnotator(evaluator)
+	line := `{"type":"user","message":{"role":"user","content":"boa novidade\n\nroda o script"},"uuid":"u-retry"}`
+
+	got := intercept(t, a, line)
+	if got == nil {
+		t.Fatal("expected the retry to annotate, got passthrough")
+	}
+	if evaluator.calls != 2 {
+		t.Fatalf("evaluator calls = %d, want 2 (one retry)", evaluator.calls)
+	}
+	if !strings.Contains(string(got), `boa novidade\n[emoções p1: investment=2 valence=positiva emotions=alegria(2)]`) {
+		t.Errorf("first paragraph not annotated from the corrected attempt:\n%s", got)
+	}
+	// The retry's user message must carry the corrective block; the first must not.
+	if len(evaluator.gotUsers) != 2 {
+		t.Fatalf("recorded %d user messages, want 2", len(evaluator.gotUsers))
+	}
+	if strings.Contains(evaluator.gotUsers[0], "CORRECAO_OBRIGATORIA") {
+		t.Error("first attempt should not carry corrective feedback")
+	}
+	if !strings.Contains(evaluator.gotUsers[1], "CORRECAO_OBRIGATORIA") ||
+		!strings.Contains(evaluator.gotUsers[1], "EXATAMENTE 2 elementos") {
+		t.Errorf("retry missing corrective feedback:\n%s", evaluator.gotUsers[1])
 	}
 }
 
@@ -306,7 +364,7 @@ func TestInputAnnotator_writesStructuredLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !success.OK || success.Facet != "input_annotator" || success.Model != "claude-haiku-4-5-20251001" ||
-		success.Paragraphs != 1 || success.Time == "" ||
+		success.Paragraphs != 1 || success.Time == "" || success.Attempts != 1 ||
 		success.InputTokens != 100 || success.OutputTokens != 20 || success.StopReason != "end_turn" {
 		t.Errorf("success entry: %+v", success)
 	}

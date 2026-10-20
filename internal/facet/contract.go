@@ -1,7 +1,9 @@
 package facet
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -120,6 +122,69 @@ func parseAnnotations(jsonArray string, expectedCount int) ([]ParagraphAnnotatio
 		}
 	}
 	return annotations, nil
+}
+
+// annotationRetries is how many EXTRA evaluator calls a facet makes after a
+// first attempt whose output failed validation (malformed JSON, count
+// mismatch, or schema violation). 1 means up to 2 total attempts. The real
+// failure mode observed in production is a count mismatch (the model returns
+// N±1 annotations for N paragraphs) with stop_reason end_turn — not
+// truncation — so a plain resend rarely helps; the retry feeds the exact
+// error back as a corrective instruction (see correctiveFeedback).
+const annotationRetries = 1
+
+// evaluateAnnotations runs the evaluator for one facet call and validates its
+// output into annotations, retrying up to annotationRetries times when the
+// VALIDATION fails. Each retry appends the previous attempt's error to the
+// user message as corrective feedback, so the model can fix a count mismatch
+// or malformed array instead of repeating it. A transport error (ctx
+// cancelled, API failure) is returned immediately without retry — those are
+// not fixable by re-prompting and the caller fails open. The returned
+// Evaluation is the LAST attempt's (its telemetry is what the caller logs);
+// attempts counts every evaluator call made (>=1), for the facet log.
+func evaluateAnnotations(ctx context.Context, ev Evaluator, system string, userMessage string, expectedCount int) (annotations []ParagraphAnnotation, lastEval Evaluation, attempts int, err error) {
+	user := userMessage
+	for {
+		attempts++
+		lastEval, err = ev.Evaluate(ctx, system, user)
+		if err != nil {
+			// Transport/timeout error: not fixable by re-prompting.
+			return nil, lastEval, attempts, err
+		}
+		annotations, err = validateEvaluation(lastEval.Text, expectedCount)
+		if err == nil {
+			return annotations, lastEval, attempts, nil
+		}
+		if attempts > annotationRetries {
+			return nil, lastEval, attempts, err
+		}
+		user = userMessage + correctiveFeedback(err, expectedCount)
+	}
+}
+
+// validateEvaluation extracts and validates the JSON array from one raw
+// evaluator response into annotations for expectedCount paragraphs. It is
+// the shared body behind every facet's parse step (the annotator and the
+// output evaluator validate identically).
+func validateEvaluation(rawText string, expectedCount int) ([]ParagraphAnnotation, error) {
+	jsonArray := extractJSONArray(rawText)
+	if jsonArray == "" {
+		return nil, errors.New("no JSON array in evaluator output")
+	}
+	return parseAnnotations(jsonArray, expectedCount)
+}
+
+// correctiveFeedback renders the previous attempt's validation error as a
+// terse instruction appended to the retry's user message. It names the exact
+// contract the model broke (the dominant failure is the count mismatch) so
+// the retry is a correction, not a blind resend.
+func correctiveFeedback(err error, expectedCount int) string {
+	return fmt.Sprintf("\n\n<<<CORRECAO_OBRIGATORIA>>>\n"+
+		"A tentativa anterior foi rejeitada: %s.\n"+
+		"Retorne APENAS o array JSON com EXATAMENTE %d elementos (um por parágrafo [P<i>], na ordem), "+
+		"cada um com investment inteiro 0-5, valence em {positiva,negativa,mista,neutra}, e emotions "+
+		"(lista, possivelmente vazia). Nenhuma prosa fora do array.\n"+
+		"<<<FIM_CORRECAO>>>", err.Error(), expectedCount)
 }
 
 // annotationLine renders one paragraph's annotation in the exact format the

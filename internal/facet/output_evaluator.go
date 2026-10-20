@@ -141,30 +141,18 @@ func (e *OutputEvaluator) EvaluateDraft(ctx context.Context, turnIndex int, draf
 
 	start := time.Now()
 	userMessage := "<<<RESPOSTA_PROPOSTA_INICIO>>>\n" + numberParagraphs(paragraphs) + "\n<<<RESPOSTA_PROPOSTA_FIM>>>"
-	eval, err := e.evaluator.Evaluate(ctx, e.systemPrompt+segmentationContract(len(paragraphs)), userMessage)
+	annotations, eval, attempts, err := evaluateAnnotations(ctx, e.evaluator, e.systemPrompt+segmentationContract(len(paragraphs)), userMessage, len(paragraphs))
 	entry := callLog{
 		Facet:        outputEvaluatorFacet,
 		Model:        e.model,
 		TurnIndex:    &turnIndex,
 		LatencyMs:    time.Since(start).Milliseconds(),
 		Paragraphs:   len(paragraphs),
+		Attempts:     attempts,
 		StopReason:   eval.StopReason,
 		InputTokens:  eval.InputTokens,
 		OutputTokens: eval.OutputTokens,
 	}
-	if err != nil {
-		entry.Err = err.Error()
-		e.log.record(entry)
-		return DraftEvaluation{}, false
-	}
-
-	jsonArray := extractJSONArray(eval.Text)
-	if jsonArray == "" {
-		entry.Err = "no JSON array in evaluator output"
-		e.log.record(entry)
-		return DraftEvaluation{}, false
-	}
-	annotations, err := parseAnnotations(jsonArray, len(paragraphs))
 	if err != nil {
 		entry.Err = err.Error()
 		e.log.record(entry)
