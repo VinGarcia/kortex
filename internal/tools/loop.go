@@ -48,8 +48,12 @@ func isYieldedResult(result anthropic.ToolResultBlock) bool {
 // giving up. This is a safety cap against a runaway loop (a model that
 // keeps calling tools without ever reaching end_turn), not an expected
 // depth — most tool-loop turns in the workloads F3b targets (crons, git,
-// scripts) resolve in a handful of calls.
-const DefaultMaxTurns = 25
+// scripts) resolve in a handful of calls. Raised 25->100 (2026-10-21, Vini):
+// 25 was killing legitimate long turns (multi-step implementation in-session)
+// recurrently; the kill was a serious recurring bug. 100 keeps the runaway
+// guard while giving real deep turns room. A refined finalize-on-budget path
+// for the core turn is deferred to a background run.
+const DefaultMaxTurns = 100
 
 // DefaultCallTimeout is the per-call deadline RunLoop uses when
 // LoopRequest.CallTimeout is 0. The core client carries no HTTP timeout, so a
