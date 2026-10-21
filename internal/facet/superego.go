@@ -211,7 +211,9 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 	messages := superegoMessages(snapshot, turnIndex, draftUnderReviewMessage(draftParagraphs, tags), s.maxHistoryTurns)
 	// Shadow mode is NOT active (active=false): calibrated leniency never shapes the
 	// log-only baseline critiques, and there is no last-round leniency to apply.
-	critique, entry, err := s.converse(ctx, turnIndex, 0, false, false, messages)
+	// loopID "" because shadow mode is one critique, not a ladder loop (see
+	// callLog.LoopID's doc comment in annotator.go).
+	critique, entry, err := s.converse(ctx, turnIndex, "", 0, false, false, messages)
 	s.log.record(entry)
 	if err != nil {
 		return
@@ -225,6 +227,12 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 // Unlike Review (shadow, async, fire-and-forget, log-only), this is the
 // active-loop primitive: the caller is the blocking core↔superego loop and
 // consumes the verdict to decide approve/revise/hold.
+//
+// loopID is the caller's stable identifier for the whole ladder loop this
+// round belongs to (minted once per ActiveSuperego.GovernOutput call); it is
+// logged verbatim on this call's callLog entry (callLog.LoopID) so every
+// round of one loop groups together at read time, and threaded through
+// unchanged — this facet never generates or inspects it.
 //
 // messages is the core's OWN conversation array for this turn — the exact
 // []anthropic.Message the core consumed, EXCLUDING the final assistant draft
@@ -272,6 +280,7 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 func (s *Superego) ReviewDraft(
 	ctx context.Context,
 	turnIndex int,
+	loopID string,
 	messages []anthropic.Message,
 	ephemeralDigest string,
 	coreMeta string,
@@ -282,7 +291,7 @@ func (s *Superego) ReviewDraft(
 	tags []ParagraphAnnotation,
 ) (SuperegoCritique, bool) {
 	if len(draftParagraphs) == 0 || len(draftParagraphs) != len(tags) {
-		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, Round: round, Err: fmt.Sprintf("draft/tags mismatch: %d paragraphs, %d tags", len(draftParagraphs), len(tags))})
+		s.log.record(callLog{Facet: superegoFacet, Model: s.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Err: fmt.Sprintf("draft/tags mismatch: %d paragraphs, %d tags", len(draftParagraphs), len(tags))})
 		return SuperegoCritique{}, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
@@ -303,7 +312,7 @@ func (s *Superego) ReviewDraft(
 		Role:    "user",
 		Content: activeDraftMessage(draftParagraphs, tags, round, prior),
 	})
-	critique, entry, err := s.converse(ctx, turnIndex, round, true, lastRound, view)
+	critique, entry, err := s.converse(ctx, turnIndex, loopID, round, true, lastRound, view)
 	s.log.record(entry)
 	if err != nil {
 		return SuperegoCritique{}, false
@@ -315,18 +324,21 @@ func (s *Superego) ReviewDraft(
 // the log entry, shared by the shadow (Review) and active (ReviewDraft) paths.
 // It never records the entry itself — the caller does, after deciding what
 // else to do with the result. round 0 means the shadow path (no ladder round).
+// loopID is copied verbatim onto the built entry's LoopID field ("" on the
+// shadow path, since it is not a ladder loop).
 // active is true only on the blocking ladder (ReviewDraft) and false on the
 // shadow path (Review); it gates calibrated leniency so the leniency calibration
 // never touches shadow-mode baseline critiques. lastRound switches the review
 // prompt to its lenient variant on the final ladder round (both only when
 // calibrated leniency is on; see reviewSystemPrompt).
-func (s *Superego) converse(ctx context.Context, turnIndex int, round int, active bool, lastRound bool, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
+func (s *Superego) converse(ctx context.Context, turnIndex int, loopID string, round int, active bool, lastRound bool, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
 	start := time.Now()
 	eval, err := s.conversant.Converse(ctx, s.reviewSystemPrompt(active, lastRound), messages)
 	entry := callLog{
 		Facet:           superegoFacet,
 		Model:           s.model,
 		TurnIndex:       &turnIndex,
+		LoopID:          loopID,
 		Round:           round,
 		LatencyMs:       time.Since(start).Milliseconds(),
 		HistoryMessages: len(messages),

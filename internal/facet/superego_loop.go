@@ -61,6 +61,11 @@ type ActiveSuperego struct {
 	// (ReviewDraft/coreDebateMessage), and strips before delivery/persistence.
 	debateMetaMessage bool
 	log               *facetLogger
+	// conflicts is the Part 1 sub-item 3 producer (conflicts_log.go): one
+	// JSONL line per ladder loop (whatever its outcome — see
+	// recordConflicts), to a file separate from log. A nil sink inside it
+	// (ActiveSuperegoParams.ConflictsLogSink left unset) makes it a no-op.
+	conflicts *conflictsLogger
 }
 
 // ActiveSuperegoParams wires an ActiveSuperego. Evaluator and Superego are
@@ -74,6 +79,12 @@ type ActiveSuperegoParams struct {
 	MaxRounds         int
 	DebateMetaMessage bool
 	LogSink           io.Writer
+	// ConflictsLogSink, when non-nil, enables the conflicts log (one JSONL
+	// line per ladder loop — see conflicts_log.go). Nil is a no-op: no file,
+	// no line, ever, matching every other optional/gated facet seam (e.g.
+	// AnnotatorParams.SessionTagsDir). The composition root owns opening/
+	// closing it, as a sibling of LogSink's file.
+	ConflictsLogSink io.Writer
 }
 
 // DefaultLadderRounds is the ladder cap: every round may approve or revise, and
@@ -101,6 +112,7 @@ func NewActiveSuperego(params ActiveSuperegoParams) *ActiveSuperego {
 		maxRounds:         maxRounds,
 		debateMetaMessage: params.DebateMetaMessage,
 		log:               &facetLogger{sink: params.LogSink},
+		conflicts:         &conflictsLogger{sink: params.ConflictsLogSink},
 	}
 }
 
@@ -165,24 +177,87 @@ func (a *ActiveSuperego) GovernOutput(
 	// Fail-open umbrella: a panic anywhere in the loop degrades to delivering
 	// the (already stripped) draft, never a crashed wire or a swallowed reply.
 	text = draft
+	// loopID groups every facet-log line this one GovernOutput call produces —
+	// this function's own lines plus the nested superego's per-round converse()
+	// entries (threaded through ReviewDraft below) — so a reader can
+	// reconstruct one ladder loop without relying on TurnIndex, which only
+	// identifies the TURN, not a specific governance pass over it (Part 1,
+	// sub-item 2 of issue #5368). Declared (zero value) here but only ASSIGNED
+	// after the panic-recovery defer below is registered, so a crypto/rand
+	// failure inside newLoopID itself (mirroring main.newUUIDv4, which panics
+	// the same way) is still caught by that defer instead of escaping
+	// GovernOutput uncaught — an empty LoopID on that one-in-never path beats
+	// a crashed wire.
+	var loopID string
+	// conflictsTail/recordConflicts/ladderEntered/lastRound are declared here,
+	// ahead of the panic-recovery defer below, so that defer can itself call
+	// recordConflicts when a panic unwinds from inside the ladder (ladderEntered
+	// true) — see the recover branch below. Without this, a loop that panics
+	// mid-ladder would silently vanish from the conflicts log instead of landing
+	// a fail_open line, breaking this log's documented "every loop, including
+	// its failures" denominator contract (conflicts_log.go's package doc).
+	var conflictsTail []ladderStep
+	recordConflicts := func(outcome string, rounds int, errText string) {
+		if err := a.conflicts.record(ladderTailEntry{TurnIndex: turnIndex, LoopID: loopID, Outcome: outcome, Rounds: rounds, Tail: conflictsTail, Err: errText}); err != nil {
+			a.log.record(callLog{Facet: conflictsLogFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Err: fmt.Sprintf("conflicts log write failed: %v", err)})
+		}
+	}
+	// ladderEntered becomes true only once the gate has fired and the ladder
+	// loop is about to run (set below, right before the `current := draft`
+	// setup) — a panic before that point (e.g. inside EvaluateDraft) means no
+	// ladder ever started, matching the `!ok` evaluator-failure branch below,
+	// which is likewise excluded from the conflicts log on purpose.
+	var ladderEntered bool
+	// lastRound tracks the most recent round the for loop below entered, so a
+	// panic mid-round still reports the right Rounds count on its
+	// conflicts-log line, the same way every other fail_open branch inside the
+	// loop reports its own `round` variable.
+	var lastRound int
 	defer func() {
 		if r := recover(); r != nil {
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Path: loopPathPrimary, Decision: "fail_open", Err: fmt.Sprintf("panic: %v", r)})
+			failed := false
+			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Err: fmt.Sprintf("panic: %v", r), Passed: &failed})
+			if ladderEntered {
+				recordConflicts(ladderOutcomeFailOpen, lastRound, fmt.Sprintf("panic: %v", r))
+			}
 			text = draft
 		}
 	}()
+	// Minted only now, after the defer above is registered, so a crypto/rand
+	// read failure here is caught by that defer rather than propagating past
+	// GovernOutput uncaught.
+	loopID = newLoopID()
 
 	de, ok := a.evaluator.EvaluateDraft(ctx, turnIndex, draft)
 	if !ok {
 		// The evaluator failed (logged inside EvaluateDraft); without a gate
-		// decision there is nothing to govern — deliver the draft.
-		a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Path: loopPathPrimary, Decision: "fail_open"})
+		// decision there is nothing to govern — deliver the draft. No ladder
+		// ever started, so this is not logged to the conflicts log (see
+		// conflicts_log.go's package doc: that log's denominator is ladder
+		// loops, not every evaluated message).
+		failed := false
+		a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Passed: &failed})
 		return draft
 	}
-	a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Path: loopPathPrimary, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire)})
+	// Passed is set ONLY in the gate-not-fired branch below: that is the one
+	// case this line is itself the terminal outcome for the message (nothing
+	// to review, deliver, done — a clean "pass"). When the gate fires the
+	// ladder is only just starting, so the outcome is not yet known and
+	// Passed stays absent (never a misleading `false`) until the ladder's own
+	// terminal log line below sets it.
+	var gateNotFiredPassed *bool
+	if !de.GateWouldFire {
+		passed := true
+		gateNotFiredPassed = &passed
+	}
+	a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire), Passed: gateNotFiredPassed})
 	if !de.GateWouldFire {
 		return draft
 	}
+	// The ladder is about to run: from here on, a panic must be attributed to
+	// an entered (and thus conflicts-logged) loop — see ladderEntered's doc
+	// comment above.
+	ladderEntered = true
 
 	current := draft
 	curEval := de
@@ -198,18 +273,40 @@ func (a *ActiveSuperego) GovernOutput(
 	// the evidence it gathered (#4753). The draft itself is never in here — it
 	// always enters as the draft-user message inside ReviewDraft.
 	reviewMessages := messages
+	// conflictsTail is the Part 1 sub-item 3 ordered record of this loop:
+	// draft, critique, optional meta, draft2, critique2, ... — appended to as
+	// the loop runs, then persisted verbatim (whatever the outcome) by
+	// recordConflicts (declared above, ahead of the panic-recovery defer).
+	// Unlike reviewedTagged (the F2c-tagged rendering the redraft tail replays
+	// to the core), this carries the PLAIN draft text and the critique prose —
+	// the human-readable shape a conflicts-log reader wants, not the wire
+	// format the core consumes.
+	//
+	// notPassed is shared by every non-approve terminal callLog line below
+	// (fail_open, final_round, anti_cycle all count as "not a clean pass" —
+	// see annotator.go's callLog.Passed doc comment for the exact mapping).
+	notPassed := false
 
 	for round := 1; round <= a.maxRounds; round++ {
-		crit, ok := a.superego.ReviewDraft(ctx, turnIndex, reviewMessages, ephemeralDigest, currentMeta, round, round == a.maxRounds, critiques, curEval.Paragraphs, curEval.Tags)
+		lastRound = round
+		conflictsTail = append(conflictsTail, ladderStep{Type: "draft", Round: round, Text: current})
+		if currentMeta != "" {
+			conflictsTail = append(conflictsTail, ladderStep{Type: "meta", Round: round, Text: currentMeta})
+		}
+		crit, ok := a.superego.ReviewDraft(ctx, turnIndex, loopID, reviewMessages, ephemeralDigest, currentMeta, round, round == a.maxRounds, critiques, curEval.Paragraphs, curEval.Tags)
 		if !ok {
 			// The superego call failed (logged inside ReviewDraft) — fail open.
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open"})
+			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+			recordConflicts(ladderOutcomeFailOpen, round, "superego review call failed")
 			return current
 		}
+		conflictsTail = append(conflictsTail, ladderStep{Type: "critique", Round: round, Text: crit.Critique, Verdict: crit.Verdict})
 
 		switch crit.Verdict {
 		case VerdictApprove:
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "deliver"})
+			passed := true
+			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Passed: &passed})
+			recordConflicts(ladderOutcomeApprove, round, "")
 			return current
 
 		case VerdictRevise:
@@ -233,7 +330,8 @@ func (a *ActiveSuperego) GovernOutput(
 				finalText, err := finalize(ctx, tail)
 				if err != nil {
 					// A finalize failure fails open to the best draft in hand.
-					a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error()})
+					a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
+					recordConflicts(ladderOutcomeFailOpen, round, err.Error())
 					return current
 				}
 				// Strip any stray meta note (feature-gated): the final message gets no
@@ -241,13 +339,16 @@ func (a *ActiveSuperego) GovernOutput(
 				if a.debateMetaMessage {
 					finalText, _ = splitCoreMeta(finalText)
 				}
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "final_round"})
+				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "final_round", Passed: &notPassed})
+				conflictsTail = append(conflictsTail, ladderStep{Type: "final", Text: finalText})
+				recordConflicts(ladderOutcomeFinalRound, round, "")
 				return finalText
 			}
 			newDraft, newMessages, err := redraft(ctx, revisionTail(critiques, redrafts, reviewedTagged, a.debateMetaMessage))
 			if err != nil {
 				// A redraft failure fails open to the best draft in hand.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error()})
+				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
+				recordConflicts(ladderOutcomeFailOpen, round, err.Error())
 				return current
 			}
 			// Strip the redraft's own reviewer-only note (feature-gated) before any
@@ -268,7 +369,8 @@ func (a *ActiveSuperego) GovernOutput(
 				// Exact-identity anti-cycle guard (ratified option (b)): the core
 				// re-emitted a byte-equal draft, so another round cannot converge —
 				// stop and deliver it rather than burn a round on an identical text.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "deliver", Err: "anti-cycle: identical redraft"})
+				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Err: "anti-cycle: identical redraft", Passed: &notPassed})
+				recordConflicts(ladderOutcomeAntiCycle, round, "anti-cycle: identical redraft")
 				return current
 			}
 			redrafts = append(redrafts, newDraft)
@@ -281,7 +383,9 @@ func (a *ActiveSuperego) GovernOutput(
 			if !ok {
 				// Cannot tag the redraft for another review — deliver it; it is the
 				// core's own revised attempt, strictly newer than the original.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open"})
+				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+				conflictsTail = append(conflictsTail, ladderStep{Type: "draft", Round: round + 1, Text: newDraft})
+				recordConflicts(ladderOutcomeFailOpen, round, "re-evaluating redraft failed")
 				return newDraft
 			}
 			current = newDraft
@@ -291,7 +395,8 @@ func (a *ActiveSuperego) GovernOutput(
 		default:
 			// Empty or unparseable verdict: shadow mode retains the free text, but
 			// the active loop has no actionable decision — fail open and deliver.
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, Round: round, Path: loopPathPrimary, Decision: "fail_open"})
+			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+			recordConflicts(ladderOutcomeFailOpen, round, "unparseable superego verdict")
 			return current
 		}
 	}

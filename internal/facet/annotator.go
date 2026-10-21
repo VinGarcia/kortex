@@ -230,6 +230,27 @@ type callLog struct {
 	Round    int    `json:"round,omitempty"`
 	Path     string `json:"path,omitempty"`
 	Decision string `json:"decision,omitempty"`
+
+	// LoopID groups every facet-log entry — this package's own gate/round
+	// lines plus the nested "superego" facet's per-round converse() entries —
+	// produced by ONE ActiveSuperego.GovernOutput call, so a reader can
+	// reconstruct one ladder loop (gate check through terminal outcome)
+	// without relying on TurnIndex (which only identifies the TURN, not a
+	// specific loop over it). Empty outside the active ladder (e.g. the
+	// shadow-mode Superego.Review path, which is not a loop).
+	LoopID string `json:"loopId,omitempty"`
+	// Passed records whether THIS evaluated message's superego gate outcome
+	// was a clean approve: true when the gate never fired (nothing to
+	// review) or a round ended in VerdictApprove; false when the message
+	// needed the ladder but it ended in fail_open, final_round, or the
+	// anti-cycle guard (see the Passed/notPassed locals set at each terminal
+	// return inside superego_loop.go's GovernOutput for the exact mapping —
+	// those three plus a clean approve are the only terminal outcomes,
+	// matching the conflicts-log Outcome vocabulary). A pointer
+	// because only the TERMINAL log line of a message's governance carries a
+	// verdict; every non-terminal line (e.g. the gate-fired line that hands
+	// off to the ladder) leaves it absent rather than a misleading `false`.
+	Passed *bool `json:"passed,omitempty"`
 }
 
 // facetLogger appends one JSON object per facet call to the sink. A nil

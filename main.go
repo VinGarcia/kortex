@@ -127,6 +127,9 @@ func main() {
 	if facets.logFile != nil {
 		facets.logFile.Close()
 	}
+	if facets.conflictsLogFile != nil {
+		facets.conflictsLogFile.Close()
+	}
 	os.Exit(code)
 }
 
@@ -153,7 +156,13 @@ type builtFacets struct {
 	// consults off the Governor path.
 	redraftToolBudget int
 	logFile           *os.File
-	mcpClient         *mcp.Client
+	// conflictsLogFile is the Part 1 sub-item 3 producer's own file (issue
+	// #5368): a "<KORTEX_LOG>.conflicts" sibling of logFile, holding one JSONL
+	// line per active-ladder loop (whatever its outcome). nil whenever logFile
+	// is nil or the superego is not in active mode — see buildFacets, where it
+	// is only opened inside the `if active` branch.
+	conflictsLogFile *os.File
+	mcpClient        *mcp.Client
 }
 
 // buildFacets loads the config at cfgPath and constructs every enabled
@@ -268,12 +277,30 @@ func buildFacets(cfgPath string, logPath string, sessionID string) (builtFacets,
 		})
 	}
 	if active {
+		// The conflicts log (Part 1 sub-item 3, issue #5368) lives next to the
+		// other KORTEX_LOG artifacts, as a sibling of the facets log opened
+		// above. Scoped to active mode only: the conflicts log records ladder
+		// loops, which only exist in active mode. An open failure degrades to
+		// no conflicts log (stderr warning, nil sink → conflictsLogger no-op),
+		// never to disabling the governor itself — mirroring the facets log's
+		// own fail-open-to-"no log" degradation a few lines above.
+		var conflictsLogSink io.Writer
+		if logPath != "" {
+			built.conflictsLogFile, err = os.OpenFile(logPath+".conflicts", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "kortex: conflicts log disabled: %v\n", err)
+				built.conflictsLogFile = nil
+			} else {
+				conflictsLogSink = built.conflictsLogFile
+			}
+		}
 		built.governor = facet.NewActiveSuperego(facet.ActiveSuperegoParams{
 			Evaluator:         built.outputEvaluator,
 			Superego:          built.superego,
 			Model:             resolveSuperegoModel(seCfg.Model),
 			DebateMetaMessage: seCfg.DebateMetaMessage,
 			LogSink:           logSink,
+			ConflictsLogSink:  conflictsLogSink,
 		})
 		// The redraft's bounded tool loop runs in the session (it owns the
 		// dispatcher/RunLoop); resolve the budget here and carry the concrete value
@@ -484,6 +511,9 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		}
 		if facets.logFile != nil {
 			facets.logFile.Close()
+		}
+		if facets.conflictsLogFile != nil {
+			facets.conflictsLogFile.Close()
 		}
 	}()
 	// A typed nil (e.g. a nil *facet.InputAnnotator) assigned straight into an
