@@ -32,26 +32,49 @@ type InputAnnotator struct {
 	timeout      time.Duration
 	model        string // logged with each call; the evaluator owns the actual routing
 	log          *facetLogger
+
+	// sessionID + sessionTagsDir wire the per-session emotion-tags producer
+	// (session_tags.go). sessionTagsDir == "" disables it (no file ever
+	// created); see AnnotatorParams.SessionTagsDir.
+	sessionID      string
+	sessionTagsDir string
 }
 
-// AnnotatorParams wires an InputAnnotator. All fields except LogSink are
-// required; a nil LogSink disables the structured facet log (the facet
-// still runs). The composition root owns opening/closing the sink.
+// AnnotatorParams wires an InputAnnotator. Evaluator/SystemPrompt/Timeout/
+// Model are required; LogSink/SessionID/SessionTagsDir are optional — a nil
+// LogSink disables the structured facet log, and an empty SessionTagsDir
+// disables per-session emotion-tags persistence (both facets still run
+// either way). The composition root owns opening/closing the log sink and
+// resolving SessionID (this process's kortex session id — the same value
+// handed to session.Config.SessionID).
 type AnnotatorParams struct {
 	Evaluator    Evaluator
 	SystemPrompt string
 	Timeout      time.Duration
 	Model        string
 	LogSink      io.Writer
+	// SessionID is this process's kortex session id. Only used to key the
+	// per-session emotion-tags file (session_tags.go); harmless when left
+	// empty together with SessionTagsDir.
+	SessionID string
+	// SessionTagsDir, when non-empty, enables the per-session emotion-tags
+	// producer: the Go-native source sylphie's memory-distill "cor
+	// emocional" pipeline reads from (see session_tags.go for the full
+	// contract and the path/key rationale). Empty is a no-op — no directory
+	// or file is ever created — matching kortex's other config/env-gated,
+	// off-by-default facet seams (e.g. the KORTEX_LOG-gated inbound tap).
+	SessionTagsDir string
 }
 
 func NewInputAnnotator(params AnnotatorParams) *InputAnnotator {
 	return &InputAnnotator{
-		evaluator:    params.Evaluator,
-		systemPrompt: params.SystemPrompt,
-		timeout:      params.Timeout,
-		model:        params.Model,
-		log:          &facetLogger{sink: params.LogSink},
+		evaluator:      params.Evaluator,
+		systemPrompt:   params.SystemPrompt,
+		timeout:        params.Timeout,
+		model:          params.Model,
+		log:            &facetLogger{sink: params.LogSink},
+		sessionID:      params.SessionID,
+		sessionTagsDir: params.SessionTagsDir,
 	}
 }
 
@@ -163,6 +186,9 @@ func (a *InputAnnotator) annotateText(text string) (string, bool) {
 
 	entry.OK = true
 	a.log.record(entry)
+	if a.sessionTagsDir != "" {
+		appendSessionTag(a.log, a.model, a.sessionTagsDir, a.sessionID, paragraphs, annotations)
+	}
 	return interleave(paragraphs, annotations), true
 }
 

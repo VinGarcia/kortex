@@ -60,7 +60,18 @@ func main() {
 	// broken config fails fast at startup (before any exec): silently
 	// degrading a flag the operator explicitly set would hide the
 	// misconfiguration; a startup failure is immediately visible.
-	facets, err := buildFacets(os.Getenv("KORTEX_CONFIG"), logPath)
+	//
+	// "" for sessionID: this exec-passthrough path has no session-id concept
+	// (it wraps the real claude-cli over a byte-level stdio pump — see
+	// proxy.go — and never resolves one the way runNative's nativeSessionID
+	// does). The per-session emotion-tags producer (buildFacets' sessionID
+	// param) degrades to a no-op here even if SessionTagsDir is configured,
+	// rather than writing a file an empty/degenerate id. This path is also
+	// not the live canary path today (the canary always sets
+	// KORTEX_STREAM_EMITTER=1 — see openclaw-plugin/index.js — which routes
+	// through runNative instead), so the gap only matters for an
+	// un-flipped deployment.
+	facets, err := buildFacets(os.Getenv("KORTEX_CONFIG"), logPath, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kortex: %v\n", err)
 		os.Exit(1)
@@ -148,8 +159,14 @@ type builtFacets struct {
 // buildFacets loads the config at cfgPath and constructs every enabled
 // facet. The zero builtFacets when cfgPath is empty. All env reading stays
 // here in the composition root: a facet receives the token, never the env
-// name.
-func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
+// name. sessionID is this process's kortex session id, threaded only to the
+// input annotator's optional per-session emotion-tags producer
+// (facet.AnnotatorParams.SessionID; see internal/facet/session_tags.go) —
+// "" is safe to pass when no session id is known (e.g. the exec-passthrough
+// call site below, which has no session concept), since an empty id never
+// resolves to a usable path (sessionTagsPath rejects it) and the producer
+// stays a no-op either way unless SessionTagsDir is also set.
+func buildFacets(cfgPath string, logPath string, sessionID string) (builtFacets, error) {
 	var built builtFacets
 	if cfgPath == "" {
 		return built, nil
@@ -192,11 +209,13 @@ func buildFacets(cfgPath string, logPath string) (builtFacets, error) {
 			return built, err
 		}
 		built.annotator = facet.NewInputAnnotator(facet.AnnotatorParams{
-			Evaluator:    facet.NewAnthropicEvaluator(client, annCfg.Model),
-			SystemPrompt: systemPrompt,
-			Timeout:      timeout,
-			Model:        annCfg.Model,
-			LogSink:      logSink,
+			Evaluator:      facet.NewAnthropicEvaluator(client, annCfg.Model),
+			SystemPrompt:   systemPrompt,
+			Timeout:        timeout,
+			Model:          annCfg.Model,
+			LogSink:        logSink,
+			SessionID:      sessionID,
+			SessionTagsDir: annCfg.SessionTagsDir,
 		})
 	}
 	// active superego mode replaces the async shadow review with the blocking
@@ -428,6 +447,15 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// Empty is fine: the API default stands.
 	effort := firstArgvValue(argv, "--effort")
 
+	// Resolved up front (ahead of buildFacets, moved earlier than its original
+	// call site right before session.Run) because the input annotator's
+	// optional per-session emotion-tags producer needs this process's session
+	// id at construction time: kortex builds one InputAnnotator per process,
+	// and a process's lifetime is exactly one session (see nativeSessionID's
+	// doc comment), so resolving it here instead of threading it in per-call
+	// is both simpler and cheaper.
+	sessionID := nativeSessionID(argv, newUUIDv4)
+
 	// SIGINT/SIGTERM cancel the in-flight turn so the process exits promptly
 	// instead of blocking on a long Messages call.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -438,7 +466,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// (gate-triggered) superego; absent/empty builds none. A broken config
 	// fails fast here, before any turn runs — mirroring the passthrough path,
 	// where silently degrading an explicitly-set flag would hide the error.
-	facets, err := buildFacets(getenv("KORTEX_CONFIG"), getenv("KORTEX_LOG"))
+	facets, err := buildFacets(getenv("KORTEX_CONFIG"), getenv("KORTEX_LOG"), sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: %v\n", err)
 		return 1
@@ -532,7 +560,6 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 
 	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
 
-	sessionID := nativeSessionID(argv, newUUIDv4)
 	err = session.Run(ctx, session.Config{
 		Stdin:                   stdin,
 		Stdout:                  stdout,

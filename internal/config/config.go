@@ -81,6 +81,16 @@ type InputAnnotator struct {
 	// TimeoutSeconds bounds each evaluator call; 0 means
 	// DefaultTimeoutSeconds.
 	TimeoutSeconds int `json:"timeoutSeconds"`
+	// SessionTagsDir, when set, enables the per-session emotion-tags
+	// producer: an absolute path to the directory where kortex appends one
+	// JSONL file per session (named after kortex's own session id),
+	// matching the path sylphie's hooks/memory-distill/DISTILL-RUN.md ("cor
+	// emocional") and scripts/emotion-session-path.sh already read/resolve
+	// from — the existing default there is
+	// "<sylphie repo>/memory/.emotion-sessions". Empty (the default)
+	// disables persistence entirely: no directory or file is ever created.
+	// See internal/facet/session_tags.go for the full producer contract.
+	SessionTagsDir string `json:"sessionTagsDir"`
 }
 
 // OutputEvaluator configures the F2c emotional evaluator that runs over
