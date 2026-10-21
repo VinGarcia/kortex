@@ -329,6 +329,28 @@ func TestInterceptToBackend_retrySucceedsWithCorrectiveFeedback(t *testing.T) {
 	}
 }
 
+func TestInterceptToBackend_markdownFenceParsedWithoutRetry(t *testing.T) {
+	// The model often wraps the array in a ```json code fence. The tolerant
+	// extraction (extractJSONArray) must strip it and parse on the FIRST
+	// attempt — no corrective retry, no extra billed call — so a fenced-but-
+	// otherwise-valid response costs exactly one evaluator call.
+	fenced := "```json\n" + oneParagraphTags + "\n```"
+	evaluator := &fakeEvaluator{response: evalText(fenced)}
+	a := newTestAnnotator(evaluator)
+	line := `{"type":"user","message":{"role":"user","content":"boa notícia hoje"},"uuid":"u-fence"}`
+
+	got := intercept(t, a, line)
+	if got == nil {
+		t.Fatal("expected the fenced response to annotate, got passthrough")
+	}
+	if evaluator.calls != 1 {
+		t.Fatalf("evaluator calls = %d, want 1 (fence stripped without retry)", evaluator.calls)
+	}
+	if !strings.Contains(string(got), `boa notícia hoje\n[emoções p1: investment=2 valence=positiva emotions=alegria(2)]`) {
+		t.Errorf("paragraph not annotated from the fenced array:\n%s", got)
+	}
+}
+
 func TestInputAnnotator_writesStructuredLog(t *testing.T) {
 	var log bytes.Buffer
 	a := NewInputAnnotator(AnnotatorParams{
