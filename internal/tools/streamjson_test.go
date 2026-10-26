@@ -325,10 +325,11 @@ func TestRunLoop_yieldEmitsSilentReplyTokenOnWire(t *testing.T) {
 
 	var out bytes.Buffer
 	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
-		Model:       "claude-fable-5",
-		MaxTokens:   1024,
-		UserMessage: "do the thing then yield",
-		Emitter:     NewStreamEmitter(&out, "sess-y", sequencedUUIDs()),
+		Model:          "claude-fable-5",
+		MaxTokens:      1024,
+		UserMessage:    "do the thing then yield",
+		Emitter:        NewStreamEmitter(&out, "sess-y", sequencedUUIDs()),
+		IsTerminalTool: alwaysTerminal,
 	})
 	if err != nil {
 		t.Fatalf("RunLoop error: %v", err)

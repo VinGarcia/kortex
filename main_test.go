@@ -138,6 +138,57 @@ func TestFirstArgvValue(t *testing.T) {
 	}
 }
 
+// TestIsSessionsYield pins the name-matching half of main's OpenClaw-semantics
+// seam (isTerminalTool / isSessionsYield, see openclaw_terminal_tool.go): the
+// bare name, the real MCP-prefixed form the model actually calls, and
+// unrelated tool names (bare or prefixed) must each match the doc comment's
+// claim.
+func TestIsSessionsYield(t *testing.T) {
+	tests := []struct {
+		desc string
+		name string
+		want bool
+	}{
+		{desc: "bare name matches", name: "sessions_yield", want: true},
+		{desc: "MCP-prefixed name matches (the form the model actually calls)", name: tools.MCPToolPrefix + "sessions_yield", want: true},
+		{desc: "unrelated bare name does not match", name: "bash", want: false},
+		{desc: "unrelated MCP-prefixed name does not match", name: tools.MCPToolPrefix + "sessions_announce", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := isSessionsYield(test.name); got != test.want {
+				t.Errorf("isSessionsYield(%q) = %v, want %v", test.name, got, test.want)
+			}
+		})
+	}
+}
+
+// TestIsYieldedResult pins the result-decoding half of main's OpenClaw-
+// semantics seam: only a clean (non-error) result whose JSON body decodes to
+// exactly {"status":"yielded"} counts — an error result, a different status,
+// and a malformed/non-JSON body must all report false rather than panic or
+// false-positive.
+func TestIsYieldedResult(t *testing.T) {
+	tests := []struct {
+		desc   string
+		result anthropic.ToolResultBlock
+		want   bool
+	}{
+		{desc: "clean yielded status", result: anthropic.ToolResultBlock{Content: `{"status":"yielded"}`}, want: true},
+		{desc: "clean yielded status alongside an acknowledgment field", result: anthropic.ToolResultBlock{Content: `{"status":"yielded","acknowledgment":"ok"}`}, want: true},
+		{desc: "tool-level error is never yielded, even with a yielded-looking body", result: anthropic.ToolResultBlock{IsError: true, Content: `{"status":"yielded"}`}, want: false},
+		{desc: "a different status is not yielded", result: anthropic.ToolResultBlock{Content: `{"status":"queued"}`}, want: false},
+		{desc: "non-JSON body is not yielded", result: anthropic.ToolResultBlock{Content: "error: yield refused"}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := isYieldedResult(test.result); got != test.want {
+				t.Errorf("isYieldedResult(%+v) = %v, want %v", test.result, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeSessionID(t *testing.T) {
 	const minted = "minted-uuid"
 	newUUID := func() string { return minted }
@@ -528,6 +579,10 @@ func TestNativeSession_SessionsYieldBypassesGovernorAndEndsTurn(t *testing.T) {
 		MaxTokens:  1024,
 		NewUUID:    newUUID,
 		Governor:   gov,
+		// Built manually here rather than via runNative, so the yield-terminal
+		// predicate must be wired explicitly too, exactly as runNative wires it —
+		// this is what makes the yield actually bypass the governor below.
+		IsTerminalTool: isTerminalTool,
 	})
 	if err != nil {
 		t.Fatalf("session.Run: %v", err)

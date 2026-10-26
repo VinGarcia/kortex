@@ -359,11 +359,24 @@ func TestRunLoop_emptyEphemeralContextChangesNothing(t *testing.T) {
 	}
 }
 
+// alwaysTerminal is a test-local LoopRequest.IsTerminalTool stub that reports
+// every call terminal. RunLoop itself does not know (and must not need to
+// know) which tool name or result shape qualifies as terminal in real life —
+// that decision belongs entirely to the composition root's injected predicate
+// (see main.go's isTerminalTool, which the tests here deliberately do NOT
+// reproduce, to avoid drifting out of sync with it — see
+// TestIsSessionsYield/TestIsYieldedResult in main_test.go for unit coverage of
+// that actual decision logic). The tests below use this stub to prove RunLoop's
+// OWN mechanics: it defers entirely to whatever the predicate decides, and only
+// ever consults it for a lone tool_use.
+func alwaysTerminal(string, anthropic.ToolResultBlock) bool { return true }
+
 // TestRunLoop_sessionsYieldEndsTurn proves the fix for the MaxTurns-kill bug: a
-// response whose ONLY tool_use is sessions_yield, executing to {"status":"yielded"},
-// ENDS the loop with a synthetic end_turn terminal instead of feeding the result
-// back and re-calling the model. Exactly one model call is made (no second call,
-// no spin to MaxTurns), the result reports end_turn and Yielded, and an empty
+// response whose ONLY tool_use is a call the injected IsTerminalTool predicate
+// recognizes as terminal (modeled here on OpenClaw's sessions_yield) ENDS the
+// loop with a synthetic end_turn terminal instead of feeding the result back
+// and re-calling the model. Exactly one model call is made (no second call, no
+// spin to MaxTurns), the result reports end_turn and Yielded, and an empty
 // FinalText does NOT trip the empty-text guard.
 func TestRunLoop_sessionsYieldEndsTurn(t *testing.T) {
 	calls := 0
@@ -383,9 +396,10 @@ func TestRunLoop_sessionsYieldEndsTurn(t *testing.T) {
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
 
 	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
-		Model:       "claude-fable-5",
-		MaxTokens:   1024,
-		UserMessage: "do the thing then yield",
+		Model:          "claude-fable-5",
+		MaxTokens:      1024,
+		UserMessage:    "do the thing then yield",
+		IsTerminalTool: alwaysTerminal,
 	})
 	if err != nil {
 		t.Fatalf("RunLoop error (a yield must end cleanly, not error): %v", err)
@@ -413,10 +427,12 @@ func TestRunLoop_sessionsYieldEndsTurn(t *testing.T) {
 	}
 }
 
-// TestRunLoop_yieldMixedWithToolIsNotTerminal proves the yield-terminal path is
-// scoped to a LONE yield: when a response carries sessions_yield alongside another
-// tool_use, it is NOT treated as a terminal — both tools run and the loop continues
-// to a normal end_turn, exactly as before the fix.
+// TestRunLoop_yieldMixedWithToolIsNotTerminal proves the terminal-tool path is
+// scoped to a LONE call: when a response carries a (would-be terminal) call
+// alongside another tool_use, it is NOT treated as a terminal — both tools run
+// and the loop continues to a normal end_turn — even though IsTerminalTool here
+// unconditionally reports true. This isolates RunLoop's own "len(results) == 1"
+// gate from the predicate's decision, exactly as before the fix.
 func TestRunLoop_yieldMixedWithToolIsNotTerminal(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -446,9 +462,10 @@ func TestRunLoop_yieldMixedWithToolIsNotTerminal(t *testing.T) {
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
 
 	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
-		Model:       "m",
-		MaxTokens:   1024,
-		UserMessage: "yield plus a tool",
+		Model:          "m",
+		MaxTokens:      1024,
+		UserMessage:    "yield plus a tool",
+		IsTerminalTool: alwaysTerminal,
 	})
 	if err != nil {
 		t.Fatalf("RunLoop error: %v", err)
@@ -464,11 +481,15 @@ func TestRunLoop_yieldMixedWithToolIsNotTerminal(t *testing.T) {
 	}
 }
 
-// TestRunLoop_loneYieldNotYieldedFallsThrough proves the result check gates the
-// terminal: a lone sessions_yield whose execution did NOT report "yielded" (an
-// error payload) is treated as an ordinary tool result — the loop feeds it back
-// and continues rather than ending the turn on a failure.
-func TestRunLoop_loneYieldNotYieldedFallsThrough(t *testing.T) {
+// TestRunLoop_terminalToolPredicateFalseLoopsNormally proves the other half of
+// the injected-predicate mechanism: a lone tool_use whose IsTerminalTool call
+// reports false is treated as an ordinary tool result — the loop feeds it back
+// and continues rather than ending the turn. Deciding WHETHER a given name and
+// result actually mean "yielded" (name matching, status/error parsing) is the
+// composition root's job now (see main.go's isSessionsYield/isYieldedResult and
+// their direct unit tests in main_test.go); RunLoop only needs to honor
+// whatever the predicate answers, which this test pins for the false case.
+func TestRunLoop_terminalToolPredicateFalseLoopsNormally(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -489,73 +510,25 @@ func TestRunLoop_loneYieldNotYieldedFallsThrough(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// The yield comes back as a tool-level error, so isYieldedResult is false.
 	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: "error: yield refused"}}, IsError: true}}
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
 
 	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
 		Model:       "m",
 		MaxTokens:   1024,
-		UserMessage: "yield that fails",
+		UserMessage: "a call the predicate does not recognize as terminal",
+		IsTerminalTool: func(string, anthropic.ToolResultBlock) bool {
+			return false
+		},
 	})
 	if err != nil {
 		t.Fatalf("RunLoop error: %v", err)
 	}
 	if calls != 2 {
-		t.Fatalf("want 2 model calls (a failed yield loops normally), got %d", calls)
+		t.Fatalf("want 2 model calls (predicate false loops normally), got %d", calls)
 	}
 	if result.Yielded {
-		t.Error("result.Yielded = true, want false when the yield result was not \"yielded\"")
-	}
-	if result.FinalText != "recovered" {
-		t.Errorf("FinalText = %q, want the follow-up turn's text", result.FinalText)
-	}
-}
-
-// TestRunLoop_loneYieldWrongStatusFallsThrough pins the exact status == "yielded"
-// match: a lone sessions_yield whose execution returns a clean, non-error payload
-// with a DIFFERENT status ("queued") must NOT end the turn. This guards against a
-// mutation that treats any successful sessions_yield result as terminal — only the
-// literal "yielded" status closes the loop.
-func TestRunLoop_loneYieldWrongStatusFallsThrough(t *testing.T) {
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		w.Header().Set("Content-Type", "application/json")
-		if calls == 1 {
-			w.Write([]byte(`{
-				"content": [{"type":"tool_use","id":"toolu_y","name":"mcp__openclaw__sessions_yield","input":{},"caller":{"type":"direct"}}],
-				"stop_reason": "tool_use",
-				"usage": {"input_tokens": 5, "output_tokens": 4}
-			}`))
-			return
-		}
-		w.Write([]byte(`{
-			"content": [{"type":"text","text":"recovered"}],
-			"stop_reason": "end_turn",
-			"usage": {"input_tokens": 2, "output_tokens": 1}
-		}`))
-	}))
-	defer server.Close()
-
-	// A clean (non-error) payload whose status is NOT "yielded": isYieldedResult
-	// must return false, so the loop feeds the result back and keeps going.
-	fake := &fakeMCPCaller{result: mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: `{"status":"queued"}`}}, IsError: false}}
-	client := anthropic.NewClient("secret-token", server.URL, time.Second)
-
-	result, err := RunLoop(context.Background(), client, &Dispatcher{mcp: fake}, LoopRequest{
-		Model:       "m",
-		MaxTokens:   1024,
-		UserMessage: "yield that is only queued",
-	})
-	if err != nil {
-		t.Fatalf("RunLoop error: %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("want 2 model calls (a non-yielded status loops normally), got %d", calls)
-	}
-	if result.Yielded {
-		t.Error("result.Yielded = true, want false when status != \"yielded\"")
+		t.Error("result.Yielded = true, want false when IsTerminalTool returned false")
 	}
 	if result.FinalText != "recovered" {
 		t.Errorf("FinalText = %q, want the follow-up turn's text", result.FinalText)

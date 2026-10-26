@@ -248,6 +248,14 @@ type Config struct {
 	// RunLoop). Governor and the async TurnEvaluator are mutually exclusive by
 	// construction in the composition root.
 	Governor OutputGovernor
+	// IsTerminalTool is forwarded verbatim to every tools.RunLoop call
+	// (tools.LoopRequest.IsTerminalTool) this session drives — the main turn and
+	// an active-superego redraft alike. Nil disables the terminal-tool short
+	// circuit entirely, leaving every tool_use batch to loop back to the model as
+	// before this field existed. session stays as agnostic as tools of what,
+	// concretely, the predicate recognizes (the composition root owns that); it
+	// only threads the already-built function through.
+	IsTerminalTool func(name string, result anthropic.ToolResultBlock) bool
 }
 
 // Run drives a native kortex session: it reads the OpenClaw NDJSON protocol
@@ -399,6 +407,7 @@ func runTurn(
 		CallTimeout:      cfg.LoopCallTimeout,
 		Emitter:          emitter,
 		EphemeralContext: digest,
+		IsTerminalTool:   cfg.IsTerminalTool,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
 		DeferFinal: cfg.Governor != nil,
@@ -629,6 +638,10 @@ func governTurn(
 				// Budget exhausted ends the round with a text answer that still sees
 				// the tool_results gathered, not a turn error.
 				FinalizeOnBudget: true,
+				// Threaded for parity with the main turn's RunLoop call above: a
+				// redraft round can call the same tools (including a terminal one
+				// like sessions_yield), and it must be recognized here too.
+				IsTerminalTool: cfg.IsTerminalTool,
 				// Emitter left nil: the redraft's tool loop is internal deliberation
 				// over the ephemeral tail, so its intermediate assistant/tool_result
 				// events never reach the wire — only the governed final text does

@@ -611,6 +611,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		Governor:                governor,
 		ToneDigester:            toneDigester,
 		InboundTap:              inboundTap,
+		IsTerminalTool:          isTerminalTool,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "kortex: native session: %v\n", err)

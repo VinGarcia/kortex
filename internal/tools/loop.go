@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -10,39 +9,6 @@ import (
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 )
-
-// sessionsYieldTool is the bare (unprefixed) name of the gateway's yield tool.
-// The model calls it as the MCP tool mcp__openclaw__sessions_yield, but the
-// detection strips MCPToolPrefix first so it matches whether or not the prefix
-// is present (see isSessionsYield).
-const sessionsYieldTool = "sessions_yield"
-
-// isSessionsYield reports whether a tool_use name is the gateway's sessions_yield
-// tool, matching on the bare name with MCPToolPrefix stripped so it holds for the
-// prefixed MCP form the model actually calls (mcp__openclaw__sessions_yield) and
-// for a bare name alike.
-func isSessionsYield(name string) bool {
-	return strings.TrimPrefix(name, MCPToolPrefix) == sessionsYieldTool
-}
-
-// isYieldedResult reports whether a sessions_yield tool_result indicates the turn
-// actually yielded. The gateway answers a yield with a JSON object carrying
-// {"status":"yielded"} (optionally alongside an "acknowledgment" field), so the
-// check parses that object and matches status. A tool-level error, or any payload
-// that does not decode to status "yielded", returns false so the caller falls
-// back to ordinary tool-loop handling rather than ending the turn on a failure.
-func isYieldedResult(result anthropic.ToolResultBlock) bool {
-	if result.IsError {
-		return false
-	}
-	var payload struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
-		return false
-	}
-	return payload.Status == "yielded"
-}
 
 // DefaultMaxTurns bounds how many tool_use round trips RunLoop makes before
 // giving up. This is a safety cap against a runaway loop (a model that
@@ -123,6 +89,19 @@ type LoopRequest struct {
 	// erroring the turn. Only this opt-in path finalizes; every other caller
 	// keeps the fail-closed behavior.
 	FinalizeOnBudget bool
+	// IsTerminalTool, when non-nil, is consulted once per turn, after a tool_use
+	// batch of exactly ONE call has been executed: if it reports true for that
+	// call's name and result, RunLoop ends the turn immediately with a synthetic
+	// end_turn terminal (LoopResult.Yielded) instead of feeding the result back
+	// and calling the model again. Nil means no tool_use ever ends a turn this
+	// way — the existing behavior for any caller that leaves this unset. This
+	// seam keeps the tools package agnostic of any specific tool's name or
+	// result semantics; the composition root (main) injects the concrete
+	// predicate, e.g. OpenClaw's sessions_yield, whose {"status":"yielded"}
+	// result means the model chose to END the turn and await events rather than
+	// request an ordinary follow-up call. Never consulted when the batch has
+	// zero or more than one tool_use.
+	IsTerminalTool func(name string, result anthropic.ToolResultBlock) bool
 }
 
 // LoopResult is the outcome of a completed tool-loop.
@@ -147,14 +126,15 @@ type LoopResult struct {
 	// the result itself.
 	Usage anthropic.Usage
 	// Yielded reports that the loop ended because the model's only tool_use was a
-	// sessions_yield call that returned "yielded" — the native OpenClaw semantic
-	// where a yield ENDS the turn (the model chose to await events), not an
-	// ordinary tool result to loop back on. RunLoop has already emitted the full
-	// terminal round for this case (assistant tool_use, tool_result, and result),
-	// so a DeferFinal consumer must NOT also run the governor or EmitFinalTurn on
-	// it: a yield carries no user-facing draft for the superego to review, and
-	// FinalText is legitimately empty. StopReason is forced to "end_turn" so the
-	// round closes cleanly instead of spinning to the MaxTurns kill.
+	// call the injected IsTerminalTool predicate recognized as ending the turn —
+	// the native OpenClaw sessions_yield semantic (the model chose to await
+	// events), not an ordinary tool result to loop back on. RunLoop has already
+	// emitted the full terminal round for this case (assistant tool_use,
+	// tool_result, and result), so a DeferFinal consumer must NOT also run the
+	// governor or EmitFinalTurn on it: a yield carries no user-facing draft for
+	// the superego to review, and FinalText is legitimately empty. StopReason is
+	// forced to "end_turn" so the round closes cleanly instead of spinning to the
+	// MaxTurns kill.
 	Yielded bool
 }
 
@@ -296,29 +276,33 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			anthropic.Message{Role: "user", Content: results},
 		)
 
-		// sessions_yield terminal: when the turn's ONLY tool_use is a sessions_yield
-		// call that executed to "yielded", the model has chosen to END the turn and
-		// await events (native OpenClaw yield semantics) — it is NOT asking us to feed
-		// a tool_result back and call it again. Treating the yield as an ordinary tool
-		// result is the bug this guards: the loop re-called the model, which (seeing
-		// only the tone digest) yielded again every ~4-5s until it hit the MaxTurns
-		// kill, destroying the real reply. So end the loop here with a synthetic
-		// end_turn terminal instead of looping.
+		// Injected terminal tool: when the turn's ONLY tool_use is a call the
+		// composition root's IsTerminalTool predicate recognizes (e.g. OpenClaw's
+		// sessions_yield executing to "yielded"), the model has chosen to END the
+		// turn — it is NOT asking us to feed a tool_result back and call it again.
+		// Treating a yield as an ordinary tool result was the original bug this
+		// guards: the loop re-called the model, which (seeing only the tone digest)
+		// yielded again every ~4-5s until it hit the MaxTurns kill, destroying the
+		// real reply. So end the loop here with a synthetic end_turn terminal
+		// instead of looping. tools itself carries no knowledge of which tool name
+		// or result shape qualifies — that is entirely the injected predicate's
+		// call, keeping this package agnostic of any specific tool's semantics.
 		//
-		// Detected AFTER executing the batch (not before) for two reasons: the yield's
-		// gateway-side effect must still run exactly once, and reusing the batch result
-		// means the tool is never executed twice. The assistant tool_use turn and the
-		// tool_result are already emitted and appended above, so the yield's full
-		// round is on the wire and in canonical history; we only add the terminal
-		// result. A single-yield call whose result is NOT "yielded" (an error payload)
-		// is deliberately excluded here and falls through to a normal next turn.
-		if len(results) == 1 && isSessionsYield(toolUses[0].Name) && isYieldedResult(results[0]) {
+		// Detected AFTER executing the batch (not before) for two reasons: the
+		// tool's real-world effect must still run exactly once, and reusing the
+		// batch result means the tool is never executed twice. The assistant
+		// tool_use turn and the tool_result are already emitted and appended above,
+		// so the call's full round is on the wire and in canonical history; we only
+		// add the terminal result. A single-call batch the predicate does NOT
+		// recognize as terminal (e.g. a yield whose result was an error payload)
+		// falls through to a normal next turn.
+		if len(results) == 1 && req.IsTerminalTool != nil && req.IsTerminalTool(toolUses[0].Name, results[0]) {
 			// StopReason is forced to end_turn: the raw response said "tool_use", but
-			// the yield IS the end of the turn, and the terminal result must report a
-			// non-tool_use stop_reason for OpenClaw to close the round. FinalText is
-			// whatever text the model sent alongside the yield (usually empty — a yield
-			// carries no reply), which is a legitimate empty final turn, so the
-			// empty-text guard above is intentionally not applied on this path.
+			// the predicate says this call IS the end of the turn, and the terminal
+			// result must report a non-tool_use stop_reason for OpenClaw to close the
+			// round. FinalText is whatever text the model sent alongside the call
+			// (usually empty for a yield), which is a legitimate empty final turn, so
+			// the empty-text guard above is intentionally not applied on this path.
 			result := LoopResult{
 				FinalText:  resp.Text,
 				StopReason: "end_turn",
