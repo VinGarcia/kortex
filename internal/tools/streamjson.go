@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/protocol"
@@ -186,6 +187,24 @@ func (e *StreamEmitter) Keepalive() error {
 		return fmt.Errorf("tools: emitting system/keepalive: %w", err)
 	}
 	return e.write(line)
+}
+
+// startCallKeepalive brackets one in-flight core-model call with keepalive
+// lines so a slow call on a giant-context session never goes silent past
+// OpenClaw's no-output watchdog (the 2026-10-31 incident: a ~355k-token turn's
+// single core call ran past 120s with nothing on the wire and the CLI was
+// killed). RunLoop calls it immediately before each CreateMessage and invokes
+// the returned stop func immediately after the call returns — BEFORE any
+// assistant / result / tool_result emission — so the wire order stays
+// deterministic (see StartKeepalive). A nil emitter (the non-streaming -p path,
+// the internal redraft loop) spawns no goroutine: there is no wire to keep
+// alive. logf is nil because the tools package carries no diagnostic sink; the
+// goroutine still recovers a panic so it can never crash the CLI.
+func (e *StreamEmitter) startCallKeepalive(interval time.Duration) (stop func()) {
+	if e == nil {
+		return func() {}
+	}
+	return StartKeepalive(interval, e.Keepalive, nil)
 }
 
 // ErrorResult emits a terminal result marking the round as failed. The native

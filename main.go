@@ -395,7 +395,7 @@ func firstArgvValue(argv []string, flag string) string {
 // deep thinking pass could consume the whole budget and leave zero text, which
 // OpenClaw rejects as an empty turn (observed live 2026-10-04). 16000 gives the
 // text room to land after thinking while staying well within the model's output
-// ceiling; the 120s per-call deadline (defaultLoopCallTimeout) is the real wall
+// ceiling; the per-call deadline (defaultLoopCallTimeout) is the real wall
 // on a long generation, not this cap. Effort (see runNative) bounds how much of
 // this budget thinking itself takes.
 const defaultMaxTokens = 16000
@@ -412,7 +412,14 @@ const defaultRedraftTimeout = 60 * time.Second
 // large enough to let a normal long generation finish, finite enough to catch
 // a truly hung call instead of blocking the turn forever. Unlike the redraft
 // (which fails open to the raw draft), a timed-out loop call fails closed.
-const defaultLoopCallTimeout = 120 * time.Second
+//
+// Raised 120s->300s (2026-10-31, incident): a ~355k-token session's single
+// core call legitimately ran past 120s and the turn failed, dropping the user's
+// message. 300s is safe ONLY because each loop call is now bracketed by
+// keepalives (LoopRequest.KeepaliveInterval), so the call no longer goes silent
+// past OpenClaw's 180s no-output watchdog; without that bracket a 300s call
+// would be killed by the watchdog long before this deadline.
+const defaultLoopCallTimeout = 300 * time.Second
 
 // defaultGovernKeepaliveInterval is how often the governor seam emits its
 // benign keepalive line while the superego ladder deliberates. It exists to

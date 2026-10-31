@@ -351,6 +351,69 @@ func TestRunLoop_yieldEmitsSilentReplyTokenOnWire(t *testing.T) {
 	}
 }
 
+// TestRunLoop_keepaliveBracketsSlowCall is the regression guard for the
+// 2026-10-31 incident: a core-model call on a giant-context session that runs
+// silent for its whole duration must be bracketed with system/keepalive lines
+// so OpenClaw's no-output watchdog does not kill the CLI. The handler stalls
+// well past the tiny KeepaliveInterval before answering end_turn, so the loop
+// must emit at least one keepalive while the call is in flight — and, the
+// wire-order invariant, every keepalive must land BEFORE the terminal result
+// (the negative control: it fails if the keepalive is not stopped before the
+// post-call emission).
+func TestRunLoop_keepaliveBracketsSlowCall(t *testing.T) {
+	const (
+		keepaliveInterval = 15 * time.Millisecond
+		callStall         = 200 * time.Millisecond
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(callStall)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"done after a slow call"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 10, "output_tokens": 5}
+		}`))
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:             "claude-fable-5",
+		MaxTokens:         1024,
+		UserMessage:       "take your time",
+		KeepaliveInterval: keepaliveInterval,
+		Emitter:           NewStreamEmitter(&out, "sess-k", sequencedUUIDs()),
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	keepalives, resultIdx := 0, -1
+	for i, line := range lines {
+		ev := protocol.Parse(line)
+		if ev.ParseErr != nil {
+			t.Fatalf("line %d failed to parse: %v\n%s", i, ev.ParseErr, line)
+		}
+		switch {
+		case ev.Type == protocol.TypeSystem && ev.Subtype == "keepalive":
+			keepalives++
+			if resultIdx != -1 {
+				t.Errorf("keepalive at line %d landed AFTER the terminal result at line %d", i, resultIdx)
+			}
+		case ev.Type == protocol.TypeResult:
+			resultIdx = i
+		}
+	}
+	if keepalives == 0 {
+		t.Fatalf("no keepalive emitted during the %s call; the watchdog would kill a real giant-context turn:\n%s", callStall, out.String())
+	}
+	if resultIdx != len(lines)-1 {
+		t.Fatalf("terminal result is not the last line (idx %d of %d)", resultIdx, len(lines)-1)
+	}
+}
+
 // TestAssistantBlocks_roundTrip pins the anthropic -> protocol block mapping
 // against the emitter+parser: the mapped blocks survive EmitAssistant ->
 // Parse unchanged, and non-text/tool_use blocks are dropped.

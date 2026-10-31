@@ -398,16 +398,19 @@ func runTurn(
 	// never persisted.
 	digest := toneDigest(cfg, priorUserTexts, userText)
 	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
-		Model:            cfg.Model,
-		System:           systemPrompt,
-		MaxTokens:        cfg.MaxTokens,
-		Effort:           cfg.Effort,
-		History:          msgs,
-		UserMessage:      userText,
-		CallTimeout:      cfg.LoopCallTimeout,
-		Emitter:          emitter,
-		EphemeralContext: digest,
-		IsTerminalTool:   cfg.IsTerminalTool,
+		Model:       cfg.Model,
+		System:      systemPrompt,
+		MaxTokens:   cfg.MaxTokens,
+		Effort:      cfg.Effort,
+		History:     msgs,
+		UserMessage: userText,
+		CallTimeout: cfg.LoopCallTimeout,
+		// Same watchdog cadence the governor ladder uses: a slow core call must
+		// be kept alive on the wire exactly like the ladder's silent span.
+		KeepaliveInterval: cfg.GovernKeepaliveInterval,
+		Emitter:           emitter,
+		EphemeralContext:  digest,
+		IsTerminalTool:    cfg.IsTerminalTool,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
 		DeferFinal: cfg.Governor != nil,
@@ -769,51 +772,23 @@ func governTurn(
 	return finalText, finalMessages, allRedraftCalls, nil
 }
 
-// startGovernorKeepalive starts the goroutine that emits a system/keepalive
-// line every GovernKeepaliveInterval while the active superego ladder runs, so
-// OpenClaw's no-output watchdog never kills the CLI mid-ladder (see the Config
-// field for the incident). The returned stop function ends the ticker AND
-// waits for the goroutine to exit, guaranteeing no keepalive write can race
-// the final-turn emission that follows. An emit failure (a broken wire) stops
-// the keepalives but is only logged — the ladder's own final emission will
-// surface the broken wire as the turn's error.
+// startGovernorKeepalive brackets the active superego ladder with a keepalive
+// span so OpenClaw's no-output watchdog never kills the CLI mid-ladder (see the
+// Config field for the incident). It delegates to tools.StartKeepalive, the
+// shared ticker primitive (the tool-loop's per-call keepalive uses it too); the
+// returned stop function ends the ticker AND waits for the goroutine to exit,
+// guaranteeing no keepalive write can race the final-turn emission that
+// follows. An emit failure (a broken wire) stops the keepalives but is only
+// logged — the ladder's own final emission will surface the broken wire as the
+// turn's error.
 func startGovernorKeepalive(cfg Config, emitter *tools.StreamEmitter) (stop func()) {
 	interval := cfg.GovernKeepaliveInterval
 	if interval <= 0 {
 		interval = DefaultGovernKeepaliveInterval
 	}
-	done := make(chan struct{})
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		// A panic here (a broken writer, a future emitter bug) must stop the
-		// keepalives, never the CLI: this goroutine has no caller to recover it,
-		// so an unrecovered panic kills the whole process mid-turn — the exact
-		// outage the keepalive exists to prevent. Same umbrella the facet
-		// goroutines carry (facet.Superego.review).
-		defer func() {
-			if r := recover(); r != nil {
-				diagf(cfg.Diag, "session: governor keepalive panic: %v", r)
-			}
-		}()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if err := emitter.Keepalive(); err != nil {
-					diagf(cfg.Diag, "session: governor keepalive emit failed: %v", err)
-					return
-				}
-			}
-		}
-	}()
-	return func() {
-		close(done)
-		<-finished
-	}
+	return tools.StartKeepalive(interval, emitter.Keepalive, func(format string, args ...any) {
+		diagf(cfg.Diag, "session: governor "+format, args...)
+	})
 }
 
 // replaceFinalAssistantText returns a copy of messages with the last message's

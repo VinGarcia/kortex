@@ -25,8 +25,22 @@ const DefaultMaxTurns = 100
 // LoopRequest.CallTimeout is 0. The core client carries no HTTP timeout, so a
 // single hung CreateMessage would otherwise block the whole turn forever; this
 // safety net bounds each call generously enough to let normal long generations
-// finish while still catching a truly stuck call.
-const DefaultCallTimeout = 120 * time.Second
+// finish while still catching a truly stuck call. Held equal to the composition
+// root's main.defaultLoopCallTimeout (the two are per-layer fallbacks for the
+// same bound); raised 120s->300s with it (2026-10-31 incident) now that each
+// call is keepalive-bracketed and so can safely outlast the 180s watchdog.
+const DefaultCallTimeout = 300 * time.Second
+
+// DefaultKeepaliveInterval is how often RunLoop emits a system/keepalive line
+// while a core-model call is in flight, when LoopRequest.KeepaliveInterval is
+// 0. It must stay well under OpenClaw's 180s no-output watchdog; 45s matches
+// the governor ladder's cadence (session.DefaultGovernKeepaliveInterval, the
+// same watchdog — the two share the "beat under the watchdog" concept, so they
+// use the same value). Without this bracket a single slow call on a
+// large-context session goes silent for its whole duration and the watchdog
+// kills the CLI: the 2026-10-31 incident, and what makes a raised CallTimeout
+// safe only once paired with the keepalive.
+const DefaultKeepaliveInterval = 45 * time.Second
 
 // LoopRequest configures one RunLoop call.
 type LoopRequest struct {
@@ -55,6 +69,14 @@ type LoopRequest struct {
 	// raw draft to fall back to), the loop has no fallback: a timed-out call
 	// surfaces as a fail-closed error return from RunLoop.
 	CallTimeout time.Duration
+	// KeepaliveInterval is how often a benign system/keepalive line is emitted
+	// (via Emitter) while each core-model call inside the loop is in flight; 0
+	// means DefaultKeepaliveInterval. A single core call on a large-context
+	// session can run for minutes with nothing else on the wire, and OpenClaw
+	// kills a CLI silent past its no-output watchdog, so each call is bracketed
+	// by keepalives. Ignored when Emitter is nil (there is no wire to keep
+	// alive).
+	KeepaliveInterval time.Duration
 	// Emitter, when non-nil, receives the loop's turns as stream-json (NDJSON)
 	// events: system/init, one assistant event per turn, one user event per
 	// tool_result batch, and the terminal result. Nil disables emission, in
@@ -173,6 +195,11 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		callTimeout = DefaultCallTimeout
 	}
 
+	keepaliveInterval := req.KeepaliveInterval
+	if keepaliveInterval <= 0 {
+		keepaliveInterval = DefaultKeepaliveInterval
+	}
+
 	messages := append(slices.Clone(req.History), anthropic.Message{Role: "user", Content: req.UserMessage})
 	tools := dispatcher.ToolDefs()
 
@@ -193,10 +220,14 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	// tool loop that reported only the final turn would under-count the round.
 	var totalUsage anthropic.Usage
 	for turn := 1; turn <= maxTurns; turn++ {
-		// Bound each call with its own deadline (see CallTimeout). cancel() is
-		// called explicitly after the call, not deferred, so the per-turn
-		// contexts do not pile up across loop iterations.
+		// Bound each call with its own deadline (see CallTimeout). cancel() and
+		// stopKeepalive() are called explicitly after the call, not deferred, so
+		// the per-turn contexts do not pile up across loop iterations and — the
+		// invariant that matters — the keepalive goroutine is fully stopped BEFORE
+		// any assistant/result/tool_result line is emitted below, keeping the wire
+		// order deterministic (see StreamEmitter.startCallKeepalive).
 		cctx, cancel := context.WithTimeout(ctx, callTimeout)
+		stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
 		resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
 			Model:     req.Model,
 			System:    req.System,
@@ -206,6 +237,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			Tools:     tools,
 		})
 		cancel()
+		stopKeepalive()
 		if err != nil {
 			// Fail-closed: the loop has no fallback output, so a call that blew the
 			// per-call deadline surfaces as a clear error naming the bound. A
@@ -326,7 +358,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	// default; the FinalizeOnBudget caller instead gets one graceful toolless
 	// call so the round still ends with a deliverable answer.
 	if req.FinalizeOnBudget {
-		return finalizeWithoutTools(ctx, client, req, messages, maxTurns, callTimeout, totalUsage)
+		return finalizeWithoutTools(ctx, client, req, messages, maxTurns, callTimeout, keepaliveInterval, totalUsage)
 	}
 	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
 }
@@ -346,9 +378,11 @@ func finalizeWithoutTools(
 	messages []anthropic.Message,
 	turns int,
 	callTimeout time.Duration,
+	keepaliveInterval time.Duration,
 	totalUsage anthropic.Usage,
 ) (LoopResult, error) {
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
+	stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
 	resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
 		Model:     req.Model,
 		System:    req.System,
@@ -358,6 +392,7 @@ func finalizeWithoutTools(
 		// No Tools: force a text answer so the budgeted round closes gracefully.
 	})
 	cancel()
+	stopKeepalive()
 	if err != nil {
 		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 			return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call exceeded per-call deadline (%s): %w", callTimeout, err)
