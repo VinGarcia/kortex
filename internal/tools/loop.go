@@ -241,10 +241,14 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		if err != nil {
 			// Fail-closed: the loop has no fallback output, so a call that blew the
 			// per-call deadline surfaces as a clear error naming the bound. A
-			// deadline hit is reported this way; any other call error keeps the
-			// existing turn-scoped wrapping.
+			// deadline hit is reported with just the turn and configured timeout,
+			// which already fully explain it; the raw transport cause ("...context
+			// deadline exceeded") is redundant here, and its wording also misled a
+			// downstream error classifier into reporting a plain timeout as a
+			// context overflow (#5994). Any other call error keeps the existing
+			// turn-scoped wrapping.
 			if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: call exceeded per-call deadline (%s): %w", turn, callTimeout, err)
+				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: call exceeded per-call deadline (%s)", turn, callTimeout)
 			}
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
@@ -394,8 +398,10 @@ func finalizeWithoutTools(
 	cancel()
 	stopKeepalive()
 	if err != nil {
+		// Same as the RunLoop branch above (#5994): report only the bound, not
+		// the redundant transport cause.
 		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call exceeded per-call deadline (%s): %w", callTimeout, err)
+			return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call exceeded per-call deadline (%s)", callTimeout)
 		}
 		return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call: %w", err)
 	}

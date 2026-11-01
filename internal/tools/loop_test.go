@@ -709,4 +709,13 @@ func TestRunLoop_callTimeoutFailsClosed(t *testing.T) {
 	if !strings.Contains(err.Error(), "per-call deadline") {
 		t.Errorf("error = %q, want it to name the per-call deadline", err)
 	}
+	// The deadline error carries only the bound, not the raw transport cause:
+	// the turn and timeout already explain it, so "...request failed...context
+	// deadline exceeded" is redundant here. That wording also misled a
+	// downstream error classifier into reporting a plain timeout as a context
+	// overflow (#5994), so keep the text free of it.
+	if strings.Contains(err.Error(), "context deadline exceeded") ||
+		strings.Contains(strings.ToLower(err.Error()), "request failed") {
+		t.Errorf("error = %q, must carry only the per-call deadline, not the raw transport cause", err)
+	}
 }
