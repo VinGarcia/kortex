@@ -185,7 +185,7 @@ func TestActiveSuperego_conflictsLogOnCleanApprove(t *testing.T) {
 	var conflictsLog bytes.Buffer
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus", ConflictsLogSink: &conflictsLog})
 
-	text := gov.GovernOutput(context.Background(), 7, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	text, archiveNote := gov.GovernOutput(context.Background(), 7, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 	if text != draft {
 		t.Fatalf("approve on round 1 must deliver the original draft, got %q", text)
 	}
@@ -205,6 +205,14 @@ func TestActiveSuperego_conflictsLogOnCleanApprove(t *testing.T) {
 	}
 	if len(entry.Tail) != 2 || entry.Tail[0].Type != "draft" || entry.Tail[1].Type != "critique" {
 		t.Errorf("tail = %+v, want [draft, critique]", entry.Tail)
+	}
+	// issue #5998: GovernOutput's archiveNote must name the SAME artifact this
+	// test just decoded — the conflicts log's own loopId — not a second id for
+	// a second file. A clean approve still ran a (1-round) ladder, so it is
+	// archived exactly like any other outcome (conflicts_log.go's package doc:
+	// every loop is logged, not just the conflicted ones).
+	if !strings.Contains(archiveNote, "archived with ID #"+entry.LoopID) || !strings.Contains(archiveNote, `"loopId"`) {
+		t.Errorf("archiveNote = %q, want it to reference the conflicts log's own loopId %q (reuse, not a second artifact)", archiveNote, entry.LoopID)
 	}
 }
 
@@ -226,8 +234,15 @@ func TestActiveSuperego_conflictsLogOffByDefault(t *testing.T) {
 	if gov.conflicts == nil || gov.conflicts.sink != nil {
 		t.Fatalf("expected a conflicts logger wrapping a nil sink, got %+v", gov.conflicts)
 	}
-	if text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn); text != draft {
+	text, archiveNote := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	if text != draft {
 		t.Fatalf("unexpected text = %q", text)
+	}
+	// issue #5998: with the conflicts log disabled, nothing was actually
+	// archived, so archiveNote must stay "" — a reference naming a loop that
+	// is not really in the log would be dangling and unrecoverable.
+	if archiveNote != "" {
+		t.Errorf("archiveNote = %q, want \"\" when the conflicts log is disabled", archiveNote)
 	}
 }
 
@@ -257,7 +272,7 @@ func TestActiveSuperego_panicInsideLadderStillLogsConflictsLine(t *testing.T) {
 	var conflictsLog bytes.Buffer
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus", ConflictsLogSink: &conflictsLog})
 
-	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	text, archiveNote := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 	if text != draft {
 		t.Fatalf("panic must still fail open to the original draft, got %q", text)
 	}
@@ -271,6 +286,12 @@ func TestActiveSuperego_panicInsideLadderStillLogsConflictsLine(t *testing.T) {
 	}
 	if !strings.Contains(entry.Err, "panic: boom") {
 		t.Errorf("error = %q, want it to contain %q", entry.Err, "panic: boom")
+	}
+	// issue #5998: even a panic mid-ladder, once the ladder was entered, still
+	// lands a real conflicts-log line (asserted above), so it must still be
+	// reported as archived.
+	if !strings.Contains(archiveNote, "archived with ID #"+entry.LoopID) || !strings.Contains(archiveNote, `"loopId"`) {
+		t.Errorf("archiveNote = %q, want it to reference the conflicts log's own loopId %q", archiveNote, entry.LoopID)
 	}
 }
 
@@ -299,11 +320,46 @@ func TestActiveSuperego_panicBeforeLadderEntryLogsNoConflictsLine(t *testing.T) 
 	var conflictsLog bytes.Buffer
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus", ConflictsLogSink: &conflictsLog})
 
-	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	text, archiveNote := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 	if text != draft {
 		t.Fatalf("panic must still fail open to the original draft, got %q", text)
 	}
 	if conflictsLog.Len() != 0 {
 		t.Errorf("expected no conflicts-log line for a panic before the ladder was entered, got %q", conflictsLog.String())
+	}
+	// issue #5998: nothing was archived (no ladder, no tail beyond the single
+	// draft already returned as text), so archiveNote must stay "".
+	if archiveNote != "" {
+		t.Errorf("archiveNote = %q, want \"\" when no ladder was ever entered", archiveNote)
+	}
+}
+
+// TestActiveSuperego_archiveNoteEmptyWhenConflictsWriteErrors covers the
+// remaining negative path: the sink is ENABLED (non-nil) but record() itself
+// fails (e.g. a full disk). The ladder still fails open to the draft, and
+// archiveNote must stay "" — a note must never name a loop that is not
+// really sitting in the log, and conflictsLogger.record's own error here
+// means it is not.
+func TestActiveSuperego_archiveNoteEmptyWhenConflictsWriteErrors(t *testing.T) {
+	const draft = "rascunho original"
+	eval := NewOutputEvaluator(OutputEvaluatorParams{
+		Evaluator:    &scriptedEvaluator{steps: []scriptStep{gateFires()}},
+		SystemPrompt: "avalie", Timeout: time.Second, Model: "haiku", GateMinInvestment: 4,
+	})
+	se := NewSuperego(SuperegoParams{
+		Conversant:   &scriptedConversant{steps: []scriptStep{superegoVerdictStep("approve")}},
+		SystemPrompt: "superego", Timeout: time.Second, Model: "opus",
+	})
+	gov := NewActiveSuperego(ActiveSuperegoParams{
+		Evaluator: eval, Superego: se, Model: "opus",
+		ConflictsLogSink: errWriter{err: errors.New("disk full")},
+	})
+
+	text, archiveNote := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	if text != draft {
+		t.Fatalf("approve must still deliver the draft even though the conflicts write failed, got %q", text)
+	}
+	if archiveNote != "" {
+		t.Errorf("archiveNote = %q, want \"\" when the conflicts log write itself errors (sink enabled, write failed)", archiveNote)
 	}
 }

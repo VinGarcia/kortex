@@ -501,10 +501,10 @@ func (g *bypassRecordingGovernor) GovernOutput(
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
-) string {
+) (string, string) {
 	g.gotDraft = draft
 	g.gotMessages = messages
-	return g.deliver
+	return g.deliver, ""
 }
 
 // wireResult is the subset of the stream-json terminal result line this test

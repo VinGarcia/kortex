@@ -35,6 +35,12 @@ type fakeGovernor struct {
 	redraftMessages  []anthropic.Message
 	callFinalizeWith []anthropic.Message
 	finalizeResult   string
+	// archiveNote, when set, is returned as-is alongside the delivered text
+	// (issue #5998) so a test can assert governTurn appends it to the
+	// persisted history verbatim. "" (the zero value, used by every test that
+	// predates this field) reproduces the exact pre-#5998 behavior: no note
+	// appended.
+	archiveNote string
 }
 
 func (f *fakeGovernor) GovernOutput(
@@ -45,7 +51,7 @@ func (f *fakeGovernor) GovernOutput(
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
-) string {
+) (string, string) {
 	f.gotDraft = draft
 	f.gotTurnIndex = turnIndex
 	f.gotMessages = messages
@@ -53,21 +59,21 @@ func (f *fakeGovernor) GovernOutput(
 	if f.callRedraftWith != nil {
 		text, msgs, err := redraft(ctx, f.callRedraftWith)
 		if err != nil {
-			return draft
+			return draft, f.archiveNote
 		}
 		f.redraftResult = text
 		f.redraftMessages = msgs
-		return text
+		return text, f.archiveNote
 	}
 	if f.callFinalizeWith != nil {
 		text, err := finalize(ctx, f.callFinalizeWith)
 		if err != nil {
-			return draft
+			return draft, f.archiveNote
 		}
 		f.finalizeResult = text
-		return text
+		return text, f.archiveNote
 	}
-	return f.deliver
+	return f.deliver, f.archiveNote
 }
 
 // sequencedResponder replies to each Messages API call with the next text in
@@ -111,12 +117,12 @@ func (g *recordingGovernor) GovernOutput(
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
-) string {
+) (string, string) {
 	g.turnIndices = append(g.turnIndices, turnIndex)
 	g.messageLens = append(g.messageLens, len(messages))
 	g.gotMessages = append(g.gotMessages, messages)
 	g.gotDigests = append(g.gotDigests, ephemeralDigest)
-	return g.deliver
+	return g.deliver, ""
 }
 
 // messageText renders one message's content for substring assertions: a plain
@@ -365,9 +371,9 @@ func (g *slowGovernor) GovernOutput(
 	draft string,
 	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
-) string {
+) (string, string) {
 	time.Sleep(g.delay)
-	return g.deliver
+	return g.deliver, ""
 }
 
 // TestRun_GovernorKeepaliveDuringLadder locks in the no-output-watchdog fix: a
@@ -729,6 +735,115 @@ func TestRun_ActiveGovernorDeliversGovernedText(t *testing.T) {
 	}
 	if content, ok := msgs[1].Content.(string); !ok || content != "governed-reply" {
 		t.Errorf("persisted final assistant = %+v, want the governed text", msgs[1].Content)
+	}
+}
+
+// TestRun_ActiveGovernorArchivesTailReferenceWithoutChangingDeliveredText
+// covers issue #5998: when GovernOutput reports a non-empty archiveNote,
+// governTurn must (a) append it verbatim onto the PERSISTED final assistant
+// message, while (b) leaving the wire-delivered text (the stream events and
+// the result) byte-for-byte identical to the governed text the governor
+// returned — i.e. archiving is a pure addition to context the core reads
+// back later, never a change to what the user already saw or to the
+// governor's own verdict/output. The note text itself simulates what facet's
+// conflictsLogger.retrievalHint renders; session treats it as opaque.
+func TestRun_ActiveGovernorArchivesTailReferenceWithoutChangingDeliveredText(t *testing.T) {
+	server, _ := sequencedResponder(t, "raw-draft")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	const note = "\n\n[superego conversation archived with ID #loop-abc123 — to review the rejected drafts and the superego's critiques behind this reply, search /var/log/kortex/example.jsonl.conflicts for the JSONL line where \"loopId\" is \"loop-abc123\"]"
+	gov := &fakeGovernor{deliver: "governed-reply", archiveNote: note}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Negative control (requirement c): the delivered text on the wire is
+	// UNCHANGED by archiving — no note, no id, exactly the governed text.
+	var assistantText, resultText string
+	for _, ev := range parseLines(t, out.String()) {
+		switch ev.Type {
+		case protocol.TypeAssistant:
+			if ev.Message != nil {
+				assistantText = ev.Message.TextContent()
+			}
+		case protocol.TypeResult:
+			resultText = ev.Result.Text
+		}
+	}
+	if assistantText != "governed-reply" {
+		t.Errorf("emitted assistant text = %q, want governed-reply unchanged by archiving", assistantText)
+	}
+	if resultText != "governed-reply" {
+		t.Errorf("emitted result text = %q, want governed-reply unchanged by archiving", resultText)
+	}
+	if strings.Contains(out.String(), "loop-abc123") {
+		t.Errorf("the archive reference leaked onto the wire, violating 'superego machinery stays invisible to the user':\n%s", out.String())
+	}
+
+	// Requirement (a)+(b): the PERSISTED final assistant message carries both
+	// the governed text and a reference naming the archived loop plus where to
+	// find it, so the core can recover the archived tail on a future turn.
+	msgs, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("persisted %d messages, want 2: %+v", len(msgs), msgs)
+	}
+	content, ok := msgs[1].Content.(string)
+	if !ok {
+		t.Fatalf("persisted final assistant content = %+v, want a string", msgs[1].Content)
+	}
+	if !strings.HasPrefix(content, "governed-reply") {
+		t.Errorf("persisted final assistant = %q, want it to still start with the governed text", content)
+	}
+	if !strings.Contains(content, "superego conversation archived with ID #loop-abc123") {
+		t.Errorf("persisted final assistant = %q, want it to reference archive ID #loop-abc123", content)
+	}
+	if !strings.Contains(content, "/var/log/kortex/example.jsonl.conflicts") {
+		t.Errorf("persisted final assistant = %q, want it to name the configured conflicts log path", content)
+	}
+	if !strings.Contains(content, `"loopId"`) || !strings.Contains(content, "loop-abc123") {
+		t.Errorf("persisted final assistant = %q, want retrieval instructions naming the loopId field to search for", content)
+	}
+}
+
+// TestRun_ActiveGovernorNoArchiveNoteWhenArchiveIDEmpty proves the archive
+// reference is only ever appended when GovernOutput actually reports a
+// non-empty archiveNote (issue #5998): with the zero-value archiveNote (what
+// every pre-#5998 governor/test produces), the persisted history must be
+// byte-for-byte what it was before this feature existed — no dangling
+// reference to a loop that was never archived.
+func TestRun_ActiveGovernorNoArchiveNoteWhenArchiveIDEmpty(t *testing.T) {
+	server, _ := sequencedResponder(t, "raw-draft")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{deliver: "governed-reply"} // archiveNote left at its zero value: ""
+
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &strings.Builder{}, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	msgs, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if content, ok := msgs[1].Content.(string); !ok || content != "governed-reply" {
+		t.Errorf("persisted final assistant = %+v, want exactly \"governed-reply\" with no archive note appended", msgs[1].Content)
 	}
 }
 

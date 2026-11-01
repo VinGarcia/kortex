@@ -87,6 +87,13 @@ type ToneDigester interface {
 // func types and only shared types (context/anthropic), so facet.ActiveSuperego
 // satisfies it structurally without session importing facet. A nil
 // Config.Governor leaves the pre-F2d (shadow/none) path unchanged.
+//
+// archiveNote (issue #5998) is an OPAQUE, already-rendered note string: the
+// governor owns deciding what it says and whether anything needs saying at
+// all ("" when it does not — no ladder ran, or the governor's own archive is
+// disabled). This package never parses or reconstructs it; governTurn just
+// appends a non-empty archiveNote to the PERSISTED copy of the final
+// assistant message (never the text already emitted to the wire).
 type OutputGovernor interface {
 	GovernOutput(
 		ctx context.Context,
@@ -96,7 +103,7 @@ type OutputGovernor interface {
 		draft string,
 		redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 		finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
-	) (text string)
+	) (text string, archiveNote string)
 }
 
 // maxLineBytes bounds one NDJSON input line. The default bufio.Scanner cap
@@ -744,7 +751,9 @@ func governTurn(
 	// assistant turn (superego aconselha, ego decide). ephemeralDigest carries the
 	// tone digest into the superego's review context (same digest the core saw,
 	// never persisted); finalize is the text-only core call for the final round.
-	finalText := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, ephemeralDigest, res.FinalText, redraft, finalize)
+	// archiveNote (issue #5998) is handled entirely below, AFTER EmitFinalTurn: it
+	// only ever touches the PERSISTED copy, never the text on the wire.
+	finalText, archiveNote := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, ephemeralDigest, res.FinalText, redraft, finalize)
 	stopKeepalive()
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
@@ -769,7 +778,29 @@ func governTurn(
 	//      live 2026-10-04. (Intermediate tool_use turns differ — RunLoop echoes
 	//      those verbatim via RawContent, signatures intact.)
 	finalMessages := replaceFinalAssistantText(res.Messages, finalText)
+	// archiveNote (issue #5998), when non-empty, is the governor's own
+	// ready-to-persist reference to the ladder it just ran (see
+	// OutputGovernor's doc comment — this package treats it as opaque).
+	// Append it to the PERSISTED copy only: finalText above is already what
+	// EmitFinalTurn put on the wire, unmodified, so this can never change
+	// what the user saw, only what the core's own next turn reads back.
+	if archiveNote != "" && len(finalMessages) > 0 {
+		finalMessages = appendArchiveNote(finalMessages, archiveNote)
+	}
 	return finalText, finalMessages, allRedraftCalls, nil
+}
+
+// appendArchiveNote returns a copy of messages with note appended to the
+// last message's content. It runs only on the PERSISTED copy governTurn
+// builds after EmitFinalTurn already sent the real delivered text over the
+// wire, so it can only affect what the core's own next turn reads back,
+// never what the user already saw.
+func appendArchiveNote(messages []anthropic.Message, note string) []anthropic.Message {
+	out := slices.Clone(messages)
+	last := len(out) - 1
+	text := out[last].Content.(string)
+	out[last] = anthropic.Message{Role: out[last].Role, Content: text + note}
+	return out
 }
 
 // startGovernorKeepalive brackets the active superego ladder with a keepalive

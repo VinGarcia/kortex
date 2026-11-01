@@ -16,7 +16,7 @@ import (
 // values). This file persists the COMPLETE ORDERED TAIL of that loop — draft,
 // critique1, meta-message (when the DebateMetaMessage feature is on),
 // draft2, critique2, ... — as one JSONL line, to a file separate from the
-// main facets log (conflictsLogPath, a sibling of it).
+// main facets log (a "<KORTEX_LOG>.conflicts" sibling of it).
 //
 // Every loop is logged here, not just the conflicted ones: a clean approve is
 // outcome "approve". Part 2 (stats aggregation, out of scope for this file)
@@ -38,6 +38,14 @@ import (
 // change the ladder's own control flow or delay/alter the delivered text —
 // GovernOutput calls conflictsLogger.record AFTER it has already decided the
 // text to deliver, purely as a side observation.
+//
+// Issue #5998 adds one more reader of this same log: once a loop's line has
+// actually landed here, GovernOutput can hand the session layer a short
+// retrievalHint (below) pointing back at it by loopId, so the core gets a
+// reference to its own archived conversation tail. This is the ONLY place
+// that invariant is stated: no second tail file is ever created for it, and
+// the session layer never sees this file's schema — retrievalHint renders
+// the complete, ready-to-persist note itself.
 
 // conflictsLogFacet names this producer's callLog entries distinctly from
 // activeSuperegoFacet, when a conflicts-log write failure itself is routed
@@ -119,6 +127,35 @@ func (c *conflictsLogger) record(entry ladderTailEntry) error {
 		return fmt.Errorf("write conflicts log entry: wrote %d of %d bytes", n, len(line))
 	}
 	return nil
+}
+
+// enabled reports whether this logger will actually record a loop: false
+// when the sink is nil (the documented off-by-default gate — see record's
+// own doc comment), in which case record is always a no-op regardless of
+// what it is asked to persist.
+func (c *conflictsLogger) enabled() bool {
+	return c != nil && c.sink != nil
+}
+
+// retrievalHint renders the complete note GovernOutput hands back as
+// archiveNote for a loop whose line has just landed in this log under id
+// (the caller, recordConflicts in superego_loop.go, only reaches this after
+// record() ran with a non-nil sink and returned no error — never for a loop
+// that is not really sitting here). It owns this log's on-disk shape (the
+// JSONL line, the loopId field) so callers outside this package treat the
+// returned string as opaque. where prefers the sink's own file path (the
+// production case: ConflictsLogSink is an *os.File) and falls back to a
+// generic description for sinks that don't name themselves (e.g. a test's
+// bytes.Buffer).
+func (c *conflictsLogger) retrievalHint(id string) string {
+	where := "the conflicts log"
+	if named, ok := c.sink.(interface{ Name() string }); ok {
+		where = named.Name()
+	}
+	return fmt.Sprintf(
+		"\n\n[superego conversation archived with ID #%s — to review the rejected drafts and the superego's critiques behind this reply, search %s for the JSONL line where \"loopId\" is %q]",
+		id, where, id,
+	)
 }
 
 // newLoopID mints a fresh per-loop identifier: 16 bytes of crypto/rand,

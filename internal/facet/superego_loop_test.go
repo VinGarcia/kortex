@@ -256,7 +256,7 @@ func TestActiveSuperego_ladder(t *testing.T) {
 			rd := &redrafter{drafts: test.redrafts, errs: test.redraftErr}
 			fin := &finalizer{text: coreFinal}
 
-			text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
+			text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
 
 			if !strings.Contains(text, test.wantText) {
 				t.Errorf("delivered text = %q, want containing %q", text, test.wantText)
@@ -370,7 +370,7 @@ func TestActiveSuperego_redraftToolCallsReachNextReview(t *testing.T) {
 			anthropic.NewToolResultBlock("t-orig", "resultados", false)}},
 	}
 
-	text := gov.GovernOutput(context.Background(), 0, messages, "", draft, rd.fn, (&finalizer{}).fn)
+	text, _ := gov.GovernOutput(context.Background(), 0, messages, "", draft, rd.fn, (&finalizer{}).fn)
 
 	if text != "rev2 com evidência" {
 		t.Fatalf("GovernOutput = %q, want the approved redraft", text)
@@ -447,7 +447,7 @@ func TestActiveSuperego_panicFailsOpen(t *testing.T) {
 	})
 	gov := NewActiveSuperego(ActiveSuperegoParams{Evaluator: eval, Superego: se, Model: "opus"})
 
-	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+	text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 	if text != draft {
 		t.Errorf("panic must fail open to the original draft: text=%q", text)
 	}
@@ -469,7 +469,7 @@ func TestActiveSuperego_spentLadderFinalRound(t *testing.T) {
 	rd := &redrafter{drafts: []string{"rev2", "rev3", "rev4"}}
 	fin := &finalizer{text: coreFinal}
 
-	text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
+	text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, fin.fn)
 
 	// The delivered text is the core's own final message, verbatim.
 	if text != coreFinal {
@@ -543,7 +543,7 @@ func TestActiveSuperego_debateMetaMessage(t *testing.T) {
 		gov, _, co := newTestGovernor([]scriptStep{gateFires()}, []scriptStep{superegoVerdictStep("approve")}, nil)
 		gov.debateMetaMessage = true
 
-		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+		text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 
 		if text != userText {
 			t.Errorf("delivered text = %q, want the draft with the note stripped (%q)", text, userText)
@@ -570,7 +570,7 @@ func TestActiveSuperego_debateMetaMessage(t *testing.T) {
 	t.Run("off: draft delivered verbatim and no framed note injected", func(t *testing.T) {
 		gov, _, co := newTestGovernor([]scriptStep{gateFires()}, []scriptStep{superegoVerdictStep("approve")}, nil)
 
-		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
+		text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, (&redrafter{}).fn, (&finalizer{}).fn)
 
 		if text != draft {
 			t.Errorf("feature off must deliver the draft verbatim, got %q", text)
@@ -600,7 +600,7 @@ func TestActiveSuperego_debateMetaRedraftPath(t *testing.T) {
 		gov.debateMetaMessage = true
 		rd := &redrafter{drafts: []string{redraft2}}
 
-		text := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, (&finalizer{}).fn)
+		text, _ := gov.GovernOutput(context.Background(), 0, govMessages(), "", draft, rd.fn, (&finalizer{}).fn)
 
 		if text != user2 {
 			t.Errorf("delivered redraft = %q, want the note stripped (%q)", text, user2)
