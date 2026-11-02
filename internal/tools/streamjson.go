@@ -31,10 +31,6 @@ type StreamEmitter struct {
 	// writes through it, so exclusion must live HERE — a half-interleaved NDJSON
 	// line is an unparseable wire — not in caller choreography.
 	writeMu sync.Mutex
-	// initSent guards systemInit so a session that reuses one emitter across
-	// several RunLoop turns emits exactly one system/init — matching the real
-	// claude-cli, which announces the session once at startup, not per turn.
-	initSent bool
 }
 
 // NewStreamEmitter builds an emitter writing to w. sessionID and newUUID are
@@ -43,21 +39,47 @@ func NewStreamEmitter(w io.Writer, sessionID string, newUUID func() string) *Str
 	return &StreamEmitter{w: w, sessionID: sessionID, newUUID: newUUID}
 }
 
-// systemInit emits the system/init line that opens the session — once. RunLoop
-// calls it at the top of every turn, but a multi-turn session reuses a single
-// emitter, so the guard collapses those calls to one init (the real claude-cli
-// emits system/init once per session, not per user turn). A single-turn caller
-// (the -p path, the parity harness) builds a fresh emitter per RunLoop and so
-// still emits exactly one.
+// systemInit emits the system/init line that opens a turn. RunLoop calls it at
+// the top of every turn (loop.go), so a multi-turn warm session — session.Run
+// reuses ONE emitter across every user turn of the process — emits a fresh
+// system/init at the start of each turn. A single-turn caller (the -p path, the
+// parity harness) builds a fresh emitter per RunLoop and so still emits exactly
+// one; an active-superego redraft runs RunLoop with a nil emitter and emits
+// none.
+//
+// WIRE DIVERGENCE (issue #6040): the real claude-cli announces system/init once
+// per PROCESS, not per turn, and kortex mirrored that until this change. The
+// per-turn re-emit is a deliberate divergence that works around an OpenClaw bug:
+// OpenClaw gates every loopback MCP tools/call on a per-turn "native tool
+// authority" allowlist (nativeCronCreatorToolAllowlist) that starts each turn as
+// null ("pending") and is populated from exactly ONE source — a claude
+// system/init stream-json record (its "tools" field). In a long-lived warm
+// claude-stdio session whose previous run crashed with loopback calls in flight,
+// OpenClaw force-closes the live session and loses the captured authority (it
+// lives only in a process-global in-memory map), but on resume it keeps
+// preparing each turn in the pending state and never re-receives an init, so the
+// allowlist stays null and every tool call is rejected ("Native tool authority
+// is not initialized") until the user starts a fresh session (/new). Re-emitting
+// system/init at the top of each turn re-populates that turn's capture, clearing
+// the stuck pending state without an upstream fix. See the full diagnosis in the
+// sylphie repo (native-tool-authority-not-initialized-diagnosis-2026-10-19).
+//
+// Safe to repeat on the same stream: OpenClaw's stream-json parser has no
+// once-only guard for system/init — it simply re-invokes the native-tool
+// authority capture (onNativeTools) for each init record and does NOT treat init
+// as a terminal/assistant/usage event or a round boundary (verified against the
+// installed OpenClaw 2026.9.6 dist: cli-live-session-registry handleParsedRecord
+// and execute-process' per-turn streaming parser). RunLoop calls this before any
+// assistant/user/result emission, so the init is always the first record of the
+// turn, never injected mid-round.
 func (e *StreamEmitter) systemInit(toolNames []string) error {
-	if e == nil || e.initSent {
+	if e == nil {
 		return nil
 	}
 	line, err := protocol.EmitSystemInit(e.sessionID, toolNames)
 	if err != nil {
 		return fmt.Errorf("tools: emitting system/init: %w", err)
 	}
-	e.initSent = true
 	return e.write(line)
 }
 

@@ -177,9 +177,12 @@ func TestRun_MultiTurnAccumulatesHistory(t *testing.T) {
 	if rec.lastMessageCount != 3 {
 		t.Errorf("second turn message count = %d, want 3 (prior user+assistant + new user)", rec.lastMessageCount)
 	}
-	// Two user turns => two terminal results, but exactly ONE system/init for
-	// the whole session (the real claude-cli announces the session once at
-	// startup, not per turn).
+	// Two user turns => two terminal results AND one system/init per turn. The
+	// per-turn re-emit is the #6040 workaround: OpenClaw re-populates its per-turn
+	// native-tool-authority allowlist only from a fresh system/init, and a warm
+	// session whose prior run crashed loses the captured authority, so every turn
+	// must re-announce it or tool calls stay rejected until /new. (This diverges
+	// from the real claude-cli's once-per-process init; see StreamEmitter.systemInit.)
 	results, inits := 0, 0
 	for _, ev := range parseLines(t, out.String()) {
 		switch {
@@ -192,8 +195,8 @@ func TestRun_MultiTurnAccumulatesHistory(t *testing.T) {
 	if results != 2 {
 		t.Errorf("terminal results = %d, want 2", results)
 	}
-	if inits != 1 {
-		t.Errorf("system/init count = %d, want exactly 1 for a multi-turn session", inits)
+	if inits != 2 {
+		t.Errorf("system/init count = %d, want one per turn (2) after the #6040 per-turn re-emit", inits)
 	}
 }
 

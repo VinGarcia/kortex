@@ -140,6 +140,65 @@ func TestRunLoop_emitsStreamJSON(t *testing.T) {
 	}
 }
 
+// TestRunLoop_reEmitsSystemInitEachTurn is the regression guard for issue #6040
+// ("Native tool authority is not initialized"). A long-lived warm session
+// (session.Run) reuses ONE emitter across every user turn, and OpenClaw
+// re-populates its per-turn native-tool-authority allowlist only from a fresh
+// system/init record. This drives two turns through the SAME emitter — exactly
+// the warm-session shape — and asserts each turn opens with its own system/init
+// carrying the tool list. The negative control: with the previous once-per-
+// process initSent guard, the second turn emitted NO init, so OpenClaw's
+// allowlist stayed stuck null and every tool call was rejected until /new.
+func TestRunLoop_reEmitsSystemInitEachTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	// One emitter, reused across two turns — the warm multi-turn session shape.
+	emitter := NewStreamEmitter(&out, "sess-warm", sequencedUUIDs())
+	for turn := 1; turn <= 2; turn++ {
+		if _, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+			Model:       "claude-haiku-4-5-20251001",
+			MaxTokens:   1024,
+			UserMessage: "ping",
+			Emitter:     emitter,
+		}); err != nil {
+			t.Fatalf("turn %d RunLoop error: %v", turn, err)
+		}
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	var inits int
+	for i, line := range lines {
+		ev := protocol.Parse(line)
+		if ev.ParseErr != nil {
+			t.Fatalf("line %d failed to parse: %v\n%s", i, ev.ParseErr, line)
+		}
+		if ev.Type != protocol.TypeSystem || ev.Subtype != "init" {
+			continue
+		}
+		inits++
+		// Each re-emitted init must still carry the tool list OpenClaw's capture
+		// reads; an init with an absent/empty tool list would not restore authority.
+		var initEvent struct {
+			Tools []string `json:"tools"`
+		}
+		if err := json.Unmarshal(line, &initEvent); err != nil {
+			t.Fatalf("decoding system/init tools: %v\n%s", err, line)
+		}
+		if !slices.Contains(initEvent.Tools, "bash") {
+			t.Errorf("init %d tools = %v, want it to contain the builtins", inits, initEvent.Tools)
+		}
+	}
+	if inits != 2 {
+		t.Fatalf("emitted %d system/init lines across two warm-session turns, want 2 (one per turn):\n%s", inits, out.String())
+	}
+}
+
 // TestRunLoop_resultUsageCumulative proves the terminal result reports usage
 // summed across every turn, not just the last one. It drives a three-turn loop
 // (two tool_use turns then end_turn), each turn carrying distinct counters, and
