@@ -448,6 +448,116 @@ func TestRun_ToolCallsPopulatedEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRun_PrunesStaleThinkingFromPastToolUseTurns is the end-to-end wiring
+// proof for the "thinking-prune" seam in runTurn (session/run.go): it drives
+// TWO user turns through the REAL Run/runTurn/RunLoop path, where turn 1
+// contains a genuine tool_use round trip whose assistant message carries a
+// thinking block alongside the tool_use block (exactly the shape a real
+// thinking-capable core model returns). It then inspects the RAW request
+// body the second turn's API call sends and asserts the thinking block from
+// turn 1's now-past, completed tool_use message is gone while the tool_use
+// block survives untouched. Without the anthropic.PruneThinkingFromHistory
+// call at the top of runTurn, that stale thinking block would still be
+// there — session.run.go's replaceFinalAssistantText only ever flattens a
+// turn's own TERMINAL message, never an intermediate tool_use turn like
+// this one.
+func TestRun_PrunesStaleThinkingFromPastToolUseTurns(t *testing.T) {
+	call := 0
+	var turn2RequestBody struct {
+		Messages []anthropic.Message `json:"messages"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		if call == 3 {
+			// Turn 2's one and only call: capture exactly what went over the
+			// wire, since that is what this test is proving about.
+			json.NewDecoder(r.Body).Decode(&turn2RequestBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			// Turn 1, round 1: a thinking block grounding the tool_use that
+			// follows it, in the same shape MessageResponse.RawContent/
+			// RunLoop echo verbatim into history (see client.go's
+			// ContentBlock/RawContent doc).
+			w.Write([]byte(`{
+				"content": [
+					{"type":"thinking","thinking":"let me check","signature":"sig-abc123"},
+					{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo hi"}}
+				],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 10, "output_tokens": 5}
+			}`))
+		case 2:
+			// Turn 1, round 2: the real Dispatcher's tool_result already fed
+			// back by RunLoop; this closes turn 1.
+			w.Write([]byte(`{
+				"content": [{"type":"text","text":"done turn 1"}],
+				"stop_reason": "end_turn",
+				"usage": {"input_tokens": 8, "output_tokens": 4}
+			}`))
+		default:
+			// Turn 2: whatever history led up to this call is what matters.
+			w.Write([]byte(`{
+				"content": [{"type":"text","text":"done turn 2"}],
+				"stop_reason": "end_turn",
+				"usage": {"input_tokens": 8, "output_tokens": 4}
+			}`))
+		}
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin: strings.NewReader(strings.Join([]string{
+			initializeLine("sys"),
+			userLine("s", "first"),
+			userLine("s", "second"),
+		}, "\n") + "\n"),
+		Stdout:     &out,
+		Client:     client,
+		Dispatcher: tools.NewDispatcher(),
+		Store:      NewStore(t.TempDir()),
+		SessionID:  "s",
+		Model:      "m",
+		MaxTokens:  1024,
+		NewUUID:    seqUUID(),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if call != 3 {
+		t.Fatalf("API calls = %d, want 3 (2 for turn 1's tool_use round trip, 1 for turn 2)", call)
+	}
+
+	// Message layout turn 2 must send: [user "first", assistant (turn 1's
+	// intermediate tool_use turn), user (tool_result), assistant ("done turn
+	// 1", flattened to plain text), user "second"]. Index 1 is the one under
+	// test: originally thinking+tool_use, it must arrive with ONLY the
+	// tool_use block.
+	if len(turn2RequestBody.Messages) < 2 {
+		t.Fatalf("turn 2 request messages = %d, want at least 2 (turn 1's history first)", len(turn2RequestBody.Messages))
+	}
+	blocks, ok := turn2RequestBody.Messages[1].Content.([]any)
+	if !ok {
+		t.Fatalf("messages[1].Content = %#v (%T), want a content-block array", turn2RequestBody.Messages[1].Content, turn2RequestBody.Messages[1].Content)
+	}
+	sawToolUse := false
+	for _, b := range blocks {
+		block, _ := b.(map[string]any)
+		switch block["type"] {
+		case "thinking", "redacted_thinking":
+			t.Errorf("turn 2's request still carries a stale %v block from turn 1's completed tool_use turn: %v", block["type"], blocks)
+		case "tool_use":
+			sawToolUse = true
+		}
+	}
+	if !sawToolUse {
+		t.Errorf("turn 2's request lost the tool_use block entirely, want it to survive pruning: %v", blocks)
+	}
+}
+
 // fakeToneDigester is a stub ToneDigester that returns a fixed digest and
 // records the user texts it was handed, so a test can assert both the injected
 // block AND that the digester saw the session's annotated user messages.
