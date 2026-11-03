@@ -218,6 +218,46 @@ func TestCacheWatchdog_historyBreakpointDeadCrossTurn(t *testing.T) {
 		}
 	})
 
+	t.Run("a healthy turn in the middle resets the streak", func(t *testing.T) {
+		// Proves the sickStreak RESET branch inside observeHistoryTrend actually
+		// runs: two sick turns build a partial streak, then one healthy turn
+		// (cache_read grows) must discard it. If that reset silently stopped
+		// firing, the pre-existing partial streak would carry into the fresh run
+		// below and this would fire one turn earlier than asserted.
+		var buf bytes.Buffer
+		w := NewCacheWatchdog(&buf, time.Minute)
+		model := "claude-opus-4-8"
+
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 5000}) // baseline
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 8000}) // sick, streak=1
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 8500}) // sick, streak=2
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("before the healthy turn: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+
+		// Healthy turn: cache_read grows (history being read back), breaking
+		// the streak.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 5000, CacheCreationInputTokens: 3000})
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("the healthy turn itself: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+
+		// A fresh run of historyBreakpointDeadStreak-1 sick turns must still stay
+		// silent — if it fired here, the earlier streak would have carried over.
+		for i := 0; i < historyBreakpointDeadStreak-1; i++ {
+			w.observe(model, historySystem, Usage{CacheReadInputTokens: 5000, CacheCreationInputTokens: 9000})
+		}
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("fresh streak not yet complete: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+
+		// The turn that completes the fresh streak fires exactly once.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 5000, CacheCreationInputTokens: 9500})
+		if got := len(warnLines(buf.String())); got != 1 {
+			t.Fatalf("fresh streak complete: want exactly 1 WARN line, got %d: %q", got, buf.String())
+		}
+	})
+
 	t.Run("sick: stagnant cache_read with large cache_creation fires exactly once, then respects cooldown", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := NewCacheWatchdog(&buf, 5*time.Minute)
