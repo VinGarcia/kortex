@@ -149,6 +149,124 @@ func TestCacheWatchdog_throttle(t *testing.T) {
 	}
 }
 
+// historySystem is the system array every cross-turn test below sends: marked
+// (so observe's case (a)/(b) system-prefix checks stay silent — this suite
+// exercises observeHistoryTrend in isolation) and above every model's floor
+// (so case (a) sees cachedTokens from a real cache_creation/cache_read pair,
+// never zero, on every turn these tests construct).
+var historySystem = markLast(systemAboveFloor)
+
+// TestCacheWatchdog_historyBreakpointDeadCrossTurn exercises observeHistoryTrend,
+// the cross-turn detector for a dead message-HISTORY breakpoint (Vini backlog
+// #6079). Each subtest replays a sequence of turns on one watchdog and checks
+// the cumulative WARN count after each turn, because the signature this
+// detector hunts for is only visible ACROSS turns, never on one in isolation.
+func TestCacheWatchdog_historyBreakpointDeadCrossTurn(t *testing.T) {
+	t.Run("healthy: growing cache_read across turns fires nothing", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewCacheWatchdog(&buf, time.Minute)
+		model := "claude-opus-4-8"
+
+		// Turn 1: first-ever write, nothing to read back yet.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 0, CacheCreationInputTokens: 5000})
+		// Turns 2-4: cache_read keeps climbing as history accumulates — the
+		// intended steady state the cache fix (7065f8d/4be22b9) exists to produce.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 5000, CacheCreationInputTokens: 3000})
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 8000, CacheCreationInputTokens: 2000})
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 10000, CacheCreationInputTokens: 1500})
+
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("healthy growing session: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+	})
+
+	t.Run("first turn alone never fires", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewCacheWatchdog(&buf, time.Minute)
+
+		// A single turn, however sick-looking (flat read would-be, large write),
+		// can never fire: there is no previous turn to compare against yet.
+		w.observe("claude-opus-4-8", historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 10000})
+
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("first turn alone: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+	})
+
+	t.Run("negative control: 2 consecutive sick turns never fire", func(t *testing.T) {
+		// Negative control for historyBreakpointDeadStreak (currently 3): the
+		// turn count below is a HARDCODED 2, deliberately NOT derived from the
+		// constant, so this is a real trap rather than a test that silently
+		// tracks whatever the constant says. Today 2 < 3, so this asserts
+		// silence; if the predicate were ever relaxed to require only 2
+		// consecutive sick turns (or fewer), this exact sequence would start
+		// firing and this test would fail — proving the "3" in
+		// historyBreakpointDeadStreak is load-bearing, not cosmetic.
+		var buf bytes.Buffer
+		w := NewCacheWatchdog(&buf, time.Minute)
+		model := "claude-opus-4-8"
+
+		// Baseline turn: sets prevCacheRead, never itself judged.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 5000})
+		// 2 consecutive sick turns: stagnant read, large write, every time.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 8000})
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 8500})
+
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("2 consecutive sick turns (below the streak of %d): want 0 WARN lines, got %d: %q",
+				historyBreakpointDeadStreak, got, buf.String())
+		}
+	})
+
+	t.Run("sick: stagnant cache_read with large cache_creation fires exactly once, then respects cooldown", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewCacheWatchdog(&buf, 5*time.Minute)
+		clock := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+		w.now = func() time.Time { return clock }
+		model := "claude-opus-4-8"
+
+		// Baseline turn: sets prevCacheRead=1200, never itself judged.
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 5000})
+
+		// historyBreakpointDeadStreak consecutive sick turns: cache_read pinned at
+		// the system-prefix-only level while cache_creation keeps paying for the
+		// (growing) history every turn — the autópsia'd session's signature.
+		for i := 0; i < historyBreakpointDeadStreak-1; i++ {
+			clock = clock.Add(time.Minute)
+			w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 8000})
+		}
+		if got := len(warnLines(buf.String())); got != 0 {
+			t.Fatalf("before the streak completes: want 0 WARN lines, got %d: %q", got, buf.String())
+		}
+
+		// This turn completes the streak: exactly one alert.
+		clock = clock.Add(time.Minute)
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 9000})
+		if got := len(warnLines(buf.String())); got != 1 {
+			t.Fatalf("streak complete: want exactly 1 WARN line, got %d: %q", got, buf.String())
+		}
+		lines := warnLines(buf.String())
+		if !strings.Contains(lines[0], "case="+string(cacheAlertHistoryBreakpointDead)) {
+			t.Errorf("WARN line = %q, want case=%s", lines[0], cacheAlertHistoryBreakpointDead)
+		}
+
+		// One more sick turn, 1 minute later — still inside the 5-minute cooldown:
+		// the detector would fire again, but the shared throttle suppresses it.
+		clock = clock.Add(time.Minute)
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 9500})
+		if got := len(warnLines(buf.String())); got != 1 {
+			t.Fatalf("within cooldown: want 1 WARN line, got %d: %q", got, buf.String())
+		}
+
+		// Past the cooldown, the still-sick session re-fires.
+		clock = clock.Add(5 * time.Minute)
+		w.observe(model, historySystem, Usage{CacheReadInputTokens: 1200, CacheCreationInputTokens: 9800})
+		if got := len(warnLines(buf.String())); got != 2 {
+			t.Fatalf("after cooldown: want 2 WARN lines, got %d: %q", got, buf.String())
+		}
+	})
+}
+
 // TestCreateMessage_cacheWatchdog proves the Client wires the watchdog on the
 // real response path (a healthy large prefix stays silent) and that a nil
 // watchdog is a silent no-op — the fail-safe default that never touches the
