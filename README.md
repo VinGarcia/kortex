@@ -22,6 +22,35 @@ pass-through proxy (F1 behavior, running in production as a canary).
 Facets are strictly fail-open: any evaluator failure (API error, timeout,
 malformed output) forwards the original line untouched.
 
+
+## Deploy (canary)
+
+The OpenClaw gateway invokes kortex through the `kortex-cli` backend
+(`~/.openclaw/extensions/kortex-cli/index.js`), which spawns the `kortex`
+binary **resolved via the gateway's PATH** on every invocation. There is no
+long-lived kortex process and no gateway restart involved in a deploy: the
+next run simply picks up whatever binary is on disk.
+
+Two copies of the binary exist on PATH-relevant locations and must stay in
+sync (`~/.local/bin/kortex` is the one the gateway shell resolves first;
+`~/go/bin/kortex` is `go install`'s default target). `make install` builds
+once and installs to both:
+
+```sh
+make install   # runs the test suite, then installs to ~/.local/bin and ~/go/bin
+```
+
+Verify what is deployed (vcs.revision must match the intended commit and
+vcs.modified must be false):
+
+```sh
+go version -m ~/.local/bin/kortex | grep -E 'vcs.revision|vcs.modified'
+```
+
+Canary deploys are pre-authorized (Vini #4645/#4648: new build + green tests
+⇒ install and smoke in the Kortex Telegram group; only expansion beyond the
+canary group needs explicit sequencing with him).
+
 ## Architecture
 
 Thin `main.go` (env/config wiring and facet construction — the composition

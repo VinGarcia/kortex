@@ -10,4 +10,8 @@ test:
 smoke:
 	./hack/smoke.sh
 
-.PHONY: lint test smoke
+.PHONY: lint test smoke install
+
+install: test
+	GOBIN=$(HOME)/.local/bin go install .
+	GOBIN=$(HOME)/go/bin go install .
