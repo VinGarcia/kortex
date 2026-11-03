@@ -43,16 +43,13 @@ import (
 // window still finds the previous turn's cache entry. Unverified; confirm
 // against usage counters on the first live session.
 //
-// Observability gap (known, accepted): unlike markStableSystemPrefix, this
-// breakpoint is not covered by CacheWatchdog. The failure signature is
-// already known: the system prefix has a fixed size, so cache_read staying
-// pinned near that size while cache_creation keeps paying for the full
-// history on every request is the sick pattern this breakpoint exists to
-// avoid. What's deferred is cost, not knowledge — baselining
-// cache_creation/cache_read across turns to apply that signal automatically
-// is new monitoring surface, not a small addition to the existing
-// per-request classifier — left as a follow-up rather than folded into this
-// change.
+// Observability: this breakpoint IS covered by CacheWatchdog, cross-turn
+// (see CacheWatchdog.observeHistoryTrend, cache_watchdog.go). The sick
+// pattern is exactly what this comment used to describe as a known gap: the
+// system prefix has a fixed size, so cache_read staying pinned near that size
+// while cache_creation keeps paying for the full history on every request is
+// what observeHistoryTrend baselines across turns to detect — that gap is now
+// closed (Vini backlog #6079).
 func markMessagesCachePrefix(model string, messages []Message) []Message {
 	if len(messages) == 0 {
 		return messages
