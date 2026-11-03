@@ -31,57 +31,35 @@ const (
 	// cacheable — the "born blind" regression the pre-037d2951 native client
 	// shipped, where every turn re-billed the whole context.
 	cacheAlertBornBlind cacheAlertKind = "no_breakpoint_despite_eligible_prefix"
-	// cacheAlertHistoryBreakpointDead is the cross-turn regression this file's
-	// Vini backlog #6079 adds: the message-HISTORY breakpoint (see
-	// markMessagesCachePrefix, cache_messages.go) has silently died. Unlike the
-	// two cases above, this is not visible on one turn in isolation — a single
-	// response's usage numbers cannot tell "history breakpoint dead" apart from
-	// "history just isn't big enough to cache yet". It only shows up by
-	// comparing usage ACROSS several turns of the same session (see
-	// observeHistoryTrend): cache_read_input_tokens stops growing while
-	// cache_creation_input_tokens stays large every turn, i.e. the whole
-	// history is being re-written from scratch instead of the system prefix
-	// (and, when healthy, the cached history) being read back. This is exactly
-	// the autópsia'd 1.4M-token session's failure mode: only the system
-	// breakpoint was ever alive, so every turn re-billed the entire growing
-	// history at full price.
+	// cacheAlertHistoryBreakpointDead is the cross-turn regression Vini backlog
+	// #6079 adds: the message-HISTORY breakpoint (markMessagesCachePrefix,
+	// cache_messages.go) has silently died — the autópsia'd 1.4M-token
+	// session's failure mode, where only the system breakpoint was ever alive
+	// and the whole growing history re-billed at full price every turn. Unlike
+	// the two cases above, no single response can tell "breakpoint dead" apart
+	// from "history not cacheable yet"; only the TREND across turns can (see
+	// observeHistoryTrend).
 	cacheAlertHistoryBreakpointDead cacheAlertKind = "history_breakpoint_dead_cross_turn"
 )
 
-// historyBreakpointDeadStreak is how many CONSECUTIVE turns must show the
-// sick cross-turn signature (see observeHistoryTrend) before
-// cacheAlertHistoryBreakpointDead fires. This is the judgment call most
-// likely to need revisiting:
-//   - 1 turn is never enough by construction — a session's first-ever
-//     observation has no prior cache_read to compare against, and a single
-//     later turn can look sick for entirely benign reasons: a prompt-cache
-//     entry has a short TTL, so a turn that arrives after an idle gap longer
-//     than the TTL legitimately has to rewrite history it would otherwise
-//     have read back, producing exactly one stagnant-read/large-write turn
-//     with no underlying regression.
-//   - 3 is chosen so that one such benign rewrite (or one early turn whose
-//     history is still below the cacheable floor) can never by itself trip
-//     the alert; three turns in a row with zero read growth, each separately
-//     clearing the "large write" bar, is past the point any single benign
-//     explanation stays plausible. There is no measured false-positive rate
-//     behind this number — it is a deliberately conservative starting point,
-//     not a tuned threshold.
+// historyBreakpointDeadStreak is how many CONSECUTIVE sick turns (see
+// observeHistoryTrend) must accumulate before cacheAlertHistoryBreakpointDead
+// fires. Judgment call, most likely to need revisiting: 1 turn is never
+// enough — the first-ever observation has no baseline, and even a single
+// later turn can look sick for a benign reason (a cache entry's TTL expiring
+// after an idle gap forces one legitimate rewrite). 3 is a deliberately
+// conservative starting point — not a tuned, measured number — chosen so one
+// benign rewrite can never by itself trip the alert.
 const historyBreakpointDeadStreak = 3
 
 // historyTurnState remembers one model's previous-turn usage numbers so
 // observeHistoryTrend can compare turn N against turn N-1 instead of judging
 // a single response in isolation. Guarded by CacheWatchdog.mu, the same lock
-// that already guards lastFired.
-//
-// This lives only in process memory, like lastFired above it: it is a
-// diagnostic streak counter, not state the product needs correct across a
-// restart (see package u-no-durable-state-in-memory's "pods are ephemeral"
-// reasoning for WHY that rule exists) — a kortex native process is already
-// one-process-per-session (see main.go's nativeSessionID doc comment), so a
-// restart starts a new session anyway, and losing an in-flight streak on
-// restart just costs one extra turn before the detector re-arms, which is the
-// same "benign, re-observed next call" shape as every other piece of state in
-// this file.
+// that already guards lastFired. Like lastFired, it lives only in process
+// memory: a kortex native process is already one-process-per-session (see
+// main.go's nativeSessionID doc comment), so losing an in-flight streak on
+// restart just costs one extra turn before the detector re-arms — the same
+// benign, re-observed-next-call shape as every other piece of state here.
 type historyTurnState struct {
 	// havePrev is false until this model's first turn is observed; the first
 	// turn is never judged sick (see observeHistoryTrend).
@@ -206,45 +184,31 @@ func (w *CacheWatchdog) observe(model string, system []systemBlock, usage Usage)
 }
 
 // observeHistoryTrend detects a dead message-HISTORY breakpoint by comparing
-// this turn's usage against the SAME model's previous turn (see
-// historyTurnState) — something observe's two cases above cannot do, because
-// they only ever see one response at a time. A single turn's
-// cache_read/cache_creation pair cannot distinguish "the history breakpoint
-// died" from "the history just isn't cacheable yet"; only the TREND across
-// several turns can.
-//
-// The sick signature, and why each piece of the predicate is there:
-//   - Stagnant read: usage.CacheReadInputTokens <= the previous turn's. A
-//     healthy session's read count is expected to be non-decreasing as more
-//     history becomes eligible to be read back (system prefix, then also the
-//     growing cached history once the fix in 7065f8d/4be22b9 is doing its
-//     job); strict non-growth — not a tolerance band — means a session that
-//     is merely growing slowly is never flagged, only one that never grows
-//     across several turns in a row.
+// this turn's usage against the SAME model's previous turn (historyTurnState)
+// — the TREND observe's two single-response cases cannot see. Sick signature,
+// required every turn of the streak:
+//   - Stagnant read: usage.CacheReadInputTokens <= the previous turn's. Strict
+//     non-growth, not a tolerance band, so a session merely growing slowly is
+//     never flagged — only one that never grows at all.
 //   - Large write: usage.CacheCreationInputTokens >= minCacheableTokens(model).
-//     Reusing the existing per-model cacheable floor as the bar for "large"
-//     (rather than inventing a new magnitude) is a judgment call: it is the
-//     same floor markMessagesCachePrefix itself uses to decide a breakpoint is
-//     even worth placing, so a write at or above it is, by this client's own
-//     yardstick, a non-trivial rewrite — consistent with "the whole history
-//     got re-billed", not a small incremental tail. The known false-positive
-//     risk this accepts: a turn whose NEW tail content alone clears the floor
-//     (e.g. one huge tool result) looks sick by this test alone; the streak
-//     requirement below is what keeps that from mattering.
-//   - historyBreakpointDeadStreak consecutive turns matching BOTH of the above
-//     — see that constant's doc comment for why 3, and for the single-turn
-//     benign explanations (TTL-expiry rewrite, early below-floor turns) this
-//     guards against.
+//     Reusing the existing per-model floor as the "large" bar (judgment call,
+//     not a new magnitude) is markMessagesCachePrefix's own yardstick for "a
+//     non-trivial rewrite happened". Known false-positive risk: a turn whose
+//     new tail alone clears the floor (one huge tool result) looks sick on
+//     this check alone — historyBreakpointDeadStreak is what absorbs that.
 //
 // Like observe, this never blocks/mutates/errors the request flow — it only
-// ever writes a throttled WARN line via the shared fire/lastFired path, so
-// cacheAlertHistoryBreakpointDead rate-limits independently of the two
-// system-prefix cases on the same model.
+// ever writes a throttled WARN line via the shared fire/lastFired path.
 func (w *CacheWatchdog) observeHistoryTrend(model string, system []systemBlock, usage Usage) {
 	w.mu.Lock()
 	state := w.historyState[model]
+	// previousCacheRead is the baseline this turn is judged against; captured
+	// before state.prevCacheRead is overwritten below so the WARN line (if any)
+	// can report what "stagnant" was measured relative to, not just this turn's
+	// own number.
+	previousCacheRead := state.prevCacheRead
 	sick := state.havePrev &&
-		usage.CacheReadInputTokens <= state.prevCacheRead &&
+		usage.CacheReadInputTokens <= previousCacheRead &&
 		usage.CacheCreationInputTokens >= minCacheableTokens(model)
 	if sick {
 		state.sickStreak++
@@ -255,18 +219,29 @@ func (w *CacheWatchdog) observeHistoryTrend(model string, system []systemBlock, 
 	state.prevCacheRead = usage.CacheReadInputTokens
 	w.historyState[model] = state
 	shouldFire := state.sickStreak >= historyBreakpointDeadStreak
+	streak := state.sickStreak
 	w.mu.Unlock()
 
 	if shouldFire {
-		w.fire(model, cacheAlertHistoryBreakpointDead, system, usage)
+		// prev_cache_read_input_tokens and sick_streak are the two numbers this
+		// alert's own verdict rests on but that the shared fire() payload has no
+		// field for (it reports only THIS turn's counters) — without them a
+		// reader sees case=history_breakpoint_dead_cross_turn fire with no way to
+		// confirm the read count actually stalled across turns.
+		w.fire(model, cacheAlertHistoryBreakpointDead, system, usage,
+			fmt.Sprintf("prev_cache_read_input_tokens=%d", previousCacheRead),
+			fmt.Sprintf("sick_streak=%d", streak))
 	}
 }
 
 // fire emits one WARN line unless an identical (model, kind) alert fired within
 // the cooldown window. The throttle check and the timestamp update happen under
 // the lock so concurrent core calls cannot both slip through; the write itself
-// is outside the lock.
-func (w *CacheWatchdog) fire(model string, kind cacheAlertKind, system []systemBlock, usage Usage) {
+// is outside the lock. extra appends additional "key=value" fields after the
+// shared payload — e.g. observeHistoryTrend uses it to carry the cross-turn
+// comparison data (previous cache_read, streak length) that the shared fields
+// alone cannot express; observe's two single-turn cases pass none.
+func (w *CacheWatchdog) fire(model string, kind cacheAlertKind, system []systemBlock, usage Usage, extra ...string) {
 	key := cacheAlertKey{model: model, kind: kind}
 	now := w.now()
 
@@ -278,13 +253,17 @@ func (w *CacheWatchdog) fire(model string, kind cacheAlertKind, system []systemB
 	w.lastFired[key] = now
 	w.mu.Unlock()
 
-	fmt.Fprintf(w.out, "kortex: WARN prompt-cache degraded on core message path: "+
+	line := fmt.Sprintf("kortex: WARN prompt-cache degraded on core message path: "+
 		"component=anthropic.cache_watchdog model=%s case=%s cache_breakpoint_set=%t "+
 		"estimated_system_tokens=%d min_cacheable_tokens=%d cache_read_input_tokens=%d "+
-		"cache_creation_input_tokens=%d input_tokens=%d\n",
+		"cache_creation_input_tokens=%d input_tokens=%d",
 		model, kind, systemHasBreakpoint(system), estimatedSystemTokens(system),
 		minCacheableTokens(model), usage.CacheReadInputTokens,
 		usage.CacheCreationInputTokens, usage.InputTokens)
+	for _, field := range extra {
+		line += " " + field
+	}
+	fmt.Fprintln(w.out, line)
 }
 
 // reportDefect emits one `kortex:`-prefixed line when the watchdog itself
