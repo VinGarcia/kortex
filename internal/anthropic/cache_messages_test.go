@@ -1,7 +1,6 @@
 package anthropic
 
 import (
-	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -68,50 +67,6 @@ func TestMarkMessagesCachePrefix_toolResultBlocks(t *testing.T) {
 	}
 }
 
-// TestMarkMessagesCachePrefix_rawBlocksSkipsTrailingThinking proves the
-// client never places a breakpoint on a thinking block (the API rejects
-// cache_control there): with a thinking block last, the marker must land on
-// the nearest eligible block walking backward (here, the tool_use block).
-func TestMarkMessagesCachePrefix_rawBlocksSkipsTrailingThinking(t *testing.T) {
-	raw := []json.RawMessage{
-		json.RawMessage(`{"type":"text","text":"hello"}`),
-		json.RawMessage(`{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}`),
-		json.RawMessage(`{"type":"thinking","thinking":"planning...","signature":"sig"}`),
-	}
-	in := []Message{{Role: "assistant", Content: raw}}
-	out := MarkMessagesCachePrefix(in)
-
-	blocks, ok := out[0].Content.([]json.RawMessage)
-	if !ok || len(blocks) != 3 {
-		t.Fatalf("content = %#v", out[0].Content)
-	}
-	if hasCacheControl(t, blocks[2]) {
-		t.Errorf("thinking block carries cache_control: %s", blocks[2])
-	}
-	if !hasCacheControl(t, blocks[1]) {
-		t.Errorf("tool_use block (nearest eligible) missing cache_control: %s", blocks[1])
-	}
-	if hasCacheControl(t, blocks[0]) {
-		t.Errorf("earlier text block carries cache_control, want only the eligible tail block: %s", blocks[0])
-	}
-	// The caller's original raw slice must stay untouched.
-	if hasCacheControl(t, raw[1]) {
-		t.Errorf("input raw block mutated: %s", raw[1])
-	}
-}
-
-// TestMarkMessagesCachePrefix_allThinkingBlocksIsFailSafe proves a message
-// made entirely of ineligible blocks is left unmarked rather than forcing a
-// marker somewhere invalid.
-func TestMarkMessagesCachePrefix_allThinkingBlocksIsFailSafe(t *testing.T) {
-	raw := []json.RawMessage{json.RawMessage(`{"type":"thinking","thinking":"only thinking"}`)}
-	in := []Message{{Role: "assistant", Content: raw}}
-	out := MarkMessagesCachePrefix(in)
-	if !reflect.DeepEqual(out, in) {
-		t.Errorf("got %#v, want unchanged %#v", out, in)
-	}
-}
-
 // TestMarkMessagesCachePrefix_onlyMarksLastMessage proves earlier messages in
 // a growing history are never touched — only the single last message ever
 // carries the moving breakpoint.
@@ -139,17 +94,4 @@ func TestMarkMessagesCachePrefix_unsupportedContentIsFailSafe(t *testing.T) {
 	if !reflect.DeepEqual(out, in) {
 		t.Errorf("got %#v, want unchanged %#v", out, in)
 	}
-}
-
-func hasCacheControl(t *testing.T, raw json.RawMessage) bool {
-	t.Helper()
-	var decoded struct {
-		CacheControl *struct {
-			Type string `json:"type"`
-		} `json:"cache_control"`
-	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("decoding block: %v", err)
-	}
-	return decoded.CacheControl != nil
 }

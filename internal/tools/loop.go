@@ -165,19 +165,15 @@ type LoopResult struct {
 
 // withEphemeralContext is the ONLY path either RunLoop call site uses to turn
 // canonical messages into the array sent on the wire: it first places the
-// prompt-cache breakpoint on the real history (anthropic.MarkMessagesCachePrefix)
-// and only THEN appends, when ephemeral is non-empty, one extra trailing user
-// message carrying ephemeral injected context (the tone digest). That order is
-// load-bearing — marking after the append would put the breakpoint on this
+// prompt-cache breakpoint on the real history (anthropic.MarkMessagesCachePrefix),
+// then appends, when ephemeral is non-empty, one extra trailing user message
+// carrying ephemeral injected context (the tone digest). Marking must happen
+// BEFORE the append — marking after would put the breakpoint on this
 // volatile, per-turn-unique tail instead of on stable history, turning every
-// call into a cache write with no matching read (see MarkMessagesCachePrefix's
-// doc) — so it is enforced here structurally, in one function, rather than left
-// as an order two separate calls at each call site would have to get right.
-// The result is only ever handed to a single CreateMessage call; the caller's
-// accumulating messages slice is never mutated (MarkMessagesCachePrefix and the
-// append below both allocate fresh slices), so neither the breakpoint nor the
-// ephemeral content ever enters the returned LoopResult, canonical history, or
-// the stream.
+// call into a cache write with no matching read. The result is only ever
+// handed to a single CreateMessage call; the caller's accumulating messages
+// slice is never mutated, so neither the breakpoint nor the ephemeral content
+// ever enters the returned LoopResult, canonical history, or the stream.
 func withEphemeralContext(messages []anthropic.Message, ephemeral string) []anthropic.Message {
 	marked := anthropic.MarkMessagesCachePrefix(messages)
 	if ephemeral == "" {
