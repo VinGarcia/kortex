@@ -1,6 +1,9 @@
 package anthropic
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // markMessagesCachePrefix returns messages with one ephemeral cache_control
 // breakpoint added to the last eligible content block of the LAST message, so
@@ -37,8 +40,8 @@ import "encoding/json"
 // wrapped form, so the same message goes out as a plain string again on the
 // next turn. This assumes the API normalizes both shapes to the same
 // cache-prefix hash; if it doesn't, the worst case is benign — the lookback
-// window still finds the previous turn's cache entry. Confirmed against the
-// usage counters on the first live session.
+// window still finds the previous turn's cache entry. Unverified; confirm
+// against usage counters on the first live session.
 //
 // Observability gap (known, accepted): unlike markStableSystemPrefix, this
 // breakpoint is not covered by CacheWatchdog. The failure signature is
@@ -152,18 +155,29 @@ func markLastEligibleBlock(msg Message) (Message, bool) {
 var thinkingBlockTypes = map[string]bool{"thinking": true, "redacted_thinking": true}
 
 // addCacheControlToRawBlock returns raw with a top-level "cache_control":
-// {"type":"ephemeral"} field added, and whether that succeeded. It decodes
-// into a generic field map rather than a typed struct so every field the raw
-// block already carries (type, text, id, name, input, an unmodeled field
-// like tool_use's "caller" — anything) survives untouched; only the new key
-// is added. Used for an echoed assistant turn's content block, whose exact
-// shape (text, tool_use, ...) this client does not otherwise need to know to
-// mark it — except its "type", checked against thinkingBlockTypes, since that
-// one shape is rejected rather than silently ignored. Any decode/encode
-// failure (including a non-object block — raw as the bare JSON literal
-// "null" decodes into a nil map with no error, which would otherwise panic on
-// the field assignment below) reports false so the caller's fail-safe (skip
-// marking) applies instead of corrupting the block or crashing the request.
+// {"type":"ephemeral"} field added, and whether that succeeded. The cache
+// key Anthropic hashes is the exact bytes of the rendered block, so this
+// must not round-trip raw through json.Unmarshal into a map and back
+// through json.Marshal: Go's map marshaling sorts keys alphabetically and
+// HTML-escapes '<', '>', '&', either of which reorders or rewrites bytes
+// the previous turn already hashed, silently breaking the cache hit on
+// every following turn. Instead it splices the new field in literally, byte
+// for byte, immediately before the block's closing '}', so every original
+// byte — field order, spacing, escaping — survives untouched.
+//
+// It still decodes raw into a generic field map, but only to read, never to
+// re-encode: that read gets the block's "type" so it can be checked against
+// thinkingBlockTypes, the one shape the Messages API rejects a
+// cache_control marker on. A decode failure (including a non-object block,
+// or the bare JSON literal "null" decoding into a nil map with no error)
+// reports false immediately, before any byte is touched.
+//
+// Once the type check clears, it re-validates the raw bytes directly: the
+// trimmed block must start with '{' and end with '}', or splicing before a
+// closing brace that doesn't belong to the object would corrupt the block.
+// Only the trimmed bytes are spliced — never raw itself — so any
+// leading/trailing whitespace around the object is dropped rather than
+// ending up on the wrong side of the spliced field.
 func addCacheControlToRawBlock(raw json.RawMessage) (json.RawMessage, bool) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
@@ -173,15 +187,17 @@ func addCacheControlToRawBlock(raw json.RawMessage) (json.RawMessage, bool) {
 	if err := json.Unmarshal(fields["type"], &blockType); err == nil && thinkingBlockTypes[blockType] {
 		return nil, false
 	}
-	cc, err := json.Marshal(cacheControl{Type: "ephemeral"})
-	if err != nil {
+
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return nil, false
 	}
-	fields["cache_control"] = cc
-	out, err := json.Marshal(fields)
-	if err != nil {
-		return nil, false
-	}
+
+	const spliced = `,"cache_control":{"type":"ephemeral"}`
+	out := make(json.RawMessage, 0, len(trimmed)+len(spliced))
+	out = append(out, trimmed[:len(trimmed)-1]...)
+	out = append(out, spliced...)
+	out = append(out, '}')
 	return out, true
 }
 

@@ -143,6 +143,16 @@ func TestMarkMessagesCachePrefix_rawAssistantBlocks(t *testing.T) {
 		t.Errorf("marked block lost the unmodeled caller field: %v", marked)
 	}
 
+	// The marked block must be the second block's EXACT original bytes, with
+	// only the cache_control field spliced in before the closing brace — not
+	// a decode/re-encode, which would resort keys and re-escape characters
+	// and so change the cache-prefix hash Anthropic computes over these
+	// bytes.
+	wantPrefix := string(second[:len(second)-1])
+	if !strings.HasPrefix(string(blocks[1]), wantPrefix) {
+		t.Errorf("marked block = %s, want byte-identical prefix %s", blocks[1], wantPrefix)
+	}
+
 	// The input slice itself must stay untouched (no aliasing).
 	origBlocks := in[0].Content.([]json.RawMessage)
 	if strings.Contains(string(origBlocks[1]), "cache_control") {
@@ -273,6 +283,35 @@ func TestAddCacheControlToRawBlock(t *testing.T) {
 			if decoded["type"] != "text" || decoded["text"] != "hi" {
 				t.Errorf("marked block lost a pre-existing field: %v", decoded)
 			}
+
+			// The marked block must be the original bytes with only the
+			// cache_control field spliced in before the closing brace, not
+			// a decode/re-encode of them.
+			wantPrefix := string(test.raw[:len(test.raw)-1])
+			if !strings.HasPrefix(string(out), wantPrefix) {
+				t.Errorf("marked block = %s, want byte-identical prefix %s", out, wantPrefix)
+			}
 		})
+	}
+}
+
+// TestAddCacheControlToRawBlock_preservesByteIdentity proves the splice
+// does not go through json.Unmarshal into a map and back through
+// json.Marshal: that round trip would sort "z_field" before "type" (Go maps
+// marshal keys alphabetically) and HTML-escape the '<' in the text, either
+// of which changes the bytes Anthropic hashes for the cache key versus what
+// the previous turn already sent and had cached.
+func TestAddCacheControlToRawBlock_preservesByteIdentity(t *testing.T) {
+	raw := json.RawMessage(`{"z_field":"z","type":"text","text":"a < b & c > d"}`)
+	out, ok := addCacheControlToRawBlock(raw)
+	if !ok {
+		t.Fatal("expected ok = true")
+	}
+	wantPrefix := string(raw[:len(raw)-1])
+	if !strings.HasPrefix(string(out), wantPrefix) {
+		t.Fatalf("marked block = %s, want byte-identical prefix %s (no key reordering, no HTML-escaping)", out, wantPrefix)
+	}
+	if !strings.HasSuffix(string(out), `,"cache_control":{"type":"ephemeral"}}`) {
+		t.Fatalf("marked block = %s, want cache_control spliced before the closing brace", out)
 	}
 }
