@@ -49,7 +49,7 @@ func textResponder(t *testing.T, reply string) (*httptest.Server, *recorded) {
 		rec.lastSystem = strings.Join(parts, "\n\n")
 		rec.lastMessageCount = len(body.Messages)
 		if n := len(body.Messages); n > 0 {
-			if text, ok := body.Messages[n-1].Content.(string); ok {
+			if text, ok := decodedMessageText(body.Messages[n-1].Content); ok {
 				rec.lastUserText = text
 				rec.userTexts = append(rec.userTexts, text)
 			}
@@ -69,6 +69,32 @@ type recorded struct {
 	// userTexts records the last user content of every call, in order, so a test
 	// can assert what each turn forwarded to the core (not just the final turn).
 	userTexts []string
+}
+
+// decodedMessageText returns the plain text of a Message.Content value as
+// decoded generically by encoding/json: a bare string, or — since
+// anthropic.MarkMessagesCachePrefix rewrites a string's last-message content
+// into the array-of-blocks form required to carry a cache_control marker —
+// the []any of block maps that shape decodes into. It reads the first
+// text-type block, which is the only shape any fixture in this file ever
+// sends as the message under test; the cache_control marker alongside it (if
+// present) is irrelevant to the text being asserted.
+func decodedMessageText(content any) (string, bool) {
+	switch v := content.(type) {
+	case string:
+		return v, true
+	case []any:
+		for _, b := range v {
+			block, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := block["text"].(string); ok {
+				return text, true
+			}
+		}
+	}
+	return "", false
 }
 
 func initializeLine(prompt string) string {

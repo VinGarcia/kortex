@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -109,12 +110,24 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 	}
 
 	// The request must carry the two history messages followed by the new user
-	// turn — in that order.
+	// turn — in that order. The new user turn is the last message of the
+	// history sent on the wire, so RunLoop's cache-breakpoint marking rewrites
+	// its content into the text-block-with-cache_control form (see
+	// anthropic.MarkMessagesCachePrefix); the earlier history message is
+	// untouched and stays a plain string.
 	if len(sentMessages) != 3 {
 		t.Fatalf("request carried %d messages, want 3 (2 history + new user)", len(sentMessages))
 	}
-	if sentMessages[0].Content != "my favorite color is blue" || sentMessages[2].Content != "what is my favorite color?" {
+	if sentMessages[0].Content != "my favorite color is blue" {
 		t.Errorf("messages not in history-then-new order: %+v", sentMessages)
+	}
+	wantLast := []any{map[string]any{
+		"type":          "text",
+		"text":          "what is my favorite color?",
+		"cache_control": map[string]any{"type": "ephemeral"},
+	}}
+	if !reflect.DeepEqual(sentMessages[2].Content, wantLast) {
+		t.Errorf("last sent message content = %#v, want the cache-marked text block %#v", sentMessages[2].Content, wantLast)
 	}
 	// The returned Messages seed the next turn: 2 history + new user + final
 	// assistant = 4.
@@ -127,6 +140,55 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 	// RunLoop must not mutate the caller's History slice.
 	if len(history) != 2 {
 		t.Errorf("input History was mutated to len %d, want 2", len(history))
+	}
+}
+
+// TestRunLoop_cacheBreakpointsStayWithinAPILimit proves a call carrying both
+// a cacheable System prompt and a multi-message History never exceeds the
+// Messages API's 4-breakpoint ceiling: this client places exactly one on the
+// system/tools prefix (markStableSystemPrefix) and one on the last history
+// message (anthropic.MarkMessagesCachePrefix) — 2 total, with headroom to
+// spare.
+func TestRunLoop_cacheBreakpointsStayWithinAPILimit(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	bigSystem := strings.Repeat("stable system prefix content. ", 1000) // clears every model's cacheable floor
+	history := []anthropic.Message{
+		{Role: "user", Content: "first turn"},
+		{Role: "assistant", Content: "noted"},
+		{Role: "user", Content: "second turn"},
+		{Role: "assistant", Content: "noted again"},
+	}
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	if _, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:       "claude-opus-4-8",
+		System:      bigSystem,
+		MaxTokens:   1024,
+		History:     history,
+		UserMessage: "third turn",
+	}); err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+
+	encoded, err := json.Marshal(gotBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := strings.Count(string(encoded), `"cache_control"`)
+	if total == 0 {
+		t.Fatalf("request carried no cache_control marker at all: %s", encoded)
+	}
+	if total > 4 {
+		t.Errorf("request carried %d cache_control markers, want at most 4 (the API's ceiling): %s", total, encoded)
+	}
+	if total != 2 {
+		t.Errorf("request carried %d cache_control markers, want exactly 2 (system + last history message)", total)
 	}
 }
 
@@ -317,6 +379,20 @@ func TestRunLoop_ephemeralContextSentButNotPersisted(t *testing.T) {
 		if occurrences != 1 {
 			t.Errorf("call %d: digest appeared %d times, want exactly 1 (no accumulation)", i+1, occurrences)
 		}
+		// The cache breakpoint must land on the real history's last message —
+		// one position BEFORE the ephemeral tail — never on the digest itself,
+		// or every call would write a fresh cache entry for the whole
+		// conversation with no matching read (see
+		// anthropic.MarkMessagesCachePrefix's doc on this ordering).
+		if len(msgs) < 2 {
+			t.Fatalf("call %d sent %d messages, want at least history + ephemeral tail", i+1, len(msgs))
+		}
+		if hasCacheControlContent(t, last.Content) {
+			t.Errorf("call %d: ephemeral digest carries the cache breakpoint, want it on the preceding history message instead", i+1)
+		}
+		if !hasCacheControlContent(t, msgs[len(msgs)-2].Content) {
+			t.Errorf("call %d: history message before the ephemeral tail is missing the cache breakpoint: %+v", i+1, msgs[len(msgs)-2])
+		}
 	}
 
 	// The digest must NOT be persisted into canonical history: no returned
@@ -326,6 +402,23 @@ func TestRunLoop_ephemeralContextSentButNotPersisted(t *testing.T) {
 			t.Errorf("returned Messages[%d] carries the ephemeral digest; it must stay out of canonical history", i)
 		}
 	}
+}
+
+// hasCacheControlContent reports whether a decoded Message.Content — a plain
+// string, or the []any of block maps encoding/json produces for an array —
+// carries a cache_control marker on any of its blocks.
+func hasCacheControlContent(t *testing.T, content any) bool {
+	t.Helper()
+	blocks, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, b := range blocks {
+		if m, ok := b.(map[string]any); ok && m["cache_control"] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRunLoop_emptyEphemeralContextChangesNothing proves the fail-open default:

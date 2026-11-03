@@ -90,14 +90,17 @@ type LoopRequest struct {
 	// events and their tool_result turns are still emitted live. With DeferFinal
 	// false the emission is byte-for-byte what it was before this field existed.
 	DeferFinal bool
-	// EphemeralContext, when non-empty, is appended as ONE extra trailing user
-	// message to the array sent to the core model on EVERY call in the loop, but
-	// is NEVER added to the accumulating/returned Messages. It is ephemeral
-	// injected context — the tone digest — recomputed per turn and kept out of
-	// canonical history, exactly like the superego's ephemeral tail. Placed last
-	// so it is the final item of the core's context; placed in the message tail
-	// (never the system prefix) so it never disturbs the cacheable prefix
-	// (anti-nonce rule: mutable per-turn content goes at the end of messages).
+	// EphemeralContext, when non-empty, is appended (via withEphemeralContext) as
+	// ONE extra trailing user message to the array sent to the core model on
+	// EVERY call in the loop, but is NEVER added to the accumulating/returned
+	// Messages. It is ephemeral injected context — the tone digest — recomputed
+	// per turn and kept out of canonical history, exactly like the superego's
+	// ephemeral tail. Placed last so it is the final item of the core's context;
+	// placed in the message tail (never the system prefix) so it never disturbs
+	// the cacheable prefix (anti-nonce rule: mutable per-turn content goes at the
+	// end of messages) — withEphemeralContext places the cache breakpoint on the
+	// real history before appending this tail, so the tail itself never carries
+	// it.
 	EphemeralContext string
 	// FinalizeOnBudget changes what happens when the loop reaches MaxTurns while
 	// the model is still asking for tools. The default (false) fails closed with
@@ -160,18 +163,28 @@ type LoopResult struct {
 	Yielded bool
 }
 
-// withEphemeralContext returns messages with one extra trailing user message
-// carrying ephemeral injected context (the tone digest), or messages unchanged
-// when ephemeral is "". The result is only ever handed to a single CreateMessage
-// call; the caller's accumulating messages slice is never mutated (a fresh slice
-// is allocated), so the ephemeral content never enters the returned LoopResult,
-// canonical history, or the stream.
+// withEphemeralContext is the ONLY path either RunLoop call site uses to turn
+// canonical messages into the array sent on the wire: it first places the
+// prompt-cache breakpoint on the real history (anthropic.MarkMessagesCachePrefix)
+// and only THEN appends, when ephemeral is non-empty, one extra trailing user
+// message carrying ephemeral injected context (the tone digest). That order is
+// load-bearing — marking after the append would put the breakpoint on this
+// volatile, per-turn-unique tail instead of on stable history, turning every
+// call into a cache write with no matching read (see MarkMessagesCachePrefix's
+// doc) — so it is enforced here structurally, in one function, rather than left
+// as an order two separate calls at each call site would have to get right.
+// The result is only ever handed to a single CreateMessage call; the caller's
+// accumulating messages slice is never mutated (MarkMessagesCachePrefix and the
+// append below both allocate fresh slices), so neither the breakpoint nor the
+// ephemeral content ever enters the returned LoopResult, canonical history, or
+// the stream.
 func withEphemeralContext(messages []anthropic.Message, ephemeral string) []anthropic.Message {
+	marked := anthropic.MarkMessagesCachePrefix(messages)
 	if ephemeral == "" {
-		return messages
+		return marked
 	}
-	out := make([]anthropic.Message, 0, len(messages)+1)
-	out = append(out, messages...)
+	out := make([]anthropic.Message, 0, len(marked)+1)
+	out = append(out, marked...)
 	return append(out, anthropic.Message{Role: "user", Content: ephemeral})
 }
 
@@ -392,7 +405,10 @@ func finalizeWithoutTools(
 		System:    req.System,
 		MaxTokens: req.MaxTokens,
 		Effort:    req.Effort,
-		Messages:  messages,
+		// No ephemeral tail on this path (matches pre-existing behavior); routed
+		// through withEphemeralContext anyway so cache marking always goes
+		// through the one enforced path.
+		Messages: withEphemeralContext(messages, ""),
 		// No Tools: force a text answer so the budgeted round closes gracefully.
 	})
 	cancel()

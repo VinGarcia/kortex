@@ -880,7 +880,13 @@ func TestRun_ActiveGovernorEphemeralTailNotPersisted(t *testing.T) {
 	// The redraft now drives the tool loop, so its opening user message is the
 	// critique followed by the deterministic bounded-action guard-rail. It must
 	// still carry the critique verbatim (the loop reached it) and the guard-rail.
-	if content, ok := last.Content.(string); !ok ||
+	// As the last message of the request it also carries the prompt-cache
+	// breakpoint (anthropic.MarkMessagesCachePrefix), which rewrites it from a
+	// bare string into the array-of-blocks form the API requires to attach
+	// cache_control — hence decoding via decodedMessageText instead of a plain
+	// string assertion.
+	content, ok := decodedMessageText(last.Content)
+	if !ok ||
 		!strings.Contains(content, "CRITIQUE-TAIL-TEXT") ||
 		!strings.Contains(content, redraftActionInstruction) {
 		t.Errorf("redraft call did not carry the critique tail + guard-rail as its last message: %+v", redraftMsgs)

@@ -120,6 +120,10 @@ type ToolResultBlock struct {
 	ToolUseID string `json:"tool_use_id"`
 	Content   string `json:"content"`
 	IsError   bool   `json:"is_error,omitempty"`
+	// CacheControl marks this block as a prompt-cache breakpoint when set (see
+	// MarkMessagesCachePrefix); nil omits the field, leaving an ordinary
+	// tool_result block unaffected.
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
 }
 
 // NewToolResultBlock builds a tool_result content block for toolUseID.
