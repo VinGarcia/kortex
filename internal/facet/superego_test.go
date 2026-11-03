@@ -3,7 +3,10 @@ package facet
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,81 @@ import (
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/history"
 )
+
+// bigEnoughForFloor clears every model's cacheable floor (opus/sonnet/
+// fable's 1024 tokens ~4096 bytes, haiku's 4096 tokens ~16384 bytes) by
+// itself, so a test proving the message-history cache breakpoint lands
+// doesn't have to reason about exact byte/token math.
+var bigEnoughForFloor = strings.Repeat("prompt cache history content. ", 1000) // ~30k bytes
+
+// TestAnthropicConversant_marksMessagesNotTail proves the Conversant adapter
+// routes messages/tail into anthropic.MessageRequest.Messages/EphemeralTail
+// respectively: the client's prompt-cache breakpoint lands on messages, never
+// on tail, and two calls with the SAME messages but a DIFFERENT tail (the
+// active ladder's successive rounds, or the shadow path's per-turn calls)
+// send a byte-identical marked messages prefix — the shape that lets the
+// second call's cache lookback find the first call's entry.
+func TestAnthropicConversant_marksMessagesNotTail(t *testing.T) {
+	var sentMessages [][]anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		sentMessages = append(sentMessages, body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	conversant := NewAnthropicConversant(client, "claude-opus-4-8")
+
+	// messages is padded past opus's 1024-token floor, since the client's floor
+	// check runs over the whole array, not just the marked message.
+	messages := []anthropic.Message{
+		{Role: "user", Content: "contava com você ontem. " + bigEnoughForFloor},
+		{Role: "assistant", Content: "desculpa, falhei"},
+	}
+
+	for i, draft := range []string{"RASCUNHO-RODADA-1", "RASCUNHO-RODADA-2"} {
+		tail := []anthropic.Message{{Role: "user", Content: draft}}
+		if _, err := conversant.Converse(context.Background(), "system", messages, tail); err != nil {
+			t.Fatalf("round %d: Converse error: %v", i+1, err)
+		}
+	}
+
+	if len(sentMessages) != 2 {
+		t.Fatalf("want 2 calls, got %d", len(sentMessages))
+	}
+	for i, msgs := range sentMessages {
+		if len(msgs) != 3 {
+			t.Fatalf("round %d: request carried %d messages, want 3 (messages' 2 + 1 tail)", i+1, len(msgs))
+		}
+	}
+
+	marked1, err1 := json.Marshal(sentMessages[0][1])
+	marked2, err2 := json.Marshal(sentMessages[1][1])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("marshal error: %v / %v", err1, err2)
+	}
+	if !strings.Contains(string(marked1), `"cache_control":{"type":"ephemeral"}`) {
+		t.Errorf("round 1: messages' last entry not marked: %s", marked1)
+	}
+	if string(marked1) != string(marked2) {
+		t.Errorf("messages' marked entry differs between rounds:\nround1=%s\nround2=%s", marked1, marked2)
+	}
+
+	for i, msgs := range sentMessages {
+		tailJSON, err := json.Marshal(msgs[2])
+		if err != nil {
+			t.Fatalf("round %d: marshal error: %v", i+1, err)
+		}
+		if strings.Contains(string(tailJSON), "cache_control") {
+			t.Errorf("round %d: tail (draft-under-review) carries the cache breakpoint, want it only on messages: %s", i+1, tailJSON)
+		}
+	}
+}
 
 // fakeConversant is the Conversant double: it records the call and returns a
 // canned evaluation, honoring the context like the real client would.
@@ -23,10 +101,17 @@ type fakeConversant struct {
 	gotMessages []anthropic.Message
 }
 
-func (f *fakeConversant) Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error) {
+func (f *fakeConversant) Converse(ctx context.Context, system string, messages []anthropic.Message, draftContext []anthropic.Message) (Evaluation, error) {
 	f.calls++
 	f.gotSys = system
-	f.gotMessages = messages
+	// Concatenated here (mirroring what the real client sends on the wire)
+	// so existing assertions over the full seen array stay unchanged; tests
+	// that care about the messages/draftContext split read gotMessages
+	// directly.
+	combined := make([]anthropic.Message, 0, len(messages)+len(draftContext))
+	combined = append(combined, messages...)
+	combined = append(combined, draftContext...)
+	f.gotMessages = combined
 	if f.delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -61,10 +146,10 @@ func reviewAndWait(s *Superego, turnIndex int, snapshot history.Snapshot, paragr
 
 // TestSuperegoMessages_contextAssembly drives the history→messages
 // conversion through a table: clean alternating messages, tag stripping,
-// draft-user as the closing message, empty-side and truncation behavior.
-// Each row states its own history inline.
+// empty-side and truncation behavior. The reviewed turn's own assistant text
+// is never included (it re-enters as the caller's own draft-context array,
+// not here — see Superego.review); each row states its own history inline.
 func TestSuperegoMessages_contextAssembly(t *testing.T) {
-	draft := "DRAFT"
 	tests := []struct {
 		desc            string
 		snapshot        history.Snapshot
@@ -73,7 +158,7 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 		want            []anthropic.Message
 	}{
 		{
-			desc: "two turns: prior exchange (annotation line stripped) plus reviewed turn's user text, draft closes",
+			desc: "two turns: prior exchange (annotation line stripped) plus reviewed turn's user text",
 			snapshot: history.Snapshot{Turns: []history.Turn{
 				{
 					UserText:      "contava com você ontem\n[emoções p1: investment=4 valence=negativa emotions=cobrança(3)]",
@@ -87,7 +172,6 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 				{Role: "user", Content: "contava com você ontem"},
 				{Role: "assistant", Content: "desculpa, falhei mesmo"},
 				{Role: "user", Content: "e agora?"},
-				{Role: "user", Content: draft},
 			},
 		},
 		{
@@ -100,7 +184,6 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 			want: []anthropic.Message{
 				{Role: "assistant", Content: "resposta sem prompt"},
 				{Role: "user", Content: "ok"},
-				{Role: "user", Content: draft},
 			},
 		},
 		{
@@ -116,7 +199,6 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 				{Role: "user", Content: "meio"},
 				{Role: "assistant", Content: "recente"},
 				{Role: "user", Content: "atual"},
-				{Role: "user", Content: draft},
 			},
 		},
 		{
@@ -128,13 +210,12 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 			maxHistoryTurns: 10,
 			want: []anthropic.Message{
 				{Role: "user", Content: "oi"},
-				{Role: "user", Content: draft},
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			got := superegoMessages(test.snapshot, test.turnIndex, draft, test.maxHistoryTurns)
+			got := superegoMessages(test.snapshot, test.turnIndex, test.maxHistoryTurns)
 			if len(got) != len(test.want) {
 				t.Fatalf("got %d messages, want %d: %+v", len(got), len(test.want), got)
 			}
@@ -149,10 +230,12 @@ func TestSuperegoMessages_contextAssembly(t *testing.T) {
 
 // TestSuperegoMessages_shadowPathIsTextOnly pins the retired #4749 behavior:
 // the SHADOW path reconstructs from the snapshot's final text only, so the
-// closing message is the bare draft and no tool-provenance block is emitted —
-// the reviewed turn's tool traffic reaches the superego on the ACTIVE path via
-// the real tool_use/tool_result blocks (TestActiveSuperego_* in the loop test),
-// not a summary here.
+// reviewed turn's own assistant text and tool traffic are never included
+// here (they re-enter only via the caller's own draft-context array, built
+// separately — see Superego.review) and no tool-provenance block is
+// emitted — the reviewed turn's tool traffic reaches the superego on the
+// ACTIVE path via the real tool_use/tool_result blocks (TestActiveSuperego_*
+// in the loop test), not a summary here.
 func TestSuperegoMessages_shadowPathIsTextOnly(t *testing.T) {
 	snapshot := history.Snapshot{Turns: []history.Turn{
 		{
@@ -164,10 +247,9 @@ func TestSuperegoMessages_shadowPathIsTextOnly(t *testing.T) {
 			},
 		},
 	}}
-	msgs := superegoMessages(snapshot, 0, "DRAFT", 0)
-	final := msgs[len(msgs)-1]
-	if final.Role != "user" || final.Content != "DRAFT" {
-		t.Errorf("closing message = %+v, want the bare draft-user with no tool block", final)
+	msgs := superegoMessages(snapshot, 0, 0)
+	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != "checa o PR #4749" {
+		t.Fatalf("history = %+v, want just the reviewed turn's user text", msgs)
 	}
 	for _, m := range msgs {
 		if s, ok := m.Content.(string); ok && strings.Contains(s, "FERRAMENTAS") {
@@ -440,7 +522,7 @@ func TestSuperego_failureModes(t *testing.T) {
 // panic would kill the whole proxy process.
 type panicConversant struct{}
 
-func (panicConversant) Converse(_ context.Context, _ string, _ []anthropic.Message) (Evaluation, error) {
+func (panicConversant) Converse(_ context.Context, _ string, _ []anthropic.Message, _ []anthropic.Message) (Evaluation, error) {
 	panic("boom")
 }
 

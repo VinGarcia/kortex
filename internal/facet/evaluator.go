@@ -45,7 +45,12 @@ func (e *AnthropicEvaluator) Evaluate(ctx context.Context, system string, userMe
 		Model:     e.model,
 		System:    system,
 		MaxTokens: evaluatorMaxTokens,
-		Messages:  []anthropic.Message{{Role: "user", Content: userMessage}},
+		// One-shot call with no continuing history: there is no later call that
+		// could ever read a breakpoint back, so userMessage goes in
+		// EphemeralTail (concatenated unmarked) rather than Messages — a
+		// cache_control breakpoint here would be a pure cache write with no
+		// matching read, strictly worse than not caching.
+		EphemeralTail: []anthropic.Message{{Role: "user", Content: userMessage}},
 	})
 	if err != nil {
 		return Evaluation{}, err

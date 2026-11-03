@@ -881,7 +881,7 @@ func TestRun_ActiveGovernorEphemeralTailNotPersisted(t *testing.T) {
 	// critique followed by the deterministic bounded-action guard-rail. It must
 	// still carry the critique verbatim (the loop reached it) and the guard-rail.
 	// As the last message of the request it also carries the prompt-cache
-	// breakpoint (anthropic.MarkMessagesCachePrefix), which rewrites it from a
+	// breakpoint (the client's markMessagesCachePrefix), which rewrites it from a
 	// bare string into the array-of-blocks form the API requires to attach
 	// cache_control — hence decoding via decodedMessageText instead of a plain
 	// string assertion.

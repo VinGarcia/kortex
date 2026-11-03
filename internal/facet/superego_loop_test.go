@@ -43,8 +43,16 @@ type scriptedConversant struct {
 	gotMessages [][]anthropic.Message
 }
 
-func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []anthropic.Message) (Evaluation, error) {
-	s.gotMessages = append(s.gotMessages, messages)
+func (s *scriptedConversant) Converse(_ context.Context, _ string, messages []anthropic.Message, draftContext []anthropic.Message) (Evaluation, error) {
+	// Concatenated here (mirroring what the real client sends on the wire) so
+	// every existing assertion over the full assembled array — the draft, the
+	// carried-over tool blocks, the prior-round annotations — stays unchanged
+	// regardless of the messages/draftContext split this double is otherwise
+	// agnostic to.
+	combined := make([]anthropic.Message, 0, len(messages)+len(draftContext))
+	combined = append(combined, messages...)
+	combined = append(combined, draftContext...)
+	s.gotMessages = append(s.gotMessages, combined)
 	step := s.steps[min(s.calls, len(s.steps)-1)]
 	s.calls++
 	return step.eval, step.err

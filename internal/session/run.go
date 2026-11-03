@@ -664,7 +664,7 @@ func governTurn(
 				// problem the superego flagged (redraftActionInstruction), not re-tone
 				// the text. Tone already carries transitively: loopHistory includes
 				// res.Messages, whose draft was produced with the digest. And threading
-				// it here would backfire — withEphemeralContext appends the digest as
+				// it here would backfire — EphemeralContext becomes the request's EphemeralTail, appended as
 				// the LAST user message on every call, which would land AFTER the
 				// critique this redraft must answer, burying the correctness
 				// instruction. So the redraft stays tone-neutral by design.
@@ -842,6 +842,13 @@ func replaceFinalAssistantText(messages []anthropic.Message, text string) []anth
 // deadline (the redraft closure already wrapped ctx with RedraftTimeout), so
 // this does not re-bound it. Usage is accumulated into the caller's running
 // total via the usage pointer so the re-emitted result still bills this call.
+//
+// canonical and tail are passed through to the client as Messages and
+// EphemeralTail respectively (never concatenated here): the client places the
+// prompt-cache breakpoint on canonical before appending tail, so repeated
+// redraft rounds over the same canonical (growing only tail) read that
+// breakpoint back from cache instead of re-billing the whole turn's history on
+// every round.
 func textOnlyRedraft(
 	ctx context.Context,
 	cfg Config,
@@ -850,13 +857,13 @@ func textOnlyRedraft(
 	tail []anthropic.Message,
 	usage *anthropic.Usage,
 ) (string, error) {
-	messages := append(slices.Clone(canonical), tail...)
 	resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
-		Model:     cfg.Model,
-		System:    systemPrompt,
-		MaxTokens: cfg.MaxTokens,
-		Effort:    cfg.Effort,
-		Messages:  messages,
+		Model:         cfg.Model,
+		System:        systemPrompt,
+		MaxTokens:     cfg.MaxTokens,
+		Effort:        cfg.Effort,
+		Messages:      canonical,
+		EphemeralTail: tail,
 	})
 	if err != nil {
 		return "", err

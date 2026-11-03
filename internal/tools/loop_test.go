@@ -15,6 +15,13 @@ import (
 	"github.com/vingarcia/kortex/internal/mcp"
 )
 
+// bigEnoughForFloor clears every model's cacheable floor (opus/sonnet/
+// fable's 1024 tokens ~4096 bytes, haiku's 4096 tokens ~16384 bytes) by
+// itself, so a test proving the message-history cache breakpoint lands
+// doesn't have to reason about exact byte/token math against the real
+// content under test.
+var bigEnoughForFloor = strings.Repeat("prompt cache history content. ", 1000) // ~30k bytes
+
 // TestRunLoop_bashRoundTrip simulates the F3a spike's observed sequence: the
 // first response is a bash tool_use, the second (after the tool_result goes
 // back) is end_turn with text. It checks the dispatcher's real bash
@@ -94,8 +101,13 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// The first history message is padded well past haiku's 4096-token floor
+	// (minCacheableTokens): markMessagesCachePrefix's floor check runs over the
+	// WHOLE messages array, so without this padding the tiny real content below
+	// would never clear it and the breakpoint assertion below would be moot.
+	favoriteColor := "my favorite color is blue. " + bigEnoughForFloor
 	history := []anthropic.Message{
-		{Role: "user", Content: "my favorite color is blue"},
+		{Role: "user", Content: favoriteColor},
 		{Role: "assistant", Content: "noted"},
 	}
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
@@ -113,12 +125,12 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 	// turn — in that order. The new user turn is the last message of the
 	// history sent on the wire, so RunLoop's cache-breakpoint marking rewrites
 	// its content into the text-block-with-cache_control form (see
-	// anthropic.MarkMessagesCachePrefix); the earlier history message is
+	// anthropic.markMessagesCachePrefix); the earlier history message is
 	// untouched and stays a plain string.
 	if len(sentMessages) != 3 {
 		t.Fatalf("request carried %d messages, want 3 (2 history + new user)", len(sentMessages))
 	}
-	if sentMessages[0].Content != "my favorite color is blue" {
+	if sentMessages[0].Content != favoriteColor {
 		t.Errorf("messages not in history-then-new order: %+v", sentMessages)
 	}
 	wantLast := []any{map[string]any{
@@ -147,7 +159,7 @@ func TestRunLoop_historyContinuation(t *testing.T) {
 // a cacheable System prompt and a multi-message History never exceeds the
 // Messages API's 4-breakpoint ceiling: this client places exactly one on the
 // system/tools prefix (markStableSystemPrefix) and one on the last history
-// message (anthropic.MarkMessagesCachePrefix) — 2 total, with headroom to
+// message (the client's markMessagesCachePrefix) — 2 total, with headroom to
 // spare.
 func TestRunLoop_cacheBreakpointsStayWithinAPILimit(t *testing.T) {
 	var gotBody map[string]any
@@ -160,7 +172,9 @@ func TestRunLoop_cacheBreakpointsStayWithinAPILimit(t *testing.T) {
 
 	bigSystem := strings.Repeat("stable system prefix content. ", 1000) // clears every model's cacheable floor
 	history := []anthropic.Message{
-		{Role: "user", Content: "first turn"},
+		// Padded past opus's 1024-token floor: the floor check runs over the
+		// WHOLE messages array, not just the marked message.
+		{Role: "user", Content: "first turn. " + bigEnoughForFloor},
 		{Role: "assistant", Content: "noted"},
 		{Role: "user", Content: "second turn"},
 		{Role: "assistant", Content: "noted again"},
@@ -346,11 +360,16 @@ func TestRunLoop_ephemeralContextSentButNotPersisted(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Padded past model "m"'s 1024-token floor (minCacheableTokens's non-haiku
+	// default): the floor check runs over the whole Messages array, so a tiny
+	// "oi" would never clear it and the breakpoint assertions below would be
+	// moot.
+	userMessage := "oi. " + bigEnoughForFloor
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
 	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
 		Model:            "m",
 		MaxTokens:        1024,
-		UserMessage:      "oi",
+		UserMessage:      userMessage,
 		EphemeralContext: digest,
 	})
 	if err != nil {
@@ -383,7 +402,7 @@ func TestRunLoop_ephemeralContextSentButNotPersisted(t *testing.T) {
 		// one position BEFORE the ephemeral tail — never on the digest itself,
 		// or every call would write a fresh cache entry for the whole
 		// conversation with no matching read (see
-		// anthropic.MarkMessagesCachePrefix's doc on this ordering).
+		// the client's markMessagesCachePrefix: EphemeralTail is concatenated AFTER marking).
 		if len(msgs) < 2 {
 			t.Fatalf("call %d sent %d messages, want at least history + ephemeral tail", i+1, len(msgs))
 		}

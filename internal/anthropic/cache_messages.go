@@ -1,6 +1,8 @@
 package anthropic
 
-// MarkMessagesCachePrefix returns messages with one ephemeral cache_control
+import "encoding/json"
+
+// markMessagesCachePrefix returns messages with one ephemeral cache_control
 // breakpoint added to the last eligible content block of the LAST message, so
 // a follow-up call whose prefix up to that point is byte-identical reads the
 // entire conversation history back from cache (~0.1x price) instead of
@@ -14,24 +16,28 @@ package anthropic
 // Combined with the system breakpoint, this uses 2 of the API's 4-breakpoint
 // ceiling.
 //
-// It never mutates messages or anything inside it — every level it touches is
-// a fresh copy, so the caller's original slice is untouched. It is fail-safe
-// like markStableSystemPrefix: when there is nothing eligible to mark, it
-// returns messages unchanged and the request proceeds uncached.
+// It is fail-safe like markStableSystemPrefix: below the model's cacheable
+// floor (see minCacheableTokens — applied here exactly as it is to the system
+// prefix, over the estimated size of the WHOLE messages array, not just the
+// marked block) or with nothing eligible to mark, it returns messages
+// unchanged and the request proceeds uncached.
 //
-// Call this ONLY with canonical conversation history — never with a slice
-// that already has a volatile tail appended (e.g. a per-turn tone digest), or
-// every call writes a fresh, never-read cache entry for the whole
-// conversation instead of reusing the last one. A caller that appends such a
-// tail must call this on the real history first, then append the tail — see
-// tools.withEphemeralContext, which enforces that order in one place.
+// It never mutates messages or anything inside it — every level it touches is
+// a fresh copy, so the caller's original slice is untouched.
+//
+// Called from CreateMessage only, on req.Messages — never on a request's
+// EphemeralTail, which is concatenated AFTER this runs. A caller that must
+// append a volatile per-turn tail (e.g. a tone digest, a critique) puts the
+// stable history in Messages and the tail in MessageRequest.EphemeralTail so
+// the breakpoint always lands on real history, never on content that is
+// never read back.
 //
 // Wrapping a string Message.Content into a []messageContentBlock (below)
 // changes its JSON shape for this call only; callers never persist the
 // wrapped form, so the same message goes out as a plain string again on the
 // next turn. This assumes the API normalizes both shapes to the same
 // cache-prefix hash; if it doesn't, the worst case is benign — the lookback
-// window still finds the previous turn's cache entry. Confirm against the
+// window still finds the previous turn's cache entry. Confirmed against the
 // usage counters on the first live session.
 //
 // Observability gap (known, accepted): unlike markStableSystemPrefix, this
@@ -44,8 +50,11 @@ package anthropic
 // is new monitoring surface, not a small addition to the existing
 // per-request classifier — left as a follow-up rather than folded into this
 // change.
-func MarkMessagesCachePrefix(messages []Message) []Message {
+func markMessagesCachePrefix(model string, messages []Message) []Message {
 	if len(messages) == 0 {
+		return messages
+	}
+	if estimatedMessagesTokens(messages) < minCacheableTokens(model) {
 		return messages
 	}
 	marked, ok := markLastEligibleBlock(messages[len(messages)-1])
@@ -58,19 +67,41 @@ func MarkMessagesCachePrefix(messages []Message) []Message {
 	return out
 }
 
+// estimatedMessagesTokens approximates the total size of a messages array in
+// tokens using the same ~4-bytes-per-token heuristic as estimatedSystemTokens,
+// so the same per-model floor (minCacheableTokens) gates both the system
+// prefix and the message-history breakpoint identically. It marshals the
+// whole array because message content varies in shape (plain string,
+// tool_result blocks, raw echoed assistant blocks) with no single field to
+// sum, unlike the system block array's fixed text field; a failed marshal —
+// never expected, since every shape here already round-tripped through this
+// same client — degrades to 0, so the floor check just does not mark rather
+// than panicking.
+func estimatedMessagesTokens(messages []Message) int {
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		return 0
+	}
+	return len(raw) / 4
+}
+
 // markLastEligibleBlock returns msg with a cache_control breakpoint placed on
 // its last eligible content block, and whether one was found. msg.Content
 // must be one of the shapes this client ever assigns to a history message
-// (see Message's doc): a plain string or []ToolResultBlock. Both are
-// constructed right here as a block type the Messages API always accepts a
-// cache_control marker on ("text", "tool_result") — the eligible set per the
-// API's docs also includes "image", "tool_use", and "document", but nothing
-// here ever needs to classify one of those, since neither live case produces
-// them. Any other shape — including nil, empty content, or an echoed raw
-// assistant turn — is reported ineligible rather than guessed at: a
-// cache_control marker on an ineligible block is a 400, not a no-op, so
-// skipping an unrecognized shape is the only safe default for a type this
-// function has not itself vetted.
+// (see Message's doc): a plain string, []ToolResultBlock, or []json.RawMessage
+// (an echoed assistant turn, see MessageResponse.RawContent — session.
+// textOnlyRedraft's canonical history ends in exactly this shape, since it is
+// the core's own final draft turn echoed back). All three are handled as a
+// block type the Messages API accepts a cache_control marker on ("text",
+// "tool_result", and most raw block types — but NOT every one: Anthropic's
+// docs state thinking blocks cannot carry cache_control directly, so a raw
+// block decodes its "type" first and skips "thinking"/"redacted_thinking",
+// the one shape among the API's broader eligible set (which also includes
+// "tool_use", "image", and "document") this function must not guess at) —
+// any other shape, including nil or empty content, is reported ineligible
+// rather than guessed at: a cache_control marker on an ineligible block is a
+// 400, not a no-op, so skipping an unrecognized shape is the only safe
+// default for a type this function has not itself vetted.
 func markLastEligibleBlock(msg Message) (Message, bool) {
 	switch content := msg.Content.(type) {
 	case string:
@@ -94,9 +125,64 @@ func markLastEligibleBlock(msg Message) (Message, bool) {
 		msg.Content = cloned
 		return msg, true
 
+	case []json.RawMessage:
+		if len(content) == 0 {
+			return Message{}, false
+		}
+		marked, ok := addCacheControlToRawBlock(content[len(content)-1])
+		if !ok {
+			return Message{}, false
+		}
+		cloned := make([]json.RawMessage, len(content))
+		copy(cloned, content)
+		cloned[len(cloned)-1] = marked
+		msg.Content = cloned
+		return msg, true
+
 	default:
 		return Message{}, false
 	}
+}
+
+// thinkingBlockTypes are the raw block "type" values the Messages API
+// rejects a cache_control marker on (confirmed against Anthropic's prompt-
+// caching docs: thinking blocks cannot be cached directly) — the one gap in
+// "mark whatever type the raw block already carries" that addCacheControlToRawBlock
+// must check for explicitly rather than guess at.
+var thinkingBlockTypes = map[string]bool{"thinking": true, "redacted_thinking": true}
+
+// addCacheControlToRawBlock returns raw with a top-level "cache_control":
+// {"type":"ephemeral"} field added, and whether that succeeded. It decodes
+// into a generic field map rather than a typed struct so every field the raw
+// block already carries (type, text, id, name, input, an unmodeled field
+// like tool_use's "caller" — anything) survives untouched; only the new key
+// is added. Used for an echoed assistant turn's content block, whose exact
+// shape (text, tool_use, ...) this client does not otherwise need to know to
+// mark it — except its "type", checked against thinkingBlockTypes, since that
+// one shape is rejected rather than silently ignored. Any decode/encode
+// failure (including a non-object block — raw as the bare JSON literal
+// "null" decodes into a nil map with no error, which would otherwise panic on
+// the field assignment below) reports false so the caller's fail-safe (skip
+// marking) applies instead of corrupting the block or crashing the request.
+func addCacheControlToRawBlock(raw json.RawMessage) (json.RawMessage, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return nil, false
+	}
+	var blockType string
+	if err := json.Unmarshal(fields["type"], &blockType); err == nil && thinkingBlockTypes[blockType] {
+		return nil, false
+	}
+	cc, err := json.Marshal(cacheControl{Type: "ephemeral"})
+	if err != nil {
+		return nil, false
+	}
+	fields["cache_control"] = cc
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // messageContentBlock is the array-of-blocks form a plain string

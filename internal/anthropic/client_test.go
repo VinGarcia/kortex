@@ -263,6 +263,107 @@ func TestCreateMessage_cacheControl(t *testing.T) {
 	}
 }
 
+// TestCreateMessage_messageCacheControlAndEphemeralTail proves CreateMessage
+// places the message-history breakpoint (see markMessagesCachePrefix) only
+// when Messages clears the model's cacheable floor, that EphemeralTail is
+// always concatenated AFTER that decision and so never carries the
+// breakpoint itself, and that a nil EphemeralTail (every pre-existing caller)
+// leaves the wire messages exactly equal to (marked) Messages.
+func TestCreateMessage_messageCacheControlAndEphemeralTail(t *testing.T) {
+	bigMessages := strings.Repeat("stable message history content. ", 1000) // ~30k bytes
+
+	tests := []struct {
+		desc            string
+		model           string
+		lastContent     string
+		tail            []Message
+		wantLastMarked  bool
+		wantTotalCount  int
+		wantTailContent string
+	}{
+		{
+			desc:           "large history marks on opus, no tail",
+			model:          "claude-opus-4-8",
+			lastContent:    bigMessages,
+			wantLastMarked: true,
+			wantTotalCount: 1,
+		},
+		{
+			desc:           "short history below floor is not marked",
+			model:          "claude-opus-4-8",
+			lastContent:    "tiny",
+			wantLastMarked: false,
+			wantTotalCount: 1,
+		},
+		{
+			desc:            "large history marks, tail concatenated after and unmarked",
+			model:           "claude-opus-4-8",
+			lastContent:     bigMessages,
+			tail:            []Message{{Role: "user", Content: "ephemeral tone digest"}},
+			wantLastMarked:  true,
+			wantTotalCount:  2,
+			wantTailContent: "ephemeral tone digest",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			var gotBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				json.NewDecoder(r.Body).Decode(&gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+			}))
+			defer server.Close()
+
+			client := NewClient("t", server.URL, time.Second)
+			if _, err := client.CreateMessage(context.Background(), MessageRequest{
+				Model:         test.model,
+				MaxTokens:     1024,
+				Messages:      []Message{{Role: "user", Content: test.lastContent}},
+				EphemeralTail: test.tail,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			messages, ok := gotBody["messages"].([]any)
+			if !ok || len(messages) != test.wantTotalCount {
+				t.Fatalf("messages = %v, want %d entries", gotBody["messages"], test.wantTotalCount)
+			}
+			if got := blockHasEphemeralCache(firstBlockOf(messages[0])); got != test.wantLastMarked {
+				t.Errorf("history message marked = %v, want %v", got, test.wantLastMarked)
+			}
+			if len(test.tail) > 0 {
+				tailMsg, ok := messages[len(messages)-1].(map[string]any)
+				if !ok || tailMsg["content"] != test.wantTailContent {
+					t.Fatalf("tail message = %v, want content %q", messages[len(messages)-1], test.wantTailContent)
+				}
+				if tailMsg["cache_control"] != nil {
+					t.Errorf("tail message carries cache_control, want none: %v", tailMsg)
+				}
+			}
+		})
+	}
+}
+
+// firstBlockOf returns a decoded message's content as a block (either the
+// bare content when it is already a map — a plain string never decodes that
+// way, so this only matches the array-of-blocks form markMessagesCachePrefix
+// produces) suitable for blockHasEphemeralCache; a plain string content
+// (unmarked case) has no block to inspect and reports false via
+// blockHasEphemeralCache's own type-assertion fallback.
+func firstBlockOf(message any) any {
+	m, ok := message.(map[string]any)
+	if !ok {
+		return nil
+	}
+	content := m["content"]
+	blocks, ok := content.([]any)
+	if !ok || len(blocks) == 0 {
+		return content
+	}
+	return blocks[len(blocks)-1]
+}
+
 // blockHasEphemeralCache reports whether a decoded system block carries an
 // ephemeral cache_control marker.
 func blockHasEphemeralCache(block any) bool {

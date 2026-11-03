@@ -90,17 +90,17 @@ type LoopRequest struct {
 	// events and their tool_result turns are still emitted live. With DeferFinal
 	// false the emission is byte-for-byte what it was before this field existed.
 	DeferFinal bool
-	// EphemeralContext, when non-empty, is appended (via withEphemeralContext) as
-	// ONE extra trailing user message to the array sent to the core model on
-	// EVERY call in the loop, but is NEVER added to the accumulating/returned
-	// Messages. It is ephemeral injected context — the tone digest — recomputed
-	// per turn and kept out of canonical history, exactly like the superego's
-	// ephemeral tail. Placed last so it is the final item of the core's context;
-	// placed in the message tail (never the system prefix) so it never disturbs
-	// the cacheable prefix (anti-nonce rule: mutable per-turn content goes at the
-	// end of messages) — withEphemeralContext places the cache breakpoint on the
-	// real history before appending this tail, so the tail itself never carries
-	// it.
+	// EphemeralContext, when non-empty, is sent (via anthropic.MessageRequest.
+	// EphemeralTail) as ONE extra trailing user message to the array sent to
+	// the core model on EVERY call in the loop, but is NEVER added to the
+	// accumulating/returned Messages. It is ephemeral injected context — the
+	// tone digest — recomputed per turn and kept out of canonical history,
+	// exactly like the superego's ephemeral tail. Placed last so it is the
+	// final item of the core's context; placed in the message tail (never the
+	// system prefix) so it never disturbs the cacheable prefix (anti-nonce
+	// rule: mutable per-turn content goes at the end of messages) — the client
+	// places the cache breakpoint on Messages before appending EphemeralTail,
+	// so the tail itself never carries it.
 	EphemeralContext string
 	// FinalizeOnBudget changes what happens when the loop reaches MaxTurns while
 	// the model is still asking for tools. The default (false) fails closed with
@@ -163,25 +163,17 @@ type LoopResult struct {
 	Yielded bool
 }
 
-// withEphemeralContext is the ONLY path either RunLoop call site uses to turn
-// canonical messages into the array sent on the wire: it first places the
-// prompt-cache breakpoint on the real history (anthropic.MarkMessagesCachePrefix),
-// then appends, when ephemeral is non-empty, one extra trailing user message
-// carrying ephemeral injected context (the tone digest). Marking must happen
-// BEFORE the append — marking after would put the breakpoint on this
-// volatile, per-turn-unique tail instead of on stable history, turning every
-// call into a cache write with no matching read. The result is only ever
-// handed to a single CreateMessage call; the caller's accumulating messages
-// slice is never mutated, so neither the breakpoint nor the ephemeral content
-// ever enters the returned LoopResult, canonical history, or the stream.
-func withEphemeralContext(messages []anthropic.Message, ephemeral string) []anthropic.Message {
-	marked := anthropic.MarkMessagesCachePrefix(messages)
+// ephemeralTail returns ephemeral as a one-message EphemeralTail (see
+// anthropic.MessageRequest.EphemeralTail), or nil when ephemeral is empty —
+// matching the exact wire shape either RunLoop call site needs: the client
+// places the cache breakpoint on Messages, then appends this tail, so the
+// tone digest never carries the breakpoint and never enters the
+// caller's accumulating messages, the returned LoopResult, or the stream.
+func ephemeralTail(ephemeral string) []anthropic.Message {
 	if ephemeral == "" {
-		return marked
+		return nil
 	}
-	out := make([]anthropic.Message, 0, len(marked)+1)
-	out = append(out, marked...)
-	return append(out, anthropic.Message{Role: "user", Content: ephemeral})
+	return []anthropic.Message{{Role: "user", Content: ephemeral}}
 }
 
 // RunLoop ports the F3a spike's tool_use/tool_result cycle
@@ -238,12 +230,13 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		cctx, cancel := context.WithTimeout(ctx, callTimeout)
 		stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
 		resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
-			Model:     req.Model,
-			System:    req.System,
-			MaxTokens: req.MaxTokens,
-			Effort:    req.Effort,
-			Messages:  withEphemeralContext(messages, req.EphemeralContext),
-			Tools:     tools,
+			Model:         req.Model,
+			System:        req.System,
+			MaxTokens:     req.MaxTokens,
+			Effort:        req.Effort,
+			Messages:      messages,
+			EphemeralTail: ephemeralTail(req.EphemeralContext),
+			Tools:         tools,
 		})
 		cancel()
 		stopKeepalive()
@@ -401,10 +394,9 @@ func finalizeWithoutTools(
 		System:    req.System,
 		MaxTokens: req.MaxTokens,
 		Effort:    req.Effort,
-		// No ephemeral tail on this path (matches pre-existing behavior); routed
-		// through withEphemeralContext anyway so cache marking always goes
-		// through the one enforced path.
-		Messages: withEphemeralContext(messages, ""),
+		// No ephemeral tail on this path (matches pre-existing behavior); the
+		// client still places the cache breakpoint on Messages regardless.
+		Messages: messages,
 		// No Tools: force a text answer so the budgeted round closes gracefully.
 	})
 	cancel()

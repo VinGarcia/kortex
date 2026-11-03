@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 	"time"
 
@@ -92,8 +91,26 @@ const superegoMaxTokens = 4096
 // (single user message) because the superego's whole point is seeing the
 // conversation the core saw — the identical array, not a lossy re-render
 // (design #4351). Tests substitute a fake.
+//
+// messages is the stable canonical history the core itself consumed, never
+// including the draft under review (design #4351). draftContext is always
+// non-empty and always closes with the draft-under-review message (design
+// #4354); on the active path it is preceded by the tone digest and the
+// core's debate meta-message when present. Both callers (the shadow path's
+// Superego.review and the active ladder's ReviewDraft) build it the same way:
+// messages is the context-assembly service's output as-is, draftContext is
+// assembled fresh per call.
+//
+// AnthropicConversant routes messages through anthropic.MessageRequest.
+// Messages and draftContext through EphemeralTail — provider-cache knowledge
+// that belongs entirely inside that adapter: the client places its
+// prompt-cache breakpoint on Messages before appending EphemeralTail, so
+// repeated reviews over a growing-but-shared messages prefix (the active
+// ladder's rounds, the shadow path's per-turn calls) read that breakpoint
+// back from cache instead of re-billing the whole conversation on every
+// review. The port itself carries no cache vocabulary.
 type Conversant interface {
-	Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error)
+	Converse(ctx context.Context, system string, messages []anthropic.Message, draftContext []anthropic.Message) (Evaluation, error)
 }
 
 // AnthropicConversant adapts the anthropic client to the Conversant port. The
@@ -110,12 +127,13 @@ func NewAnthropicConversant(client *anthropic.Client, model string) *AnthropicCo
 	return &AnthropicConversant{client: client, model: model}
 }
 
-func (c *AnthropicConversant) Converse(ctx context.Context, system string, messages []anthropic.Message) (Evaluation, error) {
+func (c *AnthropicConversant) Converse(ctx context.Context, system string, messages []anthropic.Message, draftContext []anthropic.Message) (Evaluation, error) {
 	resp, err := c.client.CreateMessage(ctx, anthropic.MessageRequest{
-		Model:     c.model,
-		System:    system,
-		MaxTokens: superegoMaxTokens,
-		Messages:  messages,
+		Model:         c.model,
+		System:        system,
+		MaxTokens:     superegoMaxTokens,
+		Messages:      messages,
+		EphemeralTail: draftContext,
 	})
 	if err != nil {
 		return Evaluation{}, err
@@ -208,12 +226,19 @@ func (s *Superego) review(turnIndex int, snapshot history.Snapshot, draftParagra
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	messages := superegoMessages(snapshot, turnIndex, draftUnderReviewMessage(draftParagraphs, tags), s.maxHistoryTurns)
+	// messages is the stable canonical history; draftContext is the volatile
+	// part — a fresh render on every call, even for the same turnIndex — built
+	// the same way ReviewDraft builds it for the active path below.
+	messages := superegoMessages(snapshot, turnIndex, s.maxHistoryTurns)
+	draftContext := []anthropic.Message{{
+		Role:    "user",
+		Content: draftUnderReviewMessage(draftParagraphs, tags),
+	}}
 	// Shadow mode is NOT active (active=false): calibrated leniency never shapes the
 	// log-only baseline critiques, and there is no last-round leniency to apply.
 	// loopID "" because shadow mode is one critique, not a ladder loop (see
 	// callLog.LoopID's doc comment in annotator.go).
-	critique, entry, err := s.converse(ctx, turnIndex, "", 0, false, false, messages)
+	critique, entry, err := s.converse(ctx, turnIndex, "", 0, false, false, messages, draftContext)
 	s.log.record(entry)
 	if err != nil {
 		return
@@ -296,23 +321,26 @@ func (s *Superego) ReviewDraft(
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	// The core's array is the durable view, so it is cloned before any append and
-	// never mutated. The ephemeral tone digest and the core's debate meta-message
-	// (each when present) enter as user messages before the draft; the draft
-	// itself always closes the array as the final user-role message (the one
-	// preserved asymmetry, #4354).
-	view := slices.Clone(messages)
+	// messages (the core's array) is the durable view and is never mutated or
+	// appended to here — it is handed to the client as-is (Messages) so the
+	// client's prompt-cache breakpoint lands on it. The ephemeral tone digest
+	// and the core's debate meta-message (each when present) enter as
+	// draftContext messages before the draft; the draft itself always closes
+	// draftContext as the final user-role message (the one preserved
+	// asymmetry, #4354). Every draftContext element is volatile per-call
+	// content, so none of it is ever marked.
+	draftContext := make([]anthropic.Message, 0, 3)
 	if ephemeralDigest != "" {
-		view = append(view, anthropic.Message{Role: "user", Content: ephemeralDigest})
+		draftContext = append(draftContext, anthropic.Message{Role: "user", Content: ephemeralDigest})
 	}
 	if coreMeta != "" {
-		view = append(view, anthropic.Message{Role: "user", Content: coreDebateMessage(coreMeta)})
+		draftContext = append(draftContext, anthropic.Message{Role: "user", Content: coreDebateMessage(coreMeta)})
 	}
-	view = append(view, anthropic.Message{
+	draftContext = append(draftContext, anthropic.Message{
 		Role:    "user",
 		Content: activeDraftMessage(draftParagraphs, tags, round, prior),
 	})
-	critique, entry, err := s.converse(ctx, turnIndex, loopID, round, true, lastRound, view)
+	critique, entry, err := s.converse(ctx, turnIndex, loopID, round, true, lastRound, messages, draftContext)
 	s.log.record(entry)
 	if err != nil {
 		return SuperegoCritique{}, false
@@ -331,9 +359,9 @@ func (s *Superego) ReviewDraft(
 // never touches shadow-mode baseline critiques. lastRound switches the review
 // prompt to its lenient variant on the final ladder round (both only when
 // calibrated leniency is on; see reviewSystemPrompt).
-func (s *Superego) converse(ctx context.Context, turnIndex int, loopID string, round int, active bool, lastRound bool, messages []anthropic.Message) (SuperegoCritique, callLog, error) {
+func (s *Superego) converse(ctx context.Context, turnIndex int, loopID string, round int, active bool, lastRound bool, messages []anthropic.Message, draftContext []anthropic.Message) (SuperegoCritique, callLog, error) {
 	start := time.Now()
-	eval, err := s.conversant.Converse(ctx, s.reviewSystemPrompt(active, lastRound), messages)
+	eval, err := s.conversant.Converse(ctx, s.reviewSystemPrompt(active, lastRound), messages, draftContext)
 	entry := callLog{
 		Facet:           superegoFacet,
 		Model:           s.model,
@@ -341,7 +369,7 @@ func (s *Superego) converse(ctx context.Context, turnIndex int, loopID string, r
 		LoopID:          loopID,
 		Round:           round,
 		LatencyMs:       time.Since(start).Milliseconds(),
-		HistoryMessages: len(messages),
+		HistoryMessages: len(messages) + len(draftContext),
 		StopReason:      eval.StopReason,
 		InputTokens:     eval.InputTokens,
 		OutputTokens:    eval.OutputTokens,

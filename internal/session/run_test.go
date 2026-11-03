@@ -72,9 +72,10 @@ type recorded struct {
 }
 
 // decodedMessageText returns the plain text of a Message.Content value as
-// decoded generically by encoding/json: a bare string, or — since
-// anthropic.MarkMessagesCachePrefix rewrites a string's last-message content
-// into the array-of-blocks form required to carry a cache_control marker —
+// decoded generically by encoding/json: a bare string, or — since the
+// anthropic client's message-history cache marking rewrites a string's
+// last-message content into the array-of-blocks form required to carry a
+// cache_control marker —
 // the []any of block maps that shape decodes into. It reads the first
 // text-type block, which is the only shape any fixture in this file ever
 // sends as the message under test; the cache_control marker alongside it (if
@@ -577,5 +578,96 @@ func TestRun_TurnErrorEmitsResultAndContinues(t *testing.T) {
 	}
 	if errResult == nil || !errResult.IsError {
 		t.Errorf("want a terminal error result after a failed turn, got %+v", errResult)
+	}
+}
+
+// bigEnoughForFloor clears every model's cacheable floor (opus/sonnet/
+// fable's 1024 tokens ~4096 bytes, haiku's 4096 tokens ~16384 bytes) by
+// itself, so a test proving the message-history cache breakpoint lands
+// doesn't have to reason about exact byte/token math.
+var bigEnoughForFloor = strings.Repeat("prompt cache history content. ", 1000) // ~30k bytes
+
+// TestTextOnlyRedraft_marksCanonicalHistoryNotTail proves textOnlyRedraft
+// closes the coverage gap the cache-coverage refactor targeted: canonical
+// (the core's res.Messages, which always ends in the echoed final assistant
+// draft — see governTurn's reviewMessages comment) gets the client's
+// prompt-cache breakpoint, the ephemeral tail never does, and two redraft
+// rounds over the SAME canonical with a DIFFERENT tail send a byte-identical
+// marked canonical prefix — the shape that lets the second round's call read
+// the first round's cache entry back instead of re-billing the turn's whole
+// history again.
+func TestTextOnlyRedraft_marksCanonicalHistoryNotTail(t *testing.T) {
+	var sentMessages [][]anthropic.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []anthropic.Message `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		sentMessages = append(sentMessages, body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"content":[{"type":"text","text":"revised"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	cfg := Config{Client: client, Model: "claude-opus-4-8", MaxTokens: 1024}
+
+	// canonical ends in the echoed raw assistant turn (text + tool_use blocks),
+	// exactly the shape MessageResponse.RawContent produces and governTurn hands
+	// to textOnlyRedraft as res.Messages — padded past opus's 1024-token floor,
+	// since markMessagesCachePrefix's floor check runs over the whole array.
+	canonical := []anthropic.Message{
+		{Role: "user", Content: "please fix the bug. " + bigEnoughForFloor},
+		{Role: "assistant", Content: []json.RawMessage{
+			json.RawMessage(`{"type":"text","text":"done"}`),
+			json.RawMessage(`{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd"}}`),
+		}},
+	}
+	var usage anthropic.Usage
+
+	for i, critique := range []string{"CRITIQUE-ROUND-1", "CRITIQUE-ROUND-2"} {
+		tail := []anthropic.Message{{Role: "user", Content: critique}}
+		if _, err := textOnlyRedraft(context.Background(), cfg, "system prompt", canonical, tail, &usage); err != nil {
+			t.Fatalf("round %d: textOnlyRedraft error: %v", i+1, err)
+		}
+	}
+
+	if len(sentMessages) != 2 {
+		t.Fatalf("want 2 calls, got %d", len(sentMessages))
+	}
+	for i, msgs := range sentMessages {
+		// canonical's 2 entries plus the 1-message tail.
+		if len(msgs) != 3 {
+			t.Fatalf("round %d: request carried %d messages, want 3 (canonical's 2 + 1 tail)", i+1, len(msgs))
+		}
+	}
+
+	// canonical's last message (index 1, the echoed assistant turn) must carry
+	// the breakpoint on both rounds, and be byte-identical across rounds: that
+	// identity is the whole point — the second call's cache lookback finds the
+	// first call's entry only if the marked prefix matches exactly.
+	marked1, err1 := json.Marshal(sentMessages[0][1])
+	marked2, err2 := json.Marshal(sentMessages[1][1])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("marshal error: %v / %v", err1, err2)
+	}
+	if !strings.Contains(string(marked1), `"cache_control":{"type":"ephemeral"}`) {
+		t.Errorf("round 1: canonical's last message not marked: %s", marked1)
+	}
+	if string(marked1) != string(marked2) {
+		t.Errorf("canonical's marked message differs between rounds:\nround1=%s\nround2=%s", marked1, marked2)
+	}
+
+	// The tail (index 2, the per-round critique) must never carry the
+	// breakpoint — marking it would turn every round into a fresh,
+	// never-read cache write instead of reusing the one above.
+	for i, msgs := range sentMessages {
+		tailJSON, err := json.Marshal(msgs[2])
+		if err != nil {
+			t.Fatalf("round %d: marshal error: %v", i+1, err)
+		}
+		if strings.Contains(string(tailJSON), "cache_control") {
+			t.Errorf("round %d: tail carries the cache breakpoint, want it only on canonical: %s", i+1, tailJSON)
+		}
 	}
 }

@@ -21,10 +21,15 @@ import (
 // model-generated).
 
 // superegoMessages converts the history snapshot into the superego's message
-// array for the SHADOW path. Turns after turnIndex are ignored; turns[turnIndex]'s
-// user text closes the plain history and draft (the reframed reviewed output) is
-// the final user message. maxHistoryTurns > 0 keeps only that many of the most
-// recent turns (the reviewed turn included), dropping the oldest ones.
+// array for the SHADOW path's stable history — the turn under review's draft
+// is NOT included; the caller appends it as its own draft-context array (see
+// Superego.review), the same way ReviewDraft does for the active path. Turns
+// after turnIndex are ignored; turns[turnIndex]'s user text closes the plain
+// history (the reviewed turn's own assistant text is intentionally omitted —
+// it re-enters as the draft-user message, not an assistant message, #4354:
+// mitigates self-leniency bias). maxHistoryTurns > 0 keeps only that many of
+// the most recent turns (the reviewed turn included), dropping the oldest
+// ones.
 //
 // The shadow path reconstructs from the Snapshot's final text only: the Snapshot
 // carries flattened per-turn ToolCalls, not the interleaved tool_use/tool_result
@@ -33,7 +38,7 @@ import (
 // the superego. Turns whose user or assistant text is empty contribute no message
 // for that side; consecutive same-role messages are valid Messages API input, so
 // no artificial filler is inserted.
-func superegoMessages(snapshot history.Snapshot, turnIndex int, draft string, maxHistoryTurns int) []anthropic.Message {
+func superegoMessages(snapshot history.Snapshot, turnIndex int, maxHistoryTurns int) []anthropic.Message {
 	turns := snapshot.Turns[:turnIndex+1]
 	start := 0
 	if maxHistoryTurns > 0 && len(turns) > maxHistoryTurns {
@@ -45,16 +50,13 @@ func superegoMessages(snapshot history.Snapshot, turnIndex int, draft string, ma
 			messages = append(messages, anthropic.Message{Role: "user", Content: user})
 		}
 		if i == turnIndex {
-			// The reviewed turn's assistant text enters as the draft-user
-			// message instead of an assistant message (draft-user decision,
-			// #4354: mitigates self-leniency bias).
 			break
 		}
 		if turns[i].AssistantText != "" {
 			messages = append(messages, anthropic.Message{Role: "assistant", Content: turns[i].AssistantText})
 		}
 	}
-	return append(messages, anthropic.Message{Role: "user", Content: draft})
+	return messages
 }
 
 // stripAnnotationLines removes the input annotator's injected tag lines

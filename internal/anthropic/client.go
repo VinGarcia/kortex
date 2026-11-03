@@ -121,7 +121,7 @@ type ToolResultBlock struct {
 	Content   string `json:"content"`
 	IsError   bool   `json:"is_error,omitempty"`
 	// CacheControl marks this block as a prompt-cache breakpoint when set (see
-	// MarkMessagesCachePrefix); nil omits the field, leaving an ordinary
+	// markMessagesCachePrefix); nil omits the field, leaving an ordinary
 	// tool_result block unaffected.
 	CacheControl *cacheControl `json:"cache_control,omitempty"`
 }
@@ -143,8 +143,22 @@ type MessageRequest struct {
 	// turn — strictly worse than not caching.
 	System    string
 	MaxTokens int
-	Messages  []Message
-	Tools     []ToolDef
+	// Messages is the canonical conversation history. CreateMessage places one
+	// ephemeral prompt-cache breakpoint on its last eligible content block (see
+	// markMessagesCachePrefix) before EphemeralTail is appended, so a caller
+	// that must send volatile per-turn content (a tone digest, a critique, an
+	// ephemeral draft-under-review message) puts it in EphemeralTail instead of
+	// here — appending it to Messages directly would move the breakpoint onto
+	// content that is never read back, turning every call into a cache write
+	// with no matching read.
+	Messages []Message
+	// EphemeralTail, when non-empty, is appended to Messages AFTER the
+	// cache-prefix breakpoint is placed, so it is sent to the model but never
+	// marked and never mutates the caller's Messages slice. Nil/empty omits the
+	// field, leaving the wire request's messages equal to (marked) Messages —
+	// the exact pre-existing behavior for every caller that does not set it.
+	EphemeralTail []Message
+	Tools         []ToolDef
 	// Effort selects output_config.effort ("low".."max"), which bounds how deeply
 	// a thinking model reasons before it answers. "" omits output_config so the
 	// API applies its default ("high"). It matters for the canary core model
@@ -370,11 +384,24 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 		system = append(system, systemBlock{Type: "text", Text: req.System})
 	}
 	markStableSystemPrefix(req.Model, system)
+
+	messages := markMessagesCachePrefix(req.Model, req.Messages)
+	if len(req.EphemeralTail) > 0 {
+		// The breakpoint is already placed (above); appending the tail now can
+		// never move it onto this volatile content. combined is a fresh slice —
+		// req.Messages/messages is never mutated, matching markMessagesCachePrefix's
+		// own no-mutation contract.
+		combined := make([]Message, 0, len(messages)+len(req.EphemeralTail))
+		combined = append(combined, messages...)
+		combined = append(combined, req.EphemeralTail...)
+		messages = combined
+	}
+
 	wire := wireRequest{
 		Model:     req.Model,
 		System:    system,
 		MaxTokens: req.MaxTokens,
-		Messages:  req.Messages,
+		Messages:  messages,
 		Tools:     req.Tools,
 	}
 	if req.Effort != "" {
