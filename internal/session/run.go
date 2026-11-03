@@ -397,6 +397,30 @@ func runTurn(
 	priorUserTexts []string,
 	userText string,
 ) ([]anthropic.Message, *history.Turn, error) {
+	// Prune stale thinking/redacted_thinking blocks out of the history this
+	// turn is about to re-send. msgs is, by construction, the full set of
+	// PAST, COMPLETED turns only — whatever the previous runTurn call
+	// returned, or what Store.Load read back at process start on a resume —
+	// never the live, in-progress slice RunLoop itself builds while THIS
+	// turn's own tool loop runs (that slice is a local clone RunLoop appends
+	// to below and returns as res.Messages; it never flows through msgs until
+	// the NEXT turn starts). So pruning msgs here can never touch an active
+	// tool-use cycle (a thinking+tool_use turn answered by a tool_result in
+	// the same request) — every cycle inside msgs already completed its one
+	// round trip in a past request.
+	//
+	// This closes the gap replaceFinalAssistantText's flatten (below) does
+	// not: that flatten only clears a turn's own TERMINAL assistant message,
+	// so a PAST turn's intermediate tool_use turns — persisted via
+	// RawContent and echoed verbatim by RunLoop — would otherwise carry
+	// their heavy, mostly-unreadable thinking/redacted_thinking blocks on
+	// every later call for the rest of the session. See
+	// anthropic.PruneThinkingFromHistory's doc comment for why the prune
+	// must be (and is) deterministic: the moving prompt-cache breakpoint
+	// (markMessagesCachePrefix) only re-stabilizes if the same input history
+	// always prunes to the same output.
+	msgs = anthropic.PruneThinkingFromHistory(msgs)
+
 	// The ephemeral tone digest is computed once per turn and shared: it is
 	// injected as the last item of the core's context (EphemeralContext below) and
 	// forwarded to the governor so the superego reviews against the same tone
