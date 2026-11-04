@@ -493,6 +493,10 @@ type bypassRecordingGovernor struct {
 	deliver     string
 }
 
+func (g *bypassRecordingGovernor) SystemPromptNote() string { return "" }
+
+func (g *bypassRecordingGovernor) StripArchiveRefs(text string) string { return text }
+
 func (g *bypassRecordingGovernor) GovernOutput(
 	ctx context.Context,
 	turnIndex int,
