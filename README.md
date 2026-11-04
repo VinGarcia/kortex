@@ -149,9 +149,10 @@ Env: `KORTEX_CLAUDE_BIN` (explicit path to the real claude), `KORTEX_LOG`
 goes to the path itself, the structured per-turn event log to
 `<path>.events`, and the structured facet-call log — latency, model,
 success/error, never the token — to `<path>.facets`), `KORTEX_CONFIG`
-(facet config file; absent = no facets, pure passthrough), `KORTEX_NATIVE_LOG_MAX_BYTES` (size cap of `<path>.native` before it rotates
-to `<path>.native.1`; default 104857600), plus the env var
-the config names as the facet OAuth token source.
+(facet config file; absent = no facets, pure passthrough),
+`KORTEX_NATIVE_LOG_MAX_BYTES` (size cap of `<path>.native` before it rotates
+to `<path>.native.1`; default 104857600), plus the env var the config names as
+the facet OAuth token source.
 
 ## Design notes
 

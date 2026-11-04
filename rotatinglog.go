@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 )
 
 // defaultNativeLogMaxBytes caps the ".native" wire log before it is rotated to
@@ -34,9 +35,14 @@ func nativeLogMaxBytes(getenv func(string) string, diag io.Writer) int64 {
 // reported once on diag and the write still lands in the current file, so the
 // log can never fail a turn. Safe for concurrent use.
 //
-// Several kortex processes may append to the same path; before each write the
-// file is stat'ed by path so a process whose file was rotated by another one
-// reopens the fresh file instead of growing the backup.
+// Several kortex processes may append to the same path. Before each write the
+// file is stat'ed by path (lock-free) so a process whose file was rotated by
+// another one reopens the fresh file. When rotation looks needed, the decision
+// is serialized across processes with flock(2) on "<path>.lock": under the lock
+// the path is re-stat'ed and renamed only if it is still r.file and still over
+// the cap, so a process that lost the race never renames a freshly created file
+// over the backup. A process that stat'ed just before another rotated may still
+// append one record to the (already renamed) backup; this is tolerated.
 type rotatingLog struct {
 	path     string
 	maxBytes int64
@@ -89,6 +95,37 @@ func (r *rotatingLog) rotateIfNeeded(incoming int64) {
 		return
 	}
 	// size > 0 guards against rotating forever on a single record above the cap.
+	if pathInfo.Size() == 0 || pathInfo.Size()+incoming <= r.maxBytes {
+		return
+	}
+	r.rotateLocked(incoming)
+}
+
+// rotateLocked serializes the rotation across processes via flock on the
+// sidecar lock file. If the lock cannot be taken it reports and skips rotation
+// (never rotates without the lock), so the write lands in the current file.
+func (r *rotatingLog) rotateLocked(incoming int64) {
+	lock, err := os.OpenFile(r.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		r.report(fmt.Errorf("open lock: %w", err))
+		return
+	}
+	defer lock.Close() // closing releases the flock
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		r.report(fmt.Errorf("flock: %w", err))
+		return
+	}
+
+	// Re-check under the lock: another process may have rotated meanwhile.
+	pathInfo, err := os.Stat(r.path)
+	if err != nil {
+		r.reopen()
+		return
+	}
+	if cur, err := r.file.Stat(); err == nil && !os.SameFile(cur, pathInfo) {
+		r.reopen()
+		return
+	}
 	if pathInfo.Size() == 0 || pathInfo.Size()+incoming <= r.maxBytes {
 		return
 	}
