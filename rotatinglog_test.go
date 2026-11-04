@@ -179,6 +179,62 @@ func TestRotatingLog_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+// Several instances on one path simulate several kortex processes. A backup
+// must never be replaced by a tiny freshly-created file.
+func TestRotatingLog_MultiProcessKeepsFullBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "k.native")
+	const maxBytes, recSize, writers, perWriter = 1000, 50, 6, 400
+	line := strings.Repeat("x", recSize-1) + "\n"
+	minBackup := int64(maxBytes - recSize)
+
+	checkBackup := func() {
+		if info, err := os.Stat(path + ".1"); err == nil && info.Size() < minBackup {
+			t.Errorf("backup is %d bytes, want >= %d (full backup destroyed)", info.Size(), minBackup)
+		}
+	}
+
+	logs := make([]*rotatingLog, writers)
+	for i := range logs {
+		l, err := newRotatingLog(path, maxBytes, &bytes.Buffer{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		logs[i] = l
+	}
+
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				checkBackup()
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for _, l := range logs {
+		wg.Add(1)
+		go func(l *rotatingLog) {
+			defer wg.Done()
+			for j := 0; j < perWriter; j++ {
+				if _, err := l.Write([]byte(line)); err != nil {
+					t.Errorf("Write: %v", err)
+				}
+			}
+		}(l)
+	}
+	wg.Wait()
+	close(stop)
+	<-sampled
+	checkBackup()
+}
+
 func TestNativeLogMaxBytes(t *testing.T) {
 	tests := []struct {
 		name     string
