@@ -86,9 +86,12 @@ func (c *Client) logWire(direction string, body []byte) {
 	}
 	c.wireMu.Lock()
 	defer c.wireMu.Unlock()
-	fmt.Fprintf(c.wireLog, "%s %s ", time.Now().Format(time.RFC3339Nano), direction)
-	c.wireLog.Write(body)
-	c.wireLog.Write([]byte("\n"))
+	// One Write per record so a size-rotating writer never splits a record
+	// across the current file and its backup.
+	line := fmt.Appendf(nil, "%s %s ", time.Now().Format(time.RFC3339Nano), direction)
+	line = append(line, body...)
+	line = append(line, '\n')
+	c.wireLog.Write(line)
 }
 
 // Message is one conversation message of a request. Content is either a
