@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -105,6 +104,16 @@ type OutputGovernor interface {
 		redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
 		finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
 	) (text string, archiveNote string)
+
+	// SystemPromptNote is the one-time explanation of archiveNote's reference
+	// for the agent's system prompt, or "" when the governor emits no
+	// references (its archive is disabled). It must be non-empty only if the
+	// load_superego_archive tool is wired alongside this governor.
+	SystemPromptNote() string
+
+	// StripArchiveRefs removes any archive reference the model imitated (or an
+	// older long footer) from text destined for the user.
+	StripArchiveRefs(text string) string
 }
 
 // maxLineBytes bounds one NDJSON input line. The default bufio.Scanner cap
@@ -318,7 +327,7 @@ func Run(ctx context.Context, cfg Config) error {
 				// for every subsequent turn and acknowledge the handshake.
 				systemPrompt = ev.AppendSystemPrompt
 				if cfg.Governor != nil {
-					systemPrompt = withArchiveExplanation(systemPrompt)
+					systemPrompt += cfg.Governor.SystemPromptNote()
 				}
 				line, err := protocol.EmitControlResponse(ev.RequestID)
 				if err != nil {
@@ -761,7 +770,7 @@ func governTurn(
 	stopKeepalive()
 	// Belt and braces: the model sees past "[superego archive #id]" references
 	// in its history and may imitate one. Never let one reach the user.
-	finalText = stripArchiveRefs(finalText)
+	finalText = cfg.Governor.StripArchiveRefs(finalText)
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
 		return "", nil, nil, fmt.Errorf("session: %w", err)
@@ -795,27 +804,6 @@ func governTurn(
 		finalMessages = appendArchiveNote(finalMessages, archiveNote)
 	}
 	return finalText, finalMessages, allRedraftCalls, nil
-}
-
-// ArchiveSystemPromptNote is the one-time explanation of the superego archive
-// reference, appended to the agent's system prompt at initialize. The per-reply
-// reference itself is just "[superego archive #<id>]" (see facet's
-// retrievalHint), kept only in persisted history.
-const ArchiveSystemPromptNote = "\n\nSuperego archive: drafts you wrote and the superego's critiques of them are ephemeral and are archived outside the conversation. When that happens, your own earlier reply in this history ends with a short reference `[superego archive #<id>]` pointing to that archive; call the `load_superego_archive` tool with that id to read the rejected drafts and the superego's critiques. The reference is bookkeeping for you only: never write, copy, or imitate such a reference in your replies; the user never sees it."
-
-// withArchiveExplanation appends ArchiveSystemPromptNote to prompt.
-func withArchiveExplanation(prompt string) string {
-	return prompt + ArchiveSystemPromptNote
-}
-
-var archiveRefRe = regexp.MustCompile(`\s*\[superego (?:archive|conversation archived with ID) #[^\]]*\]`)
-
-// stripArchiveRefs removes any "[superego archive #<id>]" reference, and the
-// OLD long footer form ("[superego conversation archived with ID #<id> — ...]",
-// still present in older sessions' history and so still imitable), from text
-// destined for the user.
-func stripArchiveRefs(text string) string {
-	return archiveRefRe.ReplaceAllString(text, "")
 }
 
 // appendArchiveNote returns a copy of messages with note appended to the

@@ -1,22 +1,10 @@
 package tools
 
-import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"regexp"
-	"strings"
-)
+import "fmt"
 
 // superegoArchiveMaxBytes caps the archive content returned in the
 // tool_result, so loading one archived loop cannot blow up the next request.
 const superegoArchiveMaxBytes = 32 << 10
-
-var superegoArchiveIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // SuperegoArchiveInput is the load_superego_archive tool's input_schema.
 type SuperegoArchiveInput struct {
@@ -38,41 +26,26 @@ var SuperegoArchiveDef = mustToolDef(
 	},
 )
 
-// RunLoadSuperegoArchive scans the conflicts log at path for the JSONL line
-// whose "loopId" equals the requested id and returns that line's content,
-// truncated to superegoArchiveMaxBytes with a note when cut.
-func RunLoadSuperegoArchive(path string, input SuperegoArchiveInput) (output string, isError bool) {
-	id := strings.TrimPrefix(strings.TrimSpace(input.ID), "#")
-	if !superegoArchiveIDRe.MatchString(id) {
-		return fmt.Sprintf("error: invalid archive id %q: want 32 lowercase hex characters (optionally prefixed with '#')", input.ID), true
-	}
-	f, err := os.Open(path)
+// ArchiveLoader is the port through which load_superego_archive reads an
+// archived loop. The implementation (facet.ConflictsArchive) owns the on-disk
+// format and id validation; tools only caps the output size.
+type ArchiveLoader interface {
+	// LoadArchive returns the archived loop for id, or an error whose message
+	// is safe to show the model (invalid id, not found, unreadable).
+	LoadArchive(id string) (string, error)
+}
+
+// RunLoadSuperegoArchive loads the archive for the requested id through
+// loader and truncates the content to superegoArchiveMaxBytes with a note
+// when cut.
+func RunLoadSuperegoArchive(loader ArchiveLoader, input SuperegoArchiveInput) (output string, isError bool) {
+	content, err := loader.LoadArchive(input.ID)
 	if err != nil {
-		return fmt.Sprintf("error: opening superego archive: %v", err), true
+		return fmt.Sprintf("error: %v", err), true
 	}
-	defer f.Close()
-	r := bufio.NewReader(f)
-	for {
-		line, readErr := r.ReadBytes('\n')
-		// Cheap substring prefilter before paying for a JSON decode.
-		if bytes.Contains(line, []byte(id)) {
-			var entry struct {
-				LoopID string `json:"loopId"`
-			}
-			if json.Unmarshal(line, &entry) == nil && entry.LoopID == id {
-				line = bytes.TrimRight(line, "\n")
-				cut, truncated := truncateUTF8(line, superegoArchiveMaxBytes)
-				if truncated {
-					return fmt.Sprintf("%s\n[truncated: showing first %d of %d bytes]", cut, len(cut), len(line)), false
-				}
-				return string(cut), false
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				return fmt.Sprintf("error: no superego archive found with id %s", id), true
-			}
-			return fmt.Sprintf("error: reading superego archive: %v", readErr), true
-		}
+	cut, truncated := truncateUTF8([]byte(content), superegoArchiveMaxBytes)
+	if truncated {
+		return fmt.Sprintf("%s\n[truncated: showing first %d of %d bytes]", cut, len(cut), len(content)), false
 	}
+	return string(cut), false
 }

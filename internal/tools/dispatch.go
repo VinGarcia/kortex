@@ -35,16 +35,17 @@ type Dispatcher struct {
 	// mcpTools is the tools/list catalog ToolDefs() declares to the model
 	// alongside the builtins; empty when mcp is nil.
 	mcpTools []mcp.Tool
-	// archivePath is the conflicts log load_superego_archive scans; empty
-	// (the default) means the tool is neither declared nor executable.
-	archivePath string
+	// archive backs load_superego_archive; nil (the default) means the tool
+	// is neither declared nor executable.
+	archive ArchiveLoader
 }
 
-// WithSuperegoArchive enables the load_superego_archive tool, reading the
-// conflicts log at path. Call it only when a governor and conflicts log are
-// wired. It returns d for chaining.
-func (d *Dispatcher) WithSuperegoArchive(path string) *Dispatcher {
-	d.archivePath = path
+// WithSuperegoArchive enables the load_superego_archive tool, reading
+// archived loops through loader. Call it only when the governor's archive is
+// really available. A nil loader leaves the tool disabled. It returns d for
+// chaining.
+func (d *Dispatcher) WithSuperegoArchive(loader ArchiveLoader) *Dispatcher {
+	d.archive = loader
 	return d
 }
 
@@ -71,7 +72,7 @@ func NewDispatcherWithMCP(client *mcp.Client, tools []mcp.Tool) *Dispatcher {
 // model). Builtins-only when no MCP client is wired.
 func (d *Dispatcher) ToolDefs() []anthropic.ToolDef {
 	defs := Definitions()
-	if d.archivePath != "" {
+	if d.archive != nil {
 		defs = append(defs, SuperegoArchiveDef)
 	}
 	return append(defs, MCPToolDefs(d.mcpTools)...)
@@ -126,14 +127,14 @@ func (d *Dispatcher) Execute(ctx context.Context, block anthropic.ContentBlock) 
 		return anthropic.NewToolResultBlock(block.ID, output, isError)
 
 	case "load_superego_archive":
-		if d.archivePath == "" {
+		if d.archive == nil {
 			return anthropic.NewToolResultBlock(block.ID, "error: superego archive is not enabled", true)
 		}
 		var input SuperegoArchiveInput
 		if err := json.Unmarshal(block.Input, &input); err != nil {
 			return errorResult(block.ID, "load_superego_archive", err)
 		}
-		output, isError := RunLoadSuperegoArchive(d.archivePath, input)
+		output, isError := RunLoadSuperegoArchive(d.archive, input)
 		return anthropic.NewToolResultBlock(block.ID, output, isError)
 
 	default:

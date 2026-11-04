@@ -46,6 +46,10 @@ import (
 // that invariant is stated: no second tail file is ever created for it, and
 // the session layer never sees this file's schema — retrievalHint renders
 // the complete, ready-to-persist note itself.
+//
+// facet OWNS this file's on-disk shape end to end: it writes it (record) and
+// reads it back (ConflictsArchive in conflicts_archive.go, validating the
+// loop id format newLoopID mints). No other package parses it.
 
 // conflictsLogFacet names this producer's callLog entries distinctly from
 // activeSuperegoFacet, when a conflicts-log write failure itself is routed
@@ -143,7 +147,7 @@ func (c *conflictsLogger) enabled() bool {
 // record() ran with a non-nil sink and returned no error — never for a loop
 // that is not really sitting here). The note is deliberately just a short
 // reference: the mechanism (what the archive is, where it lives) is explained
-// once in the system prompt (session.ArchiveSystemPromptNote), and the note is
+// once in the system prompt (archiveSystemPromptNote, exposed via ActiveSuperego.SystemPromptNote), and the note is
 // persisted in history only, never delivered to the user.
 func (c *conflictsLogger) retrievalHint(id string) string {
 	return fmt.Sprintf("\n\n[superego archive #%s]", id)
@@ -164,4 +168,20 @@ func newLoopID() string {
 		panic(fmt.Sprintf("facet: reading random for loop id: %v", err))
 	}
 	return fmt.Sprintf("%x", b)
+}
+
+// SystemPromptNote returns the one-time system-prompt explanation of the
+// "[superego archive #<id>]" reference, or "" when the conflicts log is off
+// (no reference is ever emitted then, and the load tool is not wired).
+func (a *ActiveSuperego) SystemPromptNote() string {
+	if !a.conflicts.enabled() {
+		return ""
+	}
+	return archiveSystemPromptNote
+}
+
+// StripArchiveRefs removes archive references (current and old long footer
+// form) from text destined for the user.
+func (a *ActiveSuperego) StripArchiveRefs(text string) string {
+	return archiveRefRe.ReplaceAllString(text, "")
 }

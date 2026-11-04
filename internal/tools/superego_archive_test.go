@@ -3,76 +3,49 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 )
 
-const (
-	archiveIDA = "0123456789abcdef0123456789abcdef"
-	archiveIDB = "fedcba9876543210fedcba9876543210"
-)
+// fakeLoader is an ArchiveLoader returning a canned result and recording the id.
+type fakeLoader struct {
+	content string
+	err     error
+	gotID   string
+}
 
-func writeArchive(t *testing.T, lines ...string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "x.conflicts")
-	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return p
+func (f *fakeLoader) LoadArchive(id string) (string, error) {
+	f.gotID = id
+	return f.content, f.err
 }
 
 func TestRunLoadSuperegoArchive(t *testing.T) {
-	lineA := `{"loopId":"` + archiveIDA + `","tail":[{"type":"draft","text":"bad draft"},{"type":"critique","text":"too rude"}]}`
-	lineB := `{"loopId":"` + archiveIDB + `","note":"` + archiveIDA + `","tail":[]}`
-	path := writeArchive(t, lineB, lineA)
-
-	t.Run("found, with and without #", func(t *testing.T) {
-		for _, id := range []string{archiveIDA, "#" + archiveIDA} {
-			out, isErr := RunLoadSuperegoArchive(path, SuperegoArchiveInput{ID: id})
-			if isErr || out != lineA {
-				t.Errorf("id %q: out=%q isErr=%v, want line A", id, out, isErr)
+	for name, tc := range map[string]struct {
+		loader      *fakeLoader
+		wantErr     bool
+		wantContain string
+		maxLen      int
+	}{
+		"found":      {loader: &fakeLoader{content: `{"loopId":"x"}`}, wantContain: `{"loopId":"x"}`},
+		"loader err": {loader: &fakeLoader{err: errors.New("no superego archive found")}, wantErr: true, wantContain: "no superego archive found"},
+		"truncation": {loader: &fakeLoader{content: strings.Repeat("\u00e9", superegoArchiveMaxBytes)}, wantContain: "[truncated: showing first", maxLen: superegoArchiveMaxBytes + 100},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, isErr := RunLoadSuperegoArchive(tc.loader, SuperegoArchiveInput{ID: "#abc"})
+			if isErr != tc.wantErr || !strings.Contains(out, tc.wantContain) {
+				t.Errorf("out=%.80q isErr=%v, want isErr=%v containing %q", out, isErr, tc.wantErr, tc.wantContain)
 			}
-		}
-	})
-	t.Run("id only mentioned in another field is not a match", func(t *testing.T) {
-		out, isErr := RunLoadSuperegoArchive(writeArchive(t, lineB), SuperegoArchiveInput{ID: archiveIDA})
-		if !isErr || !strings.Contains(out, "no superego archive found") {
-			t.Errorf("out=%q isErr=%v, want not-found error", out, isErr)
-		}
-	})
-	t.Run("not found", func(t *testing.T) {
-		out, isErr := RunLoadSuperegoArchive(path, SuperegoArchiveInput{ID: strings.Repeat("a", 32)})
-		if !isErr || !strings.Contains(out, "no superego archive found") {
-			t.Errorf("out=%q isErr=%v", out, isErr)
-		}
-	})
-	t.Run("invalid id", func(t *testing.T) {
-		for _, id := range []string{"", "#", "abc", "loop-abc123", strings.Repeat("g", 32), archiveIDA + "0"} {
-			out, isErr := RunLoadSuperegoArchive(path, SuperegoArchiveInput{ID: id})
-			if !isErr || !strings.Contains(out, "invalid archive id") {
-				t.Errorf("id %q: out=%q isErr=%v, want invalid-id error", id, out, isErr)
+			if tc.maxLen > 0 && len(out) > tc.maxLen {
+				t.Errorf("output %d bytes, want <= %d", len(out), tc.maxLen)
 			}
-		}
-	})
-	t.Run("missing file", func(t *testing.T) {
-		if _, isErr := RunLoadSuperegoArchive(filepath.Join(t.TempDir(), "nope"), SuperegoArchiveInput{ID: archiveIDA}); !isErr {
-			t.Error("want error for missing file")
-		}
-	})
-	t.Run("truncation", func(t *testing.T) {
-		big := `{"loopId":"` + archiveIDA + `","tail":"` + strings.Repeat("é", superegoArchiveMaxBytes) + `"}`
-		out, isErr := RunLoadSuperegoArchive(writeArchive(t, big), SuperegoArchiveInput{ID: archiveIDA})
-		if isErr || !strings.Contains(out, "[truncated: showing first") {
-			t.Fatalf("isErr=%v, want truncation note; out tail=%q", isErr, out[max(0, len(out)-80):])
-		}
-		if len(out) > superegoArchiveMaxBytes+100 {
-			t.Errorf("output %d bytes, want bounded near %d", len(out), superegoArchiveMaxBytes)
-		}
-	})
+			if tc.loader.gotID != "#abc" {
+				t.Errorf("loader got id %q, want it passed through unchanged", tc.loader.gotID)
+			}
+		})
+	}
 }
 
 func TestDispatcher_SuperegoArchiveToolOnlyWhenWired(t *testing.T) {
@@ -85,16 +58,18 @@ func TestDispatcher_SuperegoArchiveToolOnlyWhenWired(t *testing.T) {
 		return false
 	}
 	if has(NewDispatcher()) {
-		t.Error("tool declared without a conflicts log")
+		t.Error("tool declared without an archive loader")
 	}
-	path := writeArchive(t, `{"loopId":"`+archiveIDA+`"}`)
-	d := NewDispatcher().WithSuperegoArchive(path)
+	if has(NewDispatcher().WithSuperegoArchive(nil)) {
+		t.Error("tool declared with a nil loader")
+	}
+	d := NewDispatcher().WithSuperegoArchive(&fakeLoader{content: "archived"})
 	if !has(d) {
 		t.Fatal("tool not declared when wired")
 	}
-	in, _ := json.Marshal(SuperegoArchiveInput{ID: "#" + archiveIDA})
+	in, _ := json.Marshal(SuperegoArchiveInput{ID: "abc"})
 	res := d.Execute(context.Background(), anthropic.ContentBlock{Type: "tool_use", ID: "t1", Name: "load_superego_archive", Input: in})
-	if res.IsError || !strings.Contains(res.Content, archiveIDA) {
+	if res.IsError || res.Content != "archived" {
 		t.Errorf("result = %+v", res)
 	}
 	res = NewDispatcher().Execute(context.Background(), anthropic.ContentBlock{Type: "tool_use", ID: "t2", Name: "load_superego_archive", Input: in})

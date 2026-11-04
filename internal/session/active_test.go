@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -41,6 +42,16 @@ type fakeGovernor struct {
 	// predates this field) reproduces the exact pre-#5998 behavior: no note
 	// appended.
 	archiveNote string
+	// systemNote is returned by SystemPromptNote ("" = governor has no archive).
+	systemNote string
+}
+
+var fakeArchiveRefRe = regexp.MustCompile(`\s*\[superego archive #[^\]]*\]`)
+
+func (f *fakeGovernor) SystemPromptNote() string { return f.systemNote }
+
+func (f *fakeGovernor) StripArchiveRefs(text string) string {
+	return fakeArchiveRefRe.ReplaceAllString(text, "")
 }
 
 func (f *fakeGovernor) GovernOutput(
@@ -108,6 +119,10 @@ type recordingGovernor struct {
 	gotDigests  []string
 	deliver     string
 }
+
+func (g *recordingGovernor) SystemPromptNote() string { return "" }
+
+func (g *recordingGovernor) StripArchiveRefs(text string) string { return text }
 
 func (g *recordingGovernor) GovernOutput(
 	ctx context.Context,
@@ -362,6 +377,10 @@ type slowGovernor struct {
 	delay   time.Duration
 	deliver string
 }
+
+func (g *slowGovernor) SystemPromptNote() string { return "" }
+
+func (g *slowGovernor) StripArchiveRefs(text string) string { return text }
 
 func (g *slowGovernor) GovernOutput(
 	ctx context.Context,
@@ -841,33 +860,6 @@ func TestRun_ActiveGovernorStripsImitatedArchiveRefFromDeliveredText(t *testing.
 	}
 }
 
-func TestStripArchiveRefs(t *testing.T) {
-	oldFooter := "\n\n[superego conversation archived with ID #22219a3b — to review the rejected drafts and the superego's critiques behind this reply, search /home/x/kortex.log.conflicts for the JSONL line where \"loopId\" is \"22219a3b\"]"
-	for name, tc := range map[string]struct{ in, want string }{
-		"new form":     {"hi\n\n[superego archive #abc]", "hi"},
-		"old form":     {"hi" + oldFooter, "hi"},
-		"mid text":     {"a [superego archive #abc] b", "a b"},
-		"no reference": {"[other] text", "[other] text"},
-	} {
-		if got := stripArchiveRefs(tc.in); got != tc.want {
-			t.Errorf("%s: got %q, want %q", name, got, tc.want)
-		}
-	}
-}
-
-func TestWithArchiveExplanation_ExplainsOnce(t *testing.T) {
-	got := withArchiveExplanation("base prompt")
-	if !strings.HasPrefix(got, "base prompt") {
-		t.Errorf("prompt = %q, want base prompt preserved", got)
-	}
-	if !strings.Contains(got, "load_superego_archive") {
-		t.Errorf("prompt = %q, want it to name the load_superego_archive tool", got)
-	}
-	if n := strings.Count(got, "[superego archive #<id>]"); n != 1 {
-		t.Errorf("explanation count = %d, want 1", n)
-	}
-}
-
 // TestRun_ActiveGovernorNoArchiveNoteWhenArchiveIDEmpty proves the archive
 // reference is only ever appended when GovernOutput actually reports a
 // non-empty archiveNote (issue #5998): with the zero-value archiveNote (what
@@ -1222,13 +1214,14 @@ func TestRun_ActiveGovernorFinalizeAuthorsFinalMessage(t *testing.T) {
 
 // The Messages API request carries the archive explanation exactly once when a
 // governor is wired, and not at all without one.
-func TestRun_SystemPromptExplainsArchiveOnceOnlyWithGovernor(t *testing.T) {
+func TestRun_SystemPromptExplainsArchiveOnceOnlyWithArchiveGovernor(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		gov  OutputGovernor
 		want int
 	}{
-		{"with governor", &fakeGovernor{deliver: "ok"}, 1},
+		{"with archive-enabled governor", &fakeGovernor{deliver: "ok", systemNote: "\n\nexplains [superego archive #<id>] once"}, 1},
+		{"governor without archive", &fakeGovernor{deliver: "ok"}, 0},
 		{"without governor", nil, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
