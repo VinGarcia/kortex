@@ -141,21 +141,12 @@ func (c *conflictsLogger) enabled() bool {
 // archiveNote for a loop whose line has just landed in this log under id
 // (the caller, recordConflicts in superego_loop.go, only reaches this after
 // record() ran with a non-nil sink and returned no error — never for a loop
-// that is not really sitting here). It owns this log's on-disk shape (the
-// JSONL line, the loopId field) so callers outside this package treat the
-// returned string as opaque. where prefers the sink's own file path (the
-// production case: ConflictsLogSink is an *os.File) and falls back to a
-// generic description for sinks that don't name themselves (e.g. a test's
-// bytes.Buffer).
+// that is not really sitting here). The note is deliberately just a short
+// reference: the mechanism (what the archive is, where it lives) is explained
+// once in the system prompt (session.ArchiveSystemPromptNote), and the note is
+// persisted in history only, never delivered to the user.
 func (c *conflictsLogger) retrievalHint(id string) string {
-	where := "the conflicts log"
-	if named, ok := c.sink.(interface{ Name() string }); ok {
-		where = named.Name()
-	}
-	return fmt.Sprintf(
-		"\n\n[superego conversation archived with ID #%s — to review the rejected drafts and the superego's critiques behind this reply, search %s for the JSONL line where \"loopId\" is %q]",
-		id, where, id,
-	)
+	return fmt.Sprintf("\n\n[superego archive #%s]", id)
 }
 
 // newLoopID mints a fresh per-loop identifier: 16 bytes of crypto/rand,

@@ -211,7 +211,7 @@ func TestActiveSuperego_conflictsLogOnCleanApprove(t *testing.T) {
 	// a second file. A clean approve still ran a (1-round) ladder, so it is
 	// archived exactly like any other outcome (conflicts_log.go's package doc:
 	// every loop is logged, not just the conflicted ones).
-	if !strings.Contains(archiveNote, "archived with ID #"+entry.LoopID) || !strings.Contains(archiveNote, `"loopId"`) {
+	if archiveNote != "\n\n[superego archive #"+entry.LoopID+"]" {
 		t.Errorf("archiveNote = %q, want it to reference the conflicts log's own loopId %q (reuse, not a second artifact)", archiveNote, entry.LoopID)
 	}
 }
@@ -290,7 +290,7 @@ func TestActiveSuperego_panicInsideLadderStillLogsConflictsLine(t *testing.T) {
 	// issue #5998: even a panic mid-ladder, once the ladder was entered, still
 	// lands a real conflicts-log line (asserted above), so it must still be
 	// reported as archived.
-	if !strings.Contains(archiveNote, "archived with ID #"+entry.LoopID) || !strings.Contains(archiveNote, `"loopId"`) {
+	if archiveNote != "\n\n[superego archive #"+entry.LoopID+"]" {
 		t.Errorf("archiveNote = %q, want it to reference the conflicts log's own loopId %q", archiveNote, entry.LoopID)
 	}
 }
