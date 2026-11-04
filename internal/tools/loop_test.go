@@ -314,8 +314,8 @@ func TestRunLoop_emptyEndTurnRecoversWithUserContinuation(t *testing.T) {
 	if strings.Join(types, ",") != "tool_result,text" {
 		t.Errorf("last user turn blocks = %v, want [tool_result text]", types)
 	}
-	if !strings.Contains(prompt, "NO_REPLY") {
-		t.Errorf("recovery prompt = %q, want it to offer the NO_REPLY sentinel when not deferred", prompt)
+	if prompt != emptyEndTurnPrompt {
+		t.Errorf("recovery prompt = %q, want %q", prompt, emptyEndTurnPrompt)
 	}
 	if raw, _ := json.Marshal(requests[2]); strings.Contains(string(raw), "sig-abc") {
 		t.Error("recovery request echoes the empty thinking-only turn; it must be dropped")
@@ -333,23 +333,23 @@ func TestRunLoop_emptyEndTurnRecoversWithUserContinuation(t *testing.T) {
 	}
 }
 
-// TestRunLoop_emptyEndTurnDeferFinalOmitsSilentSentinel proves a DeferFinal
-// caller is not told it may answer NO_REPLY, since its governor would receive
-// the bare sentinel as a draft.
-func TestRunLoop_emptyEndTurnDeferFinalOmitsSilentSentinel(t *testing.T) {
+// TestRunLoop_emptyEndTurnRecoveryCallingToolFailsNamingIt proves a recovery answer
+// that asks for a tool is not run: the loop stays bounded at one recovery call, and
+// the error says what actually happened.
+func TestRunLoop_emptyEndTurnRecoveryCallingToolFailsNamingIt(t *testing.T) {
 	var requests [][]map[string]any
-	server := emptyEndTurnServer(t, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, &requests)
+	server := emptyEndTurnServer(t, `{"content":[{"type":"tool_use","id":"t9","name":"x","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`, &requests)
 	defer server.Close()
 
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
 	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
-		Model: "m", MaxTokens: 100, UserMessage: "x", DeferFinal: true,
+		Model: "m", MaxTokens: 100, UserMessage: "x",
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "called a tool") {
+		t.Fatalf("err = %v, want it to name the tool call", err)
 	}
-	if raw, _ := json.Marshal(requests[2][len(requests[2])-1]); strings.Contains(string(raw), "NO_REPLY") {
-		t.Errorf("DeferFinal recovery last turn = %s, must not offer NO_REPLY", raw)
+	if len(requests) != 3 {
+		t.Errorf("API calls = %d, want 3 (no further call after the recovery)", len(requests))
 	}
 }
 

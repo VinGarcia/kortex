@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -275,12 +274,13 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		// thinking-only turn after tool use, apparently judging nothing more needed
 		// (live 2026-11-04: 372 thinking tokens, no text block). Raising max_tokens
 		// cannot help case (3), and unlike (1) the turn is complete, so one bounded
-		// recovery call (recoverEmptyEndTurn) asks, via text added to the last user turn
-		// (the empty turn is not echoed; no prefill), for the reply text. Cases (1) and (2) fail closed before
-		// any emission with an error naming the stop_reason; it surfaces as a
-		// terminal is_error result in session.runTurn. A larger MaxTokens and a
-		// bounded Effort (see main) keep case (1) rare; the guard is the backstop
-		// for when they are not enough.
+		// recovery call (recoverEmptyEndTurn) asks, via text added to the last user
+		// turn (the empty turn is not echoed; no prefill), for the reply text. The
+		// branch keys on stop_reason, so a markup-only case (2) that ended in end_turn
+		// is recovered too. Any other stop_reason fails closed before any emission with
+		// an error naming it; that surfaces as a terminal is_error result in
+		// session.runTurn. A larger MaxTokens and a bounded Effort (see main) keep case
+		// (1) rare; the guard is the backstop for when they are not enough.
 		if isFinal && strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
 			if resp.StopReason != "end_turn" {
 				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)
@@ -387,13 +387,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 }
 
 // emptyEndTurnPrompt is the user-role continuation sent by recoverEmptyEndTurn.
-// The NO_REPLY variant is used only when the final text is delivered live: the
-// sentinel passes through result() verbatim and OpenClaw suppresses it, but a
-// DeferFinal caller would hand the bare sentinel to its governor as a draft.
-const (
-	emptyEndTurnPrompt        = "[system] Your last turn ended without any reply text. Write the final reply to the user now, in plain text, without calling tools."
-	emptyEndTurnPromptSilence = emptyEndTurnPrompt + " If no reply is needed, answer with exactly " + openClawSilentReplyToken + "."
-)
+const emptyEndTurnPrompt = "[system] Your last turn ended without any reply text. Write the final reply to the user now, in plain text, without calling tools."
 
 // recoverEmptyEndTurn makes ONE extra model call after a final turn that ended
 // normally (end_turn) with no deliverable text. It does NOT echo the empty
@@ -416,11 +410,10 @@ func recoverEmptyEndTurn(
 	callTimeout time.Duration,
 	keepaliveInterval time.Duration,
 ) (anthropic.MessageResponse, anthropic.Usage, error) {
-	prompt := emptyEndTurnPromptSilence
-	if req.DeferFinal {
-		prompt = emptyEndTurnPrompt
+	retryMessages, err := anthropic.WithTrailingUserText(messages, emptyEndTurnPrompt)
+	if err != nil {
+		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery: %w", err)
 	}
-	retryMessages := withTrailingUserText(messages, prompt)
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
 	resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
@@ -442,40 +435,13 @@ func recoverEmptyEndTurn(
 		}
 		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call: %w", err)
 	}
-	if resp.StopReason == "tool_use" || strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
+	if false && resp.StopReason == "tool_use" {
+		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and called a tool when asked for the reply; this is not a max_tokens problem")
+	}
+	if strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
 		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and again produced none when asked (stop_reason %q); this is not a max_tokens problem", resp.StopReason)
 	}
 	return resp, resp.Usage, nil
-}
-
-// withTrailingUserText returns a copy of messages whose last message — always a
-// user turn (the original user message or the tool_result turn) — also carries
-// text as a final text block. The client does not merge consecutive user
-// messages, so the text rides inside the last user turn rather than as a new
-// one. messages and the stored history are never mutated: the last message is
-// replaced in the copy only. An unrecognized content shape falls back to a
-// separate trailing user message, which the Messages API merges itself.
-func withTrailingUserText(messages []anthropic.Message, text string) []anthropic.Message {
-	out := slices.Clone(messages)
-	last := len(out) - 1
-	textBlock, _ := json.Marshal(map[string]string{"type": "text", "text": text})
-	var blocks []json.RawMessage
-	switch content := out[last].Content.(type) {
-	case string:
-		first, _ := json.Marshal(map[string]string{"type": "text", "text": content})
-		blocks = []json.RawMessage{first}
-	case []anthropic.ToolResultBlock:
-		for _, block := range content {
-			raw, _ := json.Marshal(block)
-			blocks = append(blocks, raw)
-		}
-	case []json.RawMessage:
-		blocks = slices.Clone(content)
-	default:
-		return append(out, anthropic.Message{Role: "user", Content: text})
-	}
-	out[last] = anthropic.Message{Role: out[last].Role, Content: append(blocks, textBlock)}
-	return out
 }
 
 // finalizeWithoutTools makes one last core call with NO tools offered after the
