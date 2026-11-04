@@ -801,16 +801,18 @@ func governTurn(
 // reference, appended to the agent's system prompt at initialize. The per-reply
 // reference itself is just "[superego archive #<id>]" (see facet's
 // retrievalHint), kept only in persisted history.
-const ArchiveSystemPromptNote = "\n\nSuperego archive: drafts you wrote and the superego's critiques of them are ephemeral and are archived outside the conversation. When that happens, your own earlier reply in this history ends with a short reference `[superego archive #<id>]` pointing to that archive. It is bookkeeping for you only: never write, copy, or imitate such a reference in your replies; the user never sees it."
+const ArchiveSystemPromptNote = "\n\nSuperego archive: drafts you wrote and the superego's critiques of them are ephemeral and are archived outside the conversation. When that happens, your own earlier reply in this history ends with a short reference `[superego archive #<id>]` pointing to that archive; call the `load_superego_archive` tool with that id to read the rejected drafts and the superego's critiques. The reference is bookkeeping for you only: never write, copy, or imitate such a reference in your replies; the user never sees it."
 
 // withArchiveExplanation appends ArchiveSystemPromptNote to prompt.
 func withArchiveExplanation(prompt string) string {
 	return prompt + ArchiveSystemPromptNote
 }
 
-var archiveRefRe = regexp.MustCompile(`\s*\[superego archive #[^\]]*\]`)
+var archiveRefRe = regexp.MustCompile(`\s*\[superego (?:archive|conversation archived with ID) #[^\]]*\]`)
 
-// stripArchiveRefs removes any "[superego archive #<id>]" reference from text
+// stripArchiveRefs removes any "[superego archive #<id>]" reference, and the
+// OLD long footer form ("[superego conversation archived with ID #<id> — ...]",
+// still present in older sessions' history and so still imitable), from text
 // destined for the user.
 func stripArchiveRefs(text string) string {
 	return archiveRefRe.ReplaceAllString(text, "")

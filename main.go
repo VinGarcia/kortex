@@ -162,6 +162,9 @@ type builtFacets struct {
 	// is nil or the superego is not in active mode — see buildFacets, where it
 	// is only opened inside the `if active` branch.
 	conflictsLogFile *os.File
+	// conflictsLogPath is set only when the conflicts log file was actually
+	// opened; it enables the load_superego_archive tool.
+	conflictsLogPath string
 	mcpClient        *mcp.Client
 }
 
@@ -292,6 +295,7 @@ func buildFacets(cfgPath string, logPath string, sessionID string) (builtFacets,
 				built.conflictsLogFile = nil
 			} else {
 				conflictsLogSink = built.conflictsLogFile
+				built.conflictsLogPath = logPath + ".conflicts"
 			}
 		}
 		built.governor = facet.NewActiveSuperego(facet.ActiveSuperegoParams{
@@ -596,6 +600,9 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	}
 
 	dispatcher := buildNativeDispatcher(ctx, argv, getenv, stderr)
+	if facets.governor != nil && facets.conflictsLogPath != "" {
+		dispatcher.WithSuperegoArchive(facets.conflictsLogPath)
+	}
 
 	err = session.Run(ctx, session.Config{
 		Stdin:                   stdin,

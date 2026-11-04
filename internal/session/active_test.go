@@ -841,10 +841,27 @@ func TestRun_ActiveGovernorStripsImitatedArchiveRefFromDeliveredText(t *testing.
 	}
 }
 
+func TestStripArchiveRefs(t *testing.T) {
+	oldFooter := "\n\n[superego conversation archived with ID #22219a3b — to review the rejected drafts and the superego's critiques behind this reply, search /home/x/kortex.log.conflicts for the JSONL line where \"loopId\" is \"22219a3b\"]"
+	for name, tc := range map[string]struct{ in, want string }{
+		"new form":     {"hi\n\n[superego archive #abc]", "hi"},
+		"old form":     {"hi" + oldFooter, "hi"},
+		"mid text":     {"a [superego archive #abc] b", "a b"},
+		"no reference": {"[other] text", "[other] text"},
+	} {
+		if got := stripArchiveRefs(tc.in); got != tc.want {
+			t.Errorf("%s: got %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
 func TestWithArchiveExplanation_ExplainsOnce(t *testing.T) {
 	got := withArchiveExplanation("base prompt")
 	if !strings.HasPrefix(got, "base prompt") {
 		t.Errorf("prompt = %q, want base prompt preserved", got)
+	}
+	if !strings.Contains(got, "load_superego_archive") {
+		t.Errorf("prompt = %q, want it to name the load_superego_archive tool", got)
 	}
 	if n := strings.Count(got, "[superego archive #<id>]"); n != 1 {
 		t.Errorf("explanation count = %d, want 1", n)

@@ -35,6 +35,17 @@ type Dispatcher struct {
 	// mcpTools is the tools/list catalog ToolDefs() declares to the model
 	// alongside the builtins; empty when mcp is nil.
 	mcpTools []mcp.Tool
+	// archivePath is the conflicts log load_superego_archive scans; empty
+	// (the default) means the tool is neither declared nor executable.
+	archivePath string
+}
+
+// WithSuperegoArchive enables the load_superego_archive tool, reading the
+// conflicts log at path. Call it only when a governor and conflicts log are
+// wired. It returns d for chaining.
+func (d *Dispatcher) WithSuperegoArchive(path string) *Dispatcher {
+	d.archivePath = path
+	return d
 }
 
 // NewDispatcher builds a builtins-only Dispatcher. Builtins read their
@@ -59,7 +70,11 @@ func NewDispatcherWithMCP(client *mcp.Client, tools []mcp.Tool) *Dispatcher {
 // the native builtins first, then the gateway's MCP tools (prefixed for the
 // model). Builtins-only when no MCP client is wired.
 func (d *Dispatcher) ToolDefs() []anthropic.ToolDef {
-	return append(Definitions(), MCPToolDefs(d.mcpTools)...)
+	defs := Definitions()
+	if d.archivePath != "" {
+		defs = append(defs, SuperegoArchiveDef)
+	}
+	return append(defs, MCPToolDefs(d.mcpTools)...)
 }
 
 // Execute runs the builtin named by block.Name with block.Input and returns
@@ -108,6 +123,17 @@ func (d *Dispatcher) Execute(ctx context.Context, block anthropic.ContentBlock) 
 			return errorResult(block.ID, "edit", err)
 		}
 		output, isError := RunEdit(input)
+		return anthropic.NewToolResultBlock(block.ID, output, isError)
+
+	case "load_superego_archive":
+		if d.archivePath == "" {
+			return anthropic.NewToolResultBlock(block.ID, "error: superego archive is not enabled", true)
+		}
+		var input SuperegoArchiveInput
+		if err := json.Unmarshal(block.Input, &input); err != nil {
+			return errorResult(block.ID, "load_superego_archive", err)
+		}
+		output, isError := RunLoadSuperegoArchive(d.archivePath, input)
 		return anthropic.NewToolResultBlock(block.ID, output, isError)
 
 	default:
