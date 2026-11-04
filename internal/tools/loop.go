@@ -435,7 +435,7 @@ func recoverEmptyEndTurn(
 		}
 		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call: %w", err)
 	}
-	if false && resp.StopReason == "tool_use" {
+	if resp.StopReason == "tool_use" {
 		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and called a tool when asked for the reply; this is not a max_tokens problem")
 	}
 	if strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
