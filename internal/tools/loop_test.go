@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -290,12 +291,34 @@ func TestRunLoop_emptyEndTurnRecoversWithUserContinuation(t *testing.T) {
 	if len(requests) != 3 {
 		t.Fatalf("API calls = %d, want 3 (tool, empty end_turn, one recovery)", len(requests))
 	}
+	// The recovery request is the pre-empty history (same message count as the
+	// empty turn's request), with the empty thinking-only turn NOT echoed and the
+	// continuation added to the last user turn next to its tool_result block.
+	if len(requests[2]) != len(requests[1]) {
+		t.Errorf("recovery request has %d messages, want %d (no echoed empty turn, no extra message)", len(requests[2]), len(requests[1]))
+	}
 	last := requests[2][len(requests[2])-1]
 	if last["role"] != "user" {
-		t.Errorf("recovery call ends with role %v, want user (assistant prefill is rejected by fable)", last["role"])
+		t.Errorf("recovery call ends with role %v, want user", last["role"])
 	}
-	if s, _ := last["content"].(string); !strings.Contains(s, "NO_REPLY") {
-		t.Errorf("recovery prompt = %q, want it to offer the NO_REPLY sentinel when not deferred", s)
+	blocks, _ := last["content"].([]any)
+	var types []string
+	var prompt string
+	for _, b := range blocks {
+		m, _ := b.(map[string]any)
+		types = append(types, fmt.Sprint(m["type"]))
+		if m["type"] == "text" {
+			prompt, _ = m["text"].(string)
+		}
+	}
+	if strings.Join(types, ",") != "tool_result,text" {
+		t.Errorf("last user turn blocks = %v, want [tool_result text]", types)
+	}
+	if !strings.Contains(prompt, "NO_REPLY") {
+		t.Errorf("recovery prompt = %q, want it to offer the NO_REPLY sentinel when not deferred", prompt)
+	}
+	if raw, _ := json.Marshal(requests[2]); strings.Contains(string(raw), "sig-abc") {
+		t.Error("recovery request echoes the empty thinking-only turn; it must be dropped")
 	}
 	if result.Usage.OutputTokens != 1+374+7 {
 		t.Errorf("output tokens = %d, want 382 summed across all three calls", result.Usage.OutputTokens)
@@ -325,9 +348,46 @@ func TestRunLoop_emptyEndTurnDeferFinalOmitsSilentSentinel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	last := requests[2][len(requests[2])-1]
-	if s, _ := last["content"].(string); strings.Contains(s, "NO_REPLY") {
-		t.Errorf("DeferFinal recovery prompt = %q, must not offer NO_REPLY", s)
+	if raw, _ := json.Marshal(requests[2][len(requests[2])-1]); strings.Contains(string(raw), "NO_REPLY") {
+		t.Errorf("DeferFinal recovery last turn = %s, must not offer NO_REPLY", raw)
+	}
+}
+
+// TestRunLoop_emptyEndTurnAtTurnOneAppendsToOriginalUserTurn proves the same
+// rule when no tool ran: the recovery request is the original history with the
+// continuation added to the user's own message, not an echoed empty turn.
+func TestRunLoop_emptyEndTurnAtTurnOneAppendsToOriginalUserTurn(t *testing.T) {
+	var requests []string
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		raw, _ := io.ReadAll(r.Body)
+		requests = append(requests, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(`{"content":[{"type":"thinking","thinking":"","signature":"sig-t1"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+			return
+		}
+		w.Write([]byte(`{"content":[{"type":"text","text":"oi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{Model: "m", MaxTokens: 100, UserMessage: "ola"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.FinalText != "oi" || len(requests) != 2 {
+		t.Fatalf("FinalText=%q calls=%d, want oi / 2", result.FinalText, len(requests))
+	}
+	if strings.Contains(requests[1], "sig-t1") || strings.Contains(requests[1], `"assistant"`) {
+		t.Errorf("recovery request must not echo the empty turn: %s", requests[1])
+	}
+	if !strings.Contains(requests[1], "ola") || !strings.Contains(requests[1], "Your last turn ended without any reply text") {
+		t.Errorf("recovery request must carry the original user text and the continuation: %s", requests[1])
+	}
+	if len(result.Messages) != 2 {
+		t.Errorf("history has %d messages, want 2 (user + final assistant)", len(result.Messages))
 	}
 }
 
