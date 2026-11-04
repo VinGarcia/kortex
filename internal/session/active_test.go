@@ -751,7 +751,7 @@ func TestRun_ActiveGovernorArchivesTailReferenceWithoutChangingDeliveredText(t *
 	server, _ := sequencedResponder(t, "raw-draft")
 	client := anthropic.NewClient("secret", server.URL, time.Second)
 	store := NewStore(t.TempDir())
-	const note = "\n\n[superego conversation archived with ID #loop-abc123 — to review the rejected drafts and the superego's critiques behind this reply, search /var/log/kortex/example.jsonl.conflicts for the JSONL line where \"loopId\" is \"loop-abc123\"]"
+	const note = "\n\n[superego archive #loop-abc123]"
 	gov := &fakeGovernor{deliver: "governed-reply", archiveNote: note}
 
 	var out strings.Builder
@@ -805,14 +805,49 @@ func TestRun_ActiveGovernorArchivesTailReferenceWithoutChangingDeliveredText(t *
 	if !strings.HasPrefix(content, "governed-reply") {
 		t.Errorf("persisted final assistant = %q, want it to still start with the governed text", content)
 	}
-	if !strings.Contains(content, "superego conversation archived with ID #loop-abc123") {
-		t.Errorf("persisted final assistant = %q, want it to reference archive ID #loop-abc123", content)
+	if content != "governed-reply"+note {
+		t.Errorf("persisted final assistant = %q, want governed text + short reference %q", content, note)
 	}
-	if !strings.Contains(content, "/var/log/kortex/example.jsonl.conflicts") {
-		t.Errorf("persisted final assistant = %q, want it to name the configured conflicts log path", content)
+}
+
+// A model that imitates the reference from its history must not leak it to
+// the user: the delivered text is stripped, and exactly one reference (the
+// governor's note) remains in persisted history.
+func TestRun_ActiveGovernorStripsImitatedArchiveRefFromDeliveredText(t *testing.T) {
+	server, _ := sequencedResponder(t, "raw-draft")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	store := NewStore(t.TempDir())
+	gov := &fakeGovernor{deliver: "hello\n\n[superego archive #zzz]", archiveNote: "\n\n[superego archive #real]"}
+
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: store, SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		Governor: gov,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if !strings.Contains(content, `"loopId"`) || !strings.Contains(content, "loop-abc123") {
-		t.Errorf("persisted final assistant = %q, want retrieval instructions naming the loopId field to search for", content)
+	if strings.Contains(out.String(), "superego archive") {
+		t.Errorf("archive reference leaked to the wire:\n%s", out.String())
+	}
+	msgs, err := store.Load("sess-1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := msgs[1].Content; got != "hello\n\n[superego archive #real]" {
+		t.Errorf("persisted = %q", got)
+	}
+}
+
+func TestWithArchiveExplanation_ExplainsOnce(t *testing.T) {
+	got := withArchiveExplanation("base prompt")
+	if !strings.HasPrefix(got, "base prompt") {
+		t.Errorf("prompt = %q, want base prompt preserved", got)
+	}
+	if n := strings.Count(got, "[superego archive #<id>]"); n != 1 {
+		t.Errorf("explanation count = %d, want 1", n)
 	}
 }
 
@@ -1165,5 +1200,59 @@ func TestRun_ActiveGovernorFinalizeAuthorsFinalMessage(t *testing.T) {
 		if content, ok := m.Content.(string); ok && strings.Contains(content, "FINAL-ROUND-INSTRUCTION-TAIL") {
 			t.Errorf("ephemeral final-round tail leaked into canonical history: %+v", m)
 		}
+	}
+}
+
+// The Messages API request carries the archive explanation exactly once when a
+// governor is wired, and not at all without one.
+func TestRun_SystemPromptExplainsArchiveOnceOnlyWithGovernor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gov  OutputGovernor
+		want int
+	}{
+		{"with governor", &fakeGovernor{deliver: "ok"}, 1},
+		{"without governor", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var system string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				system = ""
+				raw, _ := io.ReadAll(r.Body)
+				var body struct {
+					System json.RawMessage `json:"system"`
+				}
+				json.Unmarshal(raw, &body)
+				// Decode the JSON so the count sees the real text, not escapes.
+				var blocks []struct {
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(body.System, &blocks) == nil {
+					for _, b := range blocks {
+						system += b.Text
+					}
+				} else {
+					json.Unmarshal(body.System, &system)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+			}))
+			defer server.Close()
+			cfg := Config{
+				Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+				Stdout: &strings.Builder{}, Client: anthropic.NewClient("secret", server.URL, time.Second),
+				Dispatcher: tools.NewDispatcher(), Store: NewStore(t.TempDir()), SessionID: "sess-1",
+				Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+			}
+			if tc.gov != nil {
+				cfg.Governor = tc.gov
+			}
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if n := strings.Count(system, "[superego archive #<id>]"); n != tc.want {
+				t.Errorf("explanation count in system prompt = %d, want %d (system=%q)", n, tc.want, system)
+			}
+		})
 	}
 }

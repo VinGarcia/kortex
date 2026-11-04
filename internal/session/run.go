@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -316,6 +317,9 @@ func Run(ctx context.Context, cfg Config) error {
 				// OpenClaw ships the system prompt here, not via argv; capture it
 				// for every subsequent turn and acknowledge the handshake.
 				systemPrompt = ev.AppendSystemPrompt
+				if cfg.Governor != nil {
+					systemPrompt = withArchiveExplanation(systemPrompt)
+				}
 				line, err := protocol.EmitControlResponse(ev.RequestID)
 				if err != nil {
 					return fmt.Errorf("session: building control response: %w", err)
@@ -755,6 +759,9 @@ func governTurn(
 	// only ever touches the PERSISTED copy, never the text on the wire.
 	finalText, archiveNote := cfg.Governor.GovernOutput(ctx, turnIndex, reviewMessages, ephemeralDigest, res.FinalText, redraft, finalize)
 	stopKeepalive()
+	// Belt and braces: the model sees past "[superego archive #id]" references
+	// in its history and may imitate one. Never let one reach the user.
+	finalText = stripArchiveRefs(finalText)
 	finalUsage := res.Usage.Add(redraftUsage)
 	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
 		return "", nil, nil, fmt.Errorf("session: %w", err)
@@ -788,6 +795,25 @@ func governTurn(
 		finalMessages = appendArchiveNote(finalMessages, archiveNote)
 	}
 	return finalText, finalMessages, allRedraftCalls, nil
+}
+
+// ArchiveSystemPromptNote is the one-time explanation of the superego archive
+// reference, appended to the agent's system prompt at initialize. The per-reply
+// reference itself is just "[superego archive #<id>]" (see facet's
+// retrievalHint), kept only in persisted history.
+const ArchiveSystemPromptNote = "\n\nSuperego archive: drafts you wrote and the superego's critiques of them are ephemeral and are archived outside the conversation. When that happens, your own earlier reply in this history ends with a short reference `[superego archive #<id>]` pointing to that archive. It is bookkeeping for you only: never write, copy, or imitate such a reference in your replies; the user never sees it."
+
+// withArchiveExplanation appends ArchiveSystemPromptNote to prompt.
+func withArchiveExplanation(prompt string) string {
+	return prompt + ArchiveSystemPromptNote
+}
+
+var archiveRefRe = regexp.MustCompile(`\s*\[superego archive #[^\]]*\]`)
+
+// stripArchiveRefs removes any "[superego archive #<id>]" reference from text
+// destined for the user.
+func stripArchiveRefs(text string) string {
+	return archiveRefRe.ReplaceAllString(text, "")
 }
 
 // appendArchiveNote returns a copy of messages with note appended to the
