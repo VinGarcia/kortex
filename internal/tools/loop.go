@@ -263,19 +263,35 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		isFinal := resp.StopReason != "tool_use" || len(toolUses) == 0
 
 		// A final turn with no deliverable text cannot be sent: OpenClaw rejects an
-		// empty assistant turn. Two cases produce one. (1) A thinking model spends
+		// empty assistant turn. Three cases produce one. (1) A thinking model spends
 		// its whole MaxTokens budget on thinking and stops with zero text blocks
 		// (stop_reason "max_tokens"); it cannot be continued server-side, since
 		// echoing the partial assistant turn back is a last-assistant prefill, which
 		// fable rejects with a 400. (2) The text is entirely tool-call markup that
 		// StripToolMarkup removes before delivery, leaving nothing — so the check
-		// strips first, matching what result()/EmitFinalTurn actually deliver. Either
-		// way fail closed before any emission with an error naming the stop_reason; it
-		// surfaces as a terminal is_error result in session.runTurn. A larger
-		// MaxTokens and a bounded Effort (see main) keep case (1) rare; the guard is
-		// the backstop for when they are not enough.
+		// strips first, matching what result()/EmitFinalTurn actually deliver.
+		// (3) The model finished NORMALLY (stop_reason "end_turn") with a
+		// thinking-only turn after tool use, apparently judging nothing more needed
+		// (live 2026-11-04: 372 thinking tokens, no text block). Raising max_tokens
+		// cannot help case (3), and unlike (1) the turn is complete, so one bounded
+		// recovery call (recoverEmptyEndTurn) asks, via an ordinary user turn rather
+		// than a prefill, for the reply text. Cases (1) and (2) fail closed before
+		// any emission with an error naming the stop_reason; it surfaces as a
+		// terminal is_error result in session.runTurn. A larger MaxTokens and a
+		// bounded Effort (see main) keep case (1) rare; the guard is the backstop
+		// for when they are not enough.
 		if isFinal && strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
-			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)
+			if resp.StopReason != "end_turn" {
+				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)
+			}
+			recovered, usage, err := recoverEmptyEndTurn(ctx, client, req, messages, tools, resp, callTimeout, keepaliveInterval)
+			totalUsage = totalUsage.Add(usage)
+			if err != nil {
+				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
+			}
+			// The scaffolding (empty turn + continuation prompt) stays out of
+			// messages: canonical history gets only the recovered final turn.
+			resp = recovered
 		}
 
 		// The final turn's assistant event is deferred when DeferFinal is set (the
@@ -367,6 +383,68 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		return finalizeWithoutTools(ctx, client, req, messages, maxTurns, callTimeout, keepaliveInterval, totalUsage)
 	}
 	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
+}
+
+// emptyEndTurnPrompt is the user-role continuation sent by recoverEmptyEndTurn.
+// The NO_REPLY variant is used only when the final text is delivered live: the
+// sentinel passes through result() verbatim and OpenClaw suppresses it, but a
+// DeferFinal caller would hand the bare sentinel to its governor as a draft.
+const (
+	emptyEndTurnPrompt        = "[system] Your last turn ended without any reply text. Write the final reply to the user now, in plain text, without calling tools."
+	emptyEndTurnPromptSilence = emptyEndTurnPrompt + " If no reply is needed, answer with exactly " + openClawSilentReplyToken + "."
+)
+
+// recoverEmptyEndTurn makes ONE extra model call after a final turn that ended
+// normally (end_turn) with no deliverable text. It echoes the empty turn and
+// appends a user-role continuation (never an assistant prefill, which fable
+// rejects with a 400) asking for the reply. The extra call does not consume a
+// MaxTurns slot (it is bounded at one per loop, since a second empty answer
+// fails), reuses the per-call deadline and keepalive, and returns its usage so
+// the caller bills it. A still-empty answer is an error whose text does not
+// blame max_tokens, which is not the cause here.
+func recoverEmptyEndTurn(
+	ctx context.Context,
+	client *anthropic.Client,
+	req LoopRequest,
+	messages []anthropic.Message,
+	tools []anthropic.ToolDef,
+	empty anthropic.MessageResponse,
+	callTimeout time.Duration,
+	keepaliveInterval time.Duration,
+) (anthropic.MessageResponse, anthropic.Usage, error) {
+	prompt := emptyEndTurnPromptSilence
+	if req.DeferFinal {
+		prompt = emptyEndTurnPrompt
+	}
+	retryMessages := append(slices.Clone(messages),
+		anthropic.Message{Role: "assistant", Content: empty.RawContent()},
+		anthropic.Message{Role: "user", Content: prompt},
+	)
+	cctx, cancel := context.WithTimeout(ctx, callTimeout)
+	stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
+	resp, err := client.CreateMessage(cctx, anthropic.MessageRequest{
+		Model:         req.Model,
+		System:        req.System,
+		MaxTokens:     req.MaxTokens,
+		Effort:        req.Effort,
+		Messages:      retryMessages,
+		EphemeralTail: ephemeralTail(req.EphemeralContext),
+		// Tools stay declared so the history's tool_use blocks remain valid, but
+		// the prompt asks for text only; a tool_use answer is treated as empty.
+		Tools: tools,
+	})
+	cancel()
+	stopKeepalive()
+	if err != nil {
+		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call exceeded per-call deadline (%s)", callTimeout)
+		}
+		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call: %w", err)
+	}
+	if resp.StopReason == "tool_use" || strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
+		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and again produced none when asked (stop_reason %q); this is not a max_tokens problem", resp.StopReason)
+	}
+	return resp, resp.Usage, nil
 }
 
 // finalizeWithoutTools makes one last core call with NO tools offered after the

@@ -241,6 +241,120 @@ func TestRunLoop_emptyFinalTurnFailsClosed(t *testing.T) {
 	}
 }
 
+// emptyEndTurnServer scripts the 2026-11-04 incident: call 1 asks for a bash
+// tool, call 2 ends normally (end_turn) with only a thinking block, and call 3+
+// (the recovery call) answers with retryBody. It records each request's
+// decoded messages.
+func emptyEndTurnServer(t *testing.T, retryBody string, requests *[][]map[string]any) *httptest.Server {
+	t.Helper()
+	calls := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		*requests = append(*requests, body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			w.Write([]byte(`{"content":[{"type":"tool_use","id":"toolu_x","name":"bash","input":{"command":"echo hi"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`))
+		case 2:
+			w.Write([]byte(`{"content":[{"type":"thinking","thinking":"","signature":"sig-abc"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":374}}`))
+		default:
+			w.Write([]byte(retryBody))
+		}
+	}))
+}
+
+// TestRunLoop_emptyEndTurnRecoversWithUserContinuation proves the third empty
+// final-turn case: a normal end_turn with no text after tool use is recovered by
+// ONE extra call whose last message is a user-role prompt (never an assistant
+// prefill), the recovered text is delivered, usage covers all three calls, and
+// the scaffolding stays out of the returned canonical history.
+func TestRunLoop_emptyEndTurnRecoversWithUserContinuation(t *testing.T) {
+	var requests [][]map[string]any
+	server := emptyEndTurnServer(t, `{"content":[{"type":"text","text":"Ok, avisa o que ele responder."}],"stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":7}}`, &requests)
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	result, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model: "m", MaxTokens: 100, UserMessage: "vou contactar ele", MaxTurns: 2,
+	})
+	if err != nil {
+		t.Fatalf("empty end_turn must be recovered, got error: %v", err)
+	}
+	if result.FinalText != "Ok, avisa o que ele responder." {
+		t.Errorf("FinalText = %q, want the recovered reply", result.FinalText)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("API calls = %d, want 3 (tool, empty end_turn, one recovery)", len(requests))
+	}
+	last := requests[2][len(requests[2])-1]
+	if last["role"] != "user" {
+		t.Errorf("recovery call ends with role %v, want user (assistant prefill is rejected by fable)", last["role"])
+	}
+	if s, _ := last["content"].(string); !strings.Contains(s, "NO_REPLY") {
+		t.Errorf("recovery prompt = %q, want it to offer the NO_REPLY sentinel when not deferred", s)
+	}
+	if result.Usage.OutputTokens != 1+374+7 {
+		t.Errorf("output tokens = %d, want 382 summed across all three calls", result.Usage.OutputTokens)
+	}
+	// History: user, assistant(tool_use), user(tool_result), assistant(final) —
+	// no empty turn and no continuation prompt.
+	if len(result.Messages) != 4 {
+		t.Errorf("history has %d messages, want 4 without recovery scaffolding", len(result.Messages))
+	}
+	if result.Turns != 2 {
+		t.Errorf("Turns = %d, want 2 (recovery must not consume a turn)", result.Turns)
+	}
+}
+
+// TestRunLoop_emptyEndTurnDeferFinalOmitsSilentSentinel proves a DeferFinal
+// caller is not told it may answer NO_REPLY, since its governor would receive
+// the bare sentinel as a draft.
+func TestRunLoop_emptyEndTurnDeferFinalOmitsSilentSentinel(t *testing.T) {
+	var requests [][]map[string]any
+	server := emptyEndTurnServer(t, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, &requests)
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model: "m", MaxTokens: 100, UserMessage: "x", DeferFinal: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	last := requests[2][len(requests[2])-1]
+	if s, _ := last["content"].(string); strings.Contains(s, "NO_REPLY") {
+		t.Errorf("DeferFinal recovery prompt = %q, must not offer NO_REPLY", s)
+	}
+}
+
+// TestRunLoop_emptyEndTurnStillEmptyFailsHonestly proves recovery is bounded to
+// one call and that a still-empty answer fails with text that does not blame
+// max_tokens (the cause is not a token budget).
+func TestRunLoop_emptyEndTurnStillEmptyFailsHonestly(t *testing.T) {
+	var requests [][]map[string]any
+	server := emptyEndTurnServer(t, `{"content":[{"type":"thinking","thinking":"","signature":"s2"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, &requests)
+	defer server.Close()
+
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{Model: "m", MaxTokens: 100, UserMessage: "x"})
+	if err == nil {
+		t.Fatal("want an error when the recovery call is also empty")
+	}
+	if len(requests) != 3 {
+		t.Errorf("API calls = %d, want exactly 3 (recovery is bounded to one call)", len(requests))
+	}
+	if strings.Contains(err.Error(), "raise max_tokens") {
+		t.Errorf("error = %q, must not advise raising max_tokens for an end_turn", err)
+	}
+	if !strings.Contains(err.Error(), "end_turn") {
+		t.Errorf("error = %q, want it to name the end_turn stop_reason", err)
+	}
+}
+
 // TestRunLoop_echoesThinkingBlockVerbatim proves the native path preserves a
 // signature-bearing thinking block when it echoes an intermediate tool_use turn
 // back to the API. Anthropic requires thinking blocks replayed WITHIN a tool-use
