@@ -581,7 +581,9 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// Authorization header, which the client logs nothing of (see logWire). A
 	// failed open degrades gracefully — the turn still runs, we just warn once.
 	if logPath := getenv("KORTEX_LOG"); logPath != "" {
-		wireFile, err := os.OpenFile(logPath+".native", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		// Size-capped (KORTEX_NATIVE_LOG_MAX_BYTES, default 100 MiB) with one
+		// "<path>.native.1" backup: this is the only log that holds full bodies.
+		wireFile, err := newRotatingLog(logPath+".native", nativeLogMaxBytes(getenv, stderr), stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "kortex: native wire log disabled: %v\n", err)
 		} else {
