@@ -270,7 +270,7 @@ func (a *ActiveSuperego) GovernOutput(
 		passed := true
 		gateNotFiredPassed = &passed
 	}
-	a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire), Passed: gateNotFiredPassed})
+	a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, OK: true, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire), Passed: gateNotFiredPassed})
 	if !de.GateWouldFire {
 		return draft, ""
 	}
@@ -325,7 +325,7 @@ func (a *ActiveSuperego) GovernOutput(
 		switch crit.Verdict {
 		case VerdictApprove:
 			passed := true
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Passed: &passed})
+			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, OK: true, Decision: "deliver", Passed: &passed})
 			archiveNote = recordConflicts(ladderOutcomeApprove, round, "")
 			return current, archiveNote
 
@@ -359,7 +359,7 @@ func (a *ActiveSuperego) GovernOutput(
 				if a.debateMetaMessage {
 					finalText, _ = splitCoreMeta(finalText)
 				}
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "final_round", Passed: &notPassed})
+				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, OK: true, Decision: "final_round", Passed: &notPassed})
 				conflictsTail = append(conflictsTail, ladderStep{Type: "final", Text: finalText})
 				archiveNote = recordConflicts(ladderOutcomeFinalRound, round, "")
 				return finalText, archiveNote
