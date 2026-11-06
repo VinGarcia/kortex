@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -445,42 +446,64 @@ func TestActiveSuperego_logsGateAndDecisions(t *testing.T) {
 // TestActiveSuperego_logOKField locks in that the active_superego decision
 // entries report ok=true when the loop worked (a clean pass, a gate decision, an
 // approved or spent ladder) and ok=false when a real failure made the loop fail
-// open, so a healthy loop never reads as a degradation in the facet log.
+// open or the anti-cycle guard cut it short, so a healthy loop never reads as a
+// degradation in the facet log. It compares the exact ordered entry list, so a
+// duplicated or missing entry fails the test too.
 func TestActiveSuperego_logOKField(t *testing.T) {
+	type logged struct {
+		Decision string
+		OK       bool
+	}
 	tests := []struct {
 		desc      string
 		evaluator []scriptStep
 		superego  []scriptStep
-		wantOK    map[string]bool // decision -> expected ok
+		redrafts  []string
+		want      []logged
 	}{
 		{
 			desc:      "gate not fired is a healthy pass",
 			evaluator: []scriptStep{gateQuiet()},
-			wantOK:    map[string]bool{"deliver": true},
+			want:      []logged{{"deliver", true}},
 		},
 		{
 			desc:      "approve logs ok gate and deliver lines",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("approve")},
-			wantOK:    map[string]bool{"revise": true, "deliver": true},
+			want:      []logged{{"revise", true}, {"deliver", true}},
 		},
 		{
 			desc:      "spent ladder logs ok final_round",
 			evaluator: []scriptStep{gateFires(), gateFires(), gateFires(), gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise")},
-			wantOK:    map[string]bool{"revise": true, "final_round": true},
+			redrafts:  []string{"rev2", "rev3", "rev4"},
+			want:      []logged{{"revise", true}, {"final_round", true}},
 		},
 		{
 			desc:      "superego call failure stays not ok",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{{err: errors.New("boom")}, {err: errors.New("boom")}, {err: errors.New("boom")}},
-			wantOK:    map[string]bool{"revise": true, "fail_open": false},
+			want:      []logged{{"revise", true}, {"fail_open", false}},
 		},
 		{
 			desc:      "unparseable verdict stays not ok",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("garbage")},
-			wantOK:    map[string]bool{"revise": true, "fail_open": false},
+			want:      []logged{{"revise", true}, {"fail_open", false}},
+		},
+		{
+			desc:      "anti-cycle identical redraft stays not ok",
+			evaluator: []scriptStep{gateFires()},
+			superego:  []scriptStep{superegoVerdictStep("revise")},
+			redrafts:  []string{"rascunho original"}, // byte-equal to the draft
+			want:      []logged{{"revise", true}, {"deliver", false}},
+		},
+		{
+			desc:      "re-evaluating the redraft failing stays not ok",
+			evaluator: []scriptStep{gateFires(), {err: errors.New("eval down")}},
+			superego:  []scriptStep{superegoVerdictStep("revise")},
+			redrafts:  []string{"rascunho revisado"},
+			want:      []logged{{"revise", true}, {"fail_open", false}},
 		},
 	}
 
@@ -488,9 +511,9 @@ func TestActiveSuperego_logOKField(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			var log bytes.Buffer
 			gov, _, _ := newTestGovernor(test.evaluator, test.superego, &log)
-			gov.GovernOutput(context.Background(), 0, govMessages(), "", "rascunho original", (&redrafter{drafts: []string{"rev2", "rev3", "rev4"}}).fn, (&finalizer{text: "final"}).fn)
+			gov.GovernOutput(context.Background(), 0, govMessages(), "", "rascunho original", (&redrafter{drafts: test.redrafts}).fn, (&finalizer{text: "final"}).fn)
 
-			got := map[string]bool{}
+			var got []logged
 			for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
 				var entry struct {
 					Facet    string `json:"facet"`
@@ -503,15 +526,10 @@ func TestActiveSuperego_logOKField(t *testing.T) {
 				if entry.Facet != activeSuperegoFacet {
 					continue
 				}
-				got[entry.Decision] = entry.OK
+				got = append(got, logged{Decision: entry.Decision, OK: entry.OK})
 			}
-			for decision, want := range test.wantOK {
-				gotOK, found := got[decision]
-				if !found {
-					t.Errorf("no active_superego %q entry in log:\n%s", decision, log.String())
-				} else if gotOK != want {
-					t.Errorf("decision %q: ok=%v, want %v", decision, gotOK, want)
-				}
+			if !slices.Equal(got, test.want) {
+				t.Errorf("active_superego entries = %+v, want %+v\nlog:\n%s", got, test.want, log.String())
 			}
 		})
 	}

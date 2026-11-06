@@ -118,6 +118,18 @@ func NewActiveSuperego(params ActiveSuperegoParams) *ActiveSuperego {
 	}
 }
 
+// recordDecision writes one active_superego decision line to the facet log. It
+// stamps the facet and model and derives OK, so no call site can forget it: a
+// line is ok unless it is a fail_open or carries an Err (the anti-cycle deliver
+// is a degraded exit, not a clean one). A final_round with Passed=false is still
+// ok: the ladder worked and the ego authored the impasse message.
+func (a *ActiveSuperego) recordDecision(entry callLog) {
+	entry.Facet = activeSuperegoFacet
+	entry.Model = a.model
+	entry.OK = entry.Err == "" && entry.Decision != "fail_open"
+	a.log.record(entry)
+}
+
 // GovernOutput runs the active loop over one turn's draft and returns the text
 // to deliver. Every path (deliver, revise-then-deliver, core-authored final
 // message, fail-open) returns the text to speak; the loop never holds a reply.
@@ -236,7 +248,7 @@ func (a *ActiveSuperego) GovernOutput(
 	defer func() {
 		if r := recover(); r != nil {
 			failed := false
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Err: fmt.Sprintf("panic: %v", r), Passed: &failed})
+			a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Err: fmt.Sprintf("panic: %v", r), Passed: &failed})
 			if ladderEntered {
 				archiveNote = recordConflicts(ladderOutcomeFailOpen, lastRound, fmt.Sprintf("panic: %v", r))
 			}
@@ -256,7 +268,7 @@ func (a *ActiveSuperego) GovernOutput(
 		// conflicts_log.go's package doc: that log's denominator is ladder
 		// loops, not every evaluated message).
 		failed := false
-		a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Passed: &failed})
+		a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, Decision: "fail_open", Passed: &failed})
 		return draft, ""
 	}
 	// Passed is set ONLY in the gate-not-fired branch below: that is the one
@@ -270,7 +282,7 @@ func (a *ActiveSuperego) GovernOutput(
 		passed := true
 		gateNotFiredPassed = &passed
 	}
-	a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, OK: true, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire), Passed: gateNotFiredPassed})
+	a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Path: loopPathPrimary, GateWouldFire: &de.GateWouldFire, Decision: gateDecision(de.GateWouldFire), Passed: gateNotFiredPassed})
 	if !de.GateWouldFire {
 		return draft, ""
 	}
@@ -316,7 +328,7 @@ func (a *ActiveSuperego) GovernOutput(
 		crit, ok := a.superego.ReviewDraft(ctx, turnIndex, loopID, reviewMessages, ephemeralDigest, currentMeta, round, round == a.maxRounds, critiques, curEval.Paragraphs, curEval.Tags)
 		if !ok {
 			// The superego call failed (logged inside ReviewDraft) — fail open.
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+			a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
 			archiveNote = recordConflicts(ladderOutcomeFailOpen, round, "superego review call failed")
 			return current, archiveNote
 		}
@@ -325,7 +337,7 @@ func (a *ActiveSuperego) GovernOutput(
 		switch crit.Verdict {
 		case VerdictApprove:
 			passed := true
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, OK: true, Decision: "deliver", Passed: &passed})
+			a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Passed: &passed})
 			archiveNote = recordConflicts(ladderOutcomeApprove, round, "")
 			return current, archiveNote
 
@@ -350,7 +362,7 @@ func (a *ActiveSuperego) GovernOutput(
 				finalText, err := finalize(ctx, tail)
 				if err != nil {
 					// A finalize failure fails open to the best draft in hand.
-					a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
+					a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
 					archiveNote = recordConflicts(ladderOutcomeFailOpen, round, err.Error())
 					return current, archiveNote
 				}
@@ -359,7 +371,7 @@ func (a *ActiveSuperego) GovernOutput(
 				if a.debateMetaMessage {
 					finalText, _ = splitCoreMeta(finalText)
 				}
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, OK: true, Decision: "final_round", Passed: &notPassed})
+				a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "final_round", Passed: &notPassed})
 				conflictsTail = append(conflictsTail, ladderStep{Type: "final", Text: finalText})
 				archiveNote = recordConflicts(ladderOutcomeFinalRound, round, "")
 				return finalText, archiveNote
@@ -367,7 +379,7 @@ func (a *ActiveSuperego) GovernOutput(
 			newDraft, newMessages, err := redraft(ctx, revisionTail(critiques, redrafts, reviewedTagged, a.debateMetaMessage))
 			if err != nil {
 				// A redraft failure fails open to the best draft in hand.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
+				a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Err: err.Error(), Passed: &notPassed})
 				archiveNote = recordConflicts(ladderOutcomeFailOpen, round, err.Error())
 				return current, archiveNote
 			}
@@ -389,7 +401,7 @@ func (a *ActiveSuperego) GovernOutput(
 				// Exact-identity anti-cycle guard (ratified option (b)): the core
 				// re-emitted a byte-equal draft, so another round cannot converge —
 				// stop and deliver it rather than burn a round on an identical text.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Err: "anti-cycle: identical redraft", Passed: &notPassed})
+				a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "deliver", Err: "anti-cycle: identical redraft", Passed: &notPassed})
 				archiveNote = recordConflicts(ladderOutcomeAntiCycle, round, "anti-cycle: identical redraft")
 				return current, archiveNote
 			}
@@ -403,7 +415,7 @@ func (a *ActiveSuperego) GovernOutput(
 			if !ok {
 				// Cannot tag the redraft for another review — deliver it; it is the
 				// core's own revised attempt, strictly newer than the original.
-				a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+				a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
 				conflictsTail = append(conflictsTail, ladderStep{Type: "draft", Round: round + 1, Text: newDraft})
 				archiveNote = recordConflicts(ladderOutcomeFailOpen, round, "re-evaluating redraft failed")
 				return newDraft, archiveNote
@@ -415,7 +427,7 @@ func (a *ActiveSuperego) GovernOutput(
 		default:
 			// Empty or unparseable verdict: shadow mode retains the free text, but
 			// the active loop has no actionable decision — fail open and deliver.
-			a.log.record(callLog{Facet: activeSuperegoFacet, Model: a.model, TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
+			a.recordDecision(callLog{TurnIndex: &turnIndex, LoopID: loopID, Round: round, Path: loopPathPrimary, Decision: "fail_open", Passed: &notPassed})
 			archiveNote = recordConflicts(ladderOutcomeFailOpen, round, "unparseable superego verdict")
 			return current, archiveNote
 		}
