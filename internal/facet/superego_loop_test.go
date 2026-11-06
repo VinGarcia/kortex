@@ -455,55 +455,63 @@ func TestActiveSuperego_logOKField(t *testing.T) {
 		OK       bool
 	}
 	tests := []struct {
-		desc      string
-		evaluator []scriptStep
-		superego  []scriptStep
-		redrafts  []string
-		want      []logged
+		desc       string
+		evaluator  []scriptStep
+		superego   []scriptStep
+		redrafts   []string // only consulted when the ladder redrafts
+		redraftErr []error
+		want       []logged
 	}{
 		{
 			desc:      "gate not fired is a healthy pass",
 			evaluator: []scriptStep{gateQuiet()},
-			want:      []logged{{"deliver", true}},
+			want:      []logged{{Decision: "deliver", OK: true}},
 		},
 		{
 			desc:      "approve logs ok gate and deliver lines",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("approve")},
-			want:      []logged{{"revise", true}, {"deliver", true}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "deliver", OK: true}},
 		},
 		{
 			desc:      "spent ladder logs ok final_round",
 			evaluator: []scriptStep{gateFires(), gateFires(), gateFires(), gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise"), superegoVerdictStep("revise")},
 			redrafts:  []string{"rev2", "rev3", "rev4"},
-			want:      []logged{{"revise", true}, {"final_round", true}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "final_round", OK: true}},
 		},
 		{
 			desc:      "superego call failure stays not ok",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{{err: errors.New("boom")}, {err: errors.New("boom")}, {err: errors.New("boom")}},
-			want:      []logged{{"revise", true}, {"fail_open", false}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "fail_open", OK: false}},
 		},
 		{
 			desc:      "unparseable verdict stays not ok",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("garbage")},
-			want:      []logged{{"revise", true}, {"fail_open", false}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "fail_open", OK: false}},
 		},
 		{
 			desc:      "anti-cycle identical redraft stays not ok",
 			evaluator: []scriptStep{gateFires()},
 			superego:  []scriptStep{superegoVerdictStep("revise")},
 			redrafts:  []string{"rascunho original"}, // byte-equal to the draft
-			want:      []logged{{"revise", true}, {"deliver", false}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "deliver", OK: false}},
+		},
+		{
+			desc:       "redraft error carries Err and stays not ok",
+			evaluator:  []scriptStep{gateFires()},
+			superego:   []scriptStep{superegoVerdictStep("revise")},
+			redraftErr: []error{errors.New("core down")},
+			want:       []logged{{Decision: "revise", OK: true}, {Decision: "fail_open", OK: false}},
 		},
 		{
 			desc:      "re-evaluating the redraft failing stays not ok",
 			evaluator: []scriptStep{gateFires(), {err: errors.New("eval down")}},
 			superego:  []scriptStep{superegoVerdictStep("revise")},
 			redrafts:  []string{"rascunho revisado"},
-			want:      []logged{{"revise", true}, {"fail_open", false}},
+			want:      []logged{{Decision: "revise", OK: true}, {Decision: "fail_open", OK: false}},
 		},
 	}
 
@@ -511,7 +519,7 @@ func TestActiveSuperego_logOKField(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			var log bytes.Buffer
 			gov, _, _ := newTestGovernor(test.evaluator, test.superego, &log)
-			gov.GovernOutput(context.Background(), 0, govMessages(), "", "rascunho original", (&redrafter{drafts: test.redrafts}).fn, (&finalizer{text: "final"}).fn)
+			gov.GovernOutput(context.Background(), 0, govMessages(), "", "rascunho original", (&redrafter{drafts: test.redrafts, errs: test.redraftErr}).fn, (&finalizer{text: "final"}).fn)
 
 			var got []logged
 			for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
