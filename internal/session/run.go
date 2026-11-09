@@ -655,7 +655,7 @@ func governTurn(
 	// any non-deadline reason, the redraft falls back to the pre-#4753 text-only
 	// revision; and GovernOutput itself fails open to the best draft in hand if
 	// the redraft returns an error, so acting can never break the turn.
-	var redraftUsage anthropic.Usage
+	var redraftUsage redraftUsageTally
 	var allRedraftCalls []history.ToolCall
 	redraft := func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error) {
 		ctx, cancel := redraftBoundedCtx(ctx, cfg)
@@ -707,7 +707,7 @@ func governTurn(
 				// instruction. So the redraft stays tone-neutral by design.
 			})
 			if err == nil {
-				redraftUsage = redraftUsage.Add(loopRes.Usage)
+				redraftUsage.record(loopRes.Usage, loopRes.LastCallUsage)
 				// The redraft's own tool calls, derived from only the messages this
 				// redraft appended (everything past loopHistory) so the original
 				// turn's calls are never double-counted. They are returned to the
@@ -795,8 +795,12 @@ func governTurn(
 	// Belt and braces: the model sees past "[superego archive #id]" references
 	// in its history and may imitate one. Never let one reach the user.
 	finalText = cfg.Governor.StripArchiveRefs(finalText)
-	finalUsage := res.Usage.Add(redraftUsage)
-	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage); err != nil {
+	finalUsage := res.Usage.Add(redraftUsage.total)
+	lastCallUsage := res.LastCallUsage
+	if redraftUsage.ran {
+		lastCallUsage = redraftUsage.last
+	}
+	if err := emitter.EmitFinalTurn(finalText, res.Turns, res.StopReason, finalUsage, lastCallUsage); err != nil {
 		return "", nil, nil, fmt.Errorf("session: %w", err)
 	}
 
@@ -875,6 +879,25 @@ func replaceFinalAssistantText(messages []anthropic.Message, text string) []anth
 	return out
 }
 
+// redraftUsageTally accumulates the usage of the redraft/finalize model calls of
+// one round. total bills them on the result line; last is the usage of the most
+// recent call (valid only when ran), which replaces the core loop's last call on
+// the final assistant event because OpenClaw reads that event's usage as the
+// context-window size.
+type redraftUsageTally struct {
+	total anthropic.Usage
+	last  anthropic.Usage
+	ran   bool
+}
+
+// record adds a redraft run's summed usage to total and remembers the usage of
+// its last model call.
+func (t *redraftUsageTally) record(sum anthropic.Usage, lastCall anthropic.Usage) {
+	t.total = t.total.Add(sum)
+	t.last = lastCall
+	t.ran = true
+}
+
 // textOnlyRedraft is the pre-#4753 redraft: one core-model call with no tools
 // offered, over the canonical messages plus the ephemeral tail. It is the
 // fail-safe the action-capable redraft degrades to when its bounded tool loop
@@ -895,7 +918,7 @@ func textOnlyRedraft(
 	systemPrompt string,
 	canonical []anthropic.Message,
 	tail []anthropic.Message,
-	usage *anthropic.Usage,
+	usage *redraftUsageTally,
 ) (string, error) {
 	resp, err := cfg.Client.CreateMessage(ctx, anthropic.MessageRequest{
 		Model:         cfg.Model,
@@ -908,7 +931,7 @@ func textOnlyRedraft(
 	if err != nil {
 		return "", err
 	}
-	*usage = usage.Add(resp.Usage)
+	usage.record(resp.Usage, resp.Usage)
 	if strings.TrimSpace(tools.StripToolMarkup(resp.Text)) == "" {
 		return "", fmt.Errorf("redraft returned no deliverable text (stop_reason %q)", resp.StopReason)
 	}

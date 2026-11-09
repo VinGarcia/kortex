@@ -345,7 +345,7 @@ func TestStreamJSONParity_activePathReEmits(t *testing.T) {
 		t.Fatalf("RunLoop error: %v", err)
 	}
 	// The governor delivers a text that differs from the core's draft; re-emit it.
-	if err := emitter.EmitFinalTurn("governed exact output: parity-tool-ok", res.Turns, res.StopReason, res.Usage); err != nil {
+	if err := emitter.EmitFinalTurn("governed exact output: parity-tool-ok", res.Turns, res.StopReason, res.Usage, res.LastCallUsage); err != nil {
 		t.Fatalf("EmitFinalTurn error: %v", err)
 	}
 

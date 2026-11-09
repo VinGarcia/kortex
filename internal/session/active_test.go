@@ -696,6 +696,82 @@ func TestRun_ActiveGovernorRedraftToolErrorFallsBackToText(t *testing.T) {
 	}
 }
 
+// usageBody is a scripted end_turn core response with the given usage counters.
+func usageBody(text string, input int, output int) string {
+	return fmt.Sprintf(`{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":%d}}`, text, input, output)
+}
+
+// finalTurnUsages runs one governed turn against scripted core bodies and
+// returns the usage on the final assistant event and on the result event.
+func finalTurnUsages(t *testing.T, gov *fakeGovernor, bodies ...string) (assistant protocol.Usage, result protocol.Usage) {
+	t.Helper()
+	server, _ := scriptedCoreServer(t, bodies...)
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("sess-1", "hi") + "\n"),
+		Stdout: &out, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "sess-1", Model: "m", MaxTokens: 1024, NewUUID: seqUUID(),
+		RedraftTimeout: time.Second, Governor: gov, TurnEvaluator: &fakeTurnEvaluator{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev struct {
+			Type    string `json:"type"`
+			Message struct {
+				Usage protocol.Usage `json:"usage"`
+			} `json:"message"`
+			Usage protocol.Usage `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("decoding stream line: %v\n%s", err, line)
+		}
+		switch ev.Type {
+		case protocol.TypeAssistant:
+			assistant = ev.Message.Usage
+		case protocol.TypeResult:
+			result = ev.Usage
+		}
+	}
+	return assistant, result
+}
+
+// TestRun_ActiveGovernorFinalAssistantUsageIsLastRedraftCall proves the host
+// context-size contract end to end: with a redraft that ran a tool loop, the
+// final assistant event carries the LAST redraft call's usage (OpenClaw reads it
+// as the context window), while the result keeps the sum of every call.
+func TestRun_ActiveGovernorFinalAssistantUsageIsLastRedraftCall(t *testing.T) {
+	gov := &fakeGovernor{callRedraftWith: []anthropic.Message{{Role: "user", Content: "CRITIQUE-X"}}}
+	assistant, result := finalTurnUsages(t, gov,
+		usageBody("raw-draft", 100, 1),
+		toolUseBody("echo evidence-123"), // redraft call 1 (usage 1/1)
+		usageBody("verified", 300, 3),    // redraft call 2: the last call
+	)
+	if want := (protocol.Usage{InputTokens: 300, OutputTokens: 3}); assistant != want {
+		t.Errorf("final assistant usage = %+v, want the last redraft call %+v", assistant, want)
+	}
+	if want := (protocol.Usage{InputTokens: 401, OutputTokens: 5}); result != want {
+		t.Errorf("result usage = %+v, want the round total %+v", result, want)
+	}
+}
+
+// TestRun_ActiveGovernorFinalAssistantUsageIsCoreCallWithoutRedraft proves that
+// with no redraft the final assistant event carries the core loop's last call.
+func TestRun_ActiveGovernorFinalAssistantUsageIsCoreCallWithoutRedraft(t *testing.T) {
+	assistant, result := finalTurnUsages(t, &fakeGovernor{deliver: "governed"},
+		toolUseBody("echo hi"),
+		usageBody("raw-draft", 70, 7),
+	)
+	if want := (protocol.Usage{InputTokens: 70, OutputTokens: 7}); assistant != want {
+		t.Errorf("final assistant usage = %+v, want the core loop's last call %+v", assistant, want)
+	}
+	if want := (protocol.Usage{InputTokens: 71, OutputTokens: 8}); result != want {
+		t.Errorf("result usage = %+v, want the round total %+v", result, want)
+	}
+}
+
 // TestRun_ActiveGovernorDeliversGovernedText proves the active path emits and
 // persists the GOVERNED text, and that the core's raw draft never reaches the
 // wire or the canonical history.

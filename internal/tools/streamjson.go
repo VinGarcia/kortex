@@ -159,10 +159,15 @@ func (e *StreamEmitter) result(res LoopResult, usage anthropic.Usage) error {
 // delivered — so a rejected draft or a hold-and-ask substitution is what the
 // stream shows, never the original draft. text is run through StripToolMarkup to
 // honor EmitResult's no-markup contract and to keep the assistant event's text
-// consistent with the result. usage bills the round (the core loop total plus
-// any redraft calls the caller summed in). numTurns and stopReason are the
+// consistent with the result. totalUsage bills the round (the core loop total
+// plus any redraft calls the caller summed in) and goes on the result line only.
+// lastCallUsage is the usage of the last model call actually made in the round
+// (the last redraft call if one ran, else the core loop's last call) and goes on
+// the assistant line: OpenClaw takes the last assistant event's usage as the
+// context-window size, so the round total there would overstate the context
+// (a 15-call turn showed 200% of the window). numTurns and stopReason are the
 // LoopResult's, so the result line matches the undeferred path's shape.
-func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason string, usage anthropic.Usage) error {
+func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason string, totalUsage anthropic.Usage, lastCallUsage anthropic.Usage) error {
 	if e == nil {
 		return nil
 	}
@@ -176,7 +181,7 @@ func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason stri
 	if strings.TrimSpace(clean) == "" {
 		return e.ErrorResult(fmt.Sprintf("kortex: governed final turn was empty (stop_reason %q); raise max_tokens or lower effort", stopReason))
 	}
-	assistantLine, err := protocol.EmitAssistant(e.sessionID, e.newUUID(), []protocol.ContentBlock{{Type: "text", Text: clean}}, protocol.Usage(usage))
+	assistantLine, err := protocol.EmitAssistant(e.sessionID, e.newUUID(), []protocol.ContentBlock{{Type: "text", Text: clean}}, protocol.Usage(lastCallUsage))
 	if err != nil {
 		return fmt.Errorf("tools: emitting final assistant turn: %w", err)
 	}
@@ -187,7 +192,7 @@ func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason stri
 		Text:       clean,
 		NumTurns:   numTurns,
 		StopReason: stopReason,
-	}, protocol.Usage(usage))
+	}, protocol.Usage(totalUsage))
 	if err != nil {
 		return fmt.Errorf("tools: emitting final result: %w", err)
 	}

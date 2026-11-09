@@ -144,7 +144,7 @@ func TestEmitFinalTurn_emitsGovernedAssistantAndResult(t *testing.T) {
 	emitter := NewStreamEmitter(&out, "sess-9", sequencedUUIDs())
 	markup := `<invoke name="Bash"><parameter name="command">ls</parameter></invoke>`
 	usage := anthropic.Usage{InputTokens: 22, OutputTokens: 11, CacheReadInputTokens: 3}
-	if err := emitter.EmitFinalTurn("governed text "+markup, 2, "end_turn", usage); err != nil {
+	if err := emitter.EmitFinalTurn("governed text "+markup, 2, "end_turn", usage, usage); err != nil {
 		t.Fatalf("EmitFinalTurn error: %v", err)
 	}
 
@@ -185,6 +185,44 @@ func TestEmitFinalTurn_emitsGovernedAssistantAndResult(t *testing.T) {
 	}
 }
 
+// TestEmitFinalTurn_assistantCarriesLastCallUsageResultCarriesTotal is the
+// regression for the "Context 2.0m/1.0m (200%)" report: OpenClaw reads the last
+// assistant event's usage as the context-window size, so the assistant line must
+// carry the usage of the LAST model call, while the result line keeps the round
+// total for billing.
+func TestEmitFinalTurn_assistantCarriesLastCallUsageResultCarriesTotal(t *testing.T) {
+	var out bytes.Buffer
+	emitter := NewStreamEmitter(&out, "sess-9", sequencedUUIDs())
+	total := anthropic.Usage{InputTokens: 900, OutputTokens: 90, CacheReadInputTokens: 3000}
+	last := anthropic.Usage{InputTokens: 60, OutputTokens: 6, CacheReadInputTokens: 200}
+	if err := emitter.EmitFinalTurn("final", 15, "end_turn", total, last); err != nil {
+		t.Fatalf("EmitFinalTurn error: %v", err)
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatalf("EmitFinalTurn wrote %d lines, want 2:\n%s", len(lines), out.String())
+	}
+	var assistantLine, resultLine struct {
+		Message struct {
+			Usage protocol.Usage `json:"usage"`
+		} `json:"message"`
+		Usage protocol.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal(lines[0], &assistantLine); err != nil {
+		t.Fatalf("decoding assistant line: %v\n%s", err, lines[0])
+	}
+	if err := json.Unmarshal(lines[1], &resultLine); err != nil {
+		t.Fatalf("decoding result line: %v\n%s", err, lines[1])
+	}
+	if assistantLine.Message.Usage != protocol.Usage(last) {
+		t.Errorf("assistant usage = %+v, want the last call's %+v", assistantLine.Message.Usage, protocol.Usage(last))
+	}
+	if resultLine.Usage != protocol.Usage(total) {
+		t.Errorf("result usage = %+v, want the round total %+v", resultLine.Usage, protocol.Usage(total))
+	}
+}
+
 // TestEmitFinalTurn_emptyTextDegradesToError proves the emission chokepoint
 // never puts an empty assistant turn on the wire: when the governed text is
 // empty or strips (via StripToolMarkup) to nothing, EmitFinalTurn emits a single
@@ -200,7 +238,7 @@ func TestEmitFinalTurn_emptyTextDegradesToError(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var out bytes.Buffer
 			emitter := NewStreamEmitter(&out, "sess-e", sequencedUUIDs())
-			if err := emitter.EmitFinalTurn(text, 1, "max_tokens", anthropic.Usage{}); err != nil {
+			if err := emitter.EmitFinalTurn(text, 1, "max_tokens", anthropic.Usage{}, anthropic.Usage{}); err != nil {
 				t.Fatalf("EmitFinalTurn error: %v", err)
 			}
 
@@ -226,7 +264,7 @@ func TestEmitFinalTurn_emptyTextDegradesToError(t *testing.T) {
 // no-op: EmitFinalTurn returns nil and writes nothing.
 func TestEmitFinalTurn_nilEmitterSilent(t *testing.T) {
 	var e *StreamEmitter
-	if err := e.EmitFinalTurn("anything", 1, "end_turn", anthropic.Usage{}); err != nil {
+	if err := e.EmitFinalTurn("anything", 1, "end_turn", anthropic.Usage{}, anthropic.Usage{}); err != nil {
 		t.Fatalf("nil EmitFinalTurn error: %v", err)
 	}
 }

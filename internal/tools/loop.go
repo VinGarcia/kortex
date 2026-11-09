@@ -150,6 +150,12 @@ type LoopResult struct {
 	// on its own re-emitted result (EmitFinalTurn), since RunLoop did not emit
 	// the result itself.
 	Usage anthropic.Usage
+	// LastCallUsage is the usage of the LAST model call made in this turn (the
+	// final loop call, or the empty-reply recovery / finalize call that replaced
+	// it), not a sum. OpenClaw reads the last assistant event's usage as the
+	// context-window size, so EmitFinalTurn puts this on its assistant event while
+	// the result keeps the Usage total.
+	LastCallUsage anthropic.Usage
 	// Yielded reports that the loop ended because the model's only tool_use was a
 	// call the injected IsTerminalTool predicate recognized as ending the turn —
 	// the native OpenClaw sessions_yield semantic (the model chose to await
@@ -220,6 +226,9 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	// last one: OpenClaw bills the round on the result's usage, so a multi-turn
 	// tool loop that reported only the final turn would under-count the round.
 	var totalUsage anthropic.Usage
+	// lastCallUsage is the usage of the most recent model call (see
+	// LoopResult.LastCallUsage); totalUsage above is the sum.
+	var lastCallUsage anthropic.Usage
 	for turn := 1; turn <= maxTurns; turn++ {
 		// Bound each call with its own deadline (see CallTimeout). cancel() and
 		// stopKeepalive() are called explicitly after the call, not deferred, so
@@ -255,6 +264,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 		}
 		totalUsage = totalUsage.Add(resp.Usage)
+		lastCallUsage = resp.Usage
 
 		toolUses := resp.ToolUseBlocks()
 		// stop_reason other than tool_use — or tool_use with no decodable block,
@@ -287,6 +297,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			}
 			recovered, usage, err := recoverEmptyEndTurn(ctx, client, req, messages, tools, callTimeout, keepaliveInterval)
 			totalUsage = totalUsage.Add(usage)
+			lastCallUsage = usage
 			if err != nil {
 				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
 			}
@@ -307,7 +318,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 
 		if isFinal {
 			messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
-			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn, Messages: messages, Usage: totalUsage}
+			result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turn, Messages: messages, Usage: totalUsage, LastCallUsage: lastCallUsage}
 			// The terminal result is deferred alongside the final assistant event:
 			// the caller governs the draft and emits both via EmitFinalTurn.
 			if !req.DeferFinal {
@@ -359,12 +370,13 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			// (usually empty for a yield), which is a legitimate empty final turn, so
 			// the empty-text guard above is intentionally not applied on this path.
 			result := LoopResult{
-				FinalText:  resp.Text,
-				StopReason: "end_turn",
-				Turns:      turn,
-				Messages:   messages,
-				Usage:      totalUsage,
-				Yielded:    true,
+				FinalText:     resp.Text,
+				StopReason:    "end_turn",
+				Turns:         turn,
+				Messages:      messages,
+				Usage:         totalUsage,
+				Yielded:       true,
+				LastCallUsage: lastCallUsage,
 			}
 			// Emitted unconditionally (even under DeferFinal): a yield has no
 			// user-facing draft for the governor to substitute, so there is nothing
@@ -494,7 +506,7 @@ func finalizeWithoutTools(
 		}
 	}
 	messages = append(messages, anthropic.Message{Role: "assistant", Content: resp.RawContent()})
-	result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turns, Messages: messages, Usage: totalUsage}
+	result := LoopResult{FinalText: resp.Text, StopReason: resp.StopReason, Turns: turns, Messages: messages, Usage: totalUsage, LastCallUsage: resp.Usage}
 	if !req.DeferFinal {
 		if err := req.Emitter.result(result, totalUsage); err != nil {
 			return LoopResult{}, err

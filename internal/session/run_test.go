@@ -733,7 +733,7 @@ func TestTextOnlyRedraft_marksCanonicalHistoryNotTail(t *testing.T) {
 			json.RawMessage(`{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd"}}`),
 		}},
 	}
-	var usage anthropic.Usage
+	var usage redraftUsageTally
 
 	for i, critique := range []string{"CRITIQUE-ROUND-1", "CRITIQUE-ROUND-2"} {
 		tail := []anthropic.Message{{Role: "user", Content: critique}}
