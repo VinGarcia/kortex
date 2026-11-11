@@ -781,3 +781,61 @@ func TestTextOnlyRedraft_marksCanonicalHistoryNotTail(t *testing.T) {
 		}
 	}
 }
+
+func TestRun_PanicInTurnYieldsErrorResultAndContinues(t *testing.T) {
+	// The server asks for a tool call; the injected IsTerminalTool predicate
+	// then panics inside RunLoop. The turn must end with an error result whose
+	// text is the short panic message, the stack must go to Diag, and the
+	// session must keep reading input (second turn answered normally).
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			fmt.Fprint(w, `{"content":[{"type":"tool_use","id":"t1","name":"nope","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`)
+			return
+		}
+		fmt.Fprint(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+
+	panicOnce := true
+	var out, diag strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("s", "one") + "\n" + userLine("s", "two") + "\n"),
+		Stdout: &out, Diag: &diag, Client: client, Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "s", Model: "m", MaxTokens: 10, NewUUID: seqUUID(),
+		IsTerminalTool: func(name string, result anthropic.ToolResultBlock) bool {
+			if panicOnce {
+				panicOnce = false
+				panic("secret internal detail")
+			}
+			return false
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run must survive a turn panic: %v", err)
+	}
+	var results []*protocol.Result
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			results = append(results, ev.Result)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d result lines, want 2 (error, then normal)", len(results))
+	}
+	if !results[0].IsError || results[0].Text != "kortex: internal error (panic recovered)" {
+		t.Errorf("first result = %+v, want is_error with the short panic text", results[0])
+	}
+	if strings.Contains(results[0].Text, "secret internal detail") {
+		t.Error("panic value leaked into the user-visible result")
+	}
+	if results[1].IsError {
+		t.Errorf("second turn should succeed, got %+v", results[1])
+	}
+	if !strings.Contains(diag.String(), "secret internal detail") || !strings.Contains(diag.String(), "goroutine") {
+		t.Errorf("diag must carry panic value and stack, got %q", diag.String())
+	}
+}

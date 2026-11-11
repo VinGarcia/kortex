@@ -258,10 +258,11 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			// downstream error classifier into reporting a plain timeout as a
 			// context overflow (#5994). Any other call error keeps the existing
 			// turn-scoped wrapping.
-			if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: call exceeded per-call deadline (%s)", turn, callTimeout)
-			}
-			return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
+			// The deadline error is typed KindTimeout and, like before, carries
+			// no wrapped cause (see TurnError).
+			return LoopResult{}, callError(ctx, cctx, err,
+				fmt.Sprintf("tools: tool-loop turn %d", turn),
+				fmt.Sprintf("tools: tool-loop turn %d: call exceeded per-call deadline (%s)", turn, callTimeout))
 		}
 		totalUsage = totalUsage.Add(resp.Usage)
 		lastCallUsage = resp.Usage
@@ -293,13 +294,13 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 		// (1) rare; the guard is the backstop for when they are not enough.
 		if isFinal && strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
 			if resp.StopReason != "end_turn" {
-				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)
+				return LoopResult{}, &TurnError{Kind: KindEmptyReply, Msg: fmt.Sprintf("tools: tool-loop turn %d: model returned no deliverable text (stop_reason %q); raise max_tokens or lower effort", turn, resp.StopReason)}
 			}
 			recovered, usage, err := recoverEmptyEndTurn(ctx, client, req, messages, tools, callTimeout, keepaliveInterval)
 			totalUsage = totalUsage.Add(usage)
 			lastCallUsage = usage
 			if err != nil {
-				return LoopResult{}, fmt.Errorf("tools: tool-loop turn %d: %w", turn, err)
+				return LoopResult{}, wrapTurn(fmt.Sprintf("tools: tool-loop turn %d", turn), err)
 			}
 			// The scaffolding (empty turn + continuation prompt) stays out of
 			// messages: canonical history gets only the recovered final turn.
@@ -395,7 +396,7 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 	if req.FinalizeOnBudget {
 		return finalizeWithoutTools(ctx, client, req, messages, maxTurns, callTimeout, keepaliveInterval, totalUsage)
 	}
-	return LoopResult{}, fmt.Errorf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)
+	return LoopResult{}, &TurnError{Kind: KindInternal, Msg: fmt.Sprintf("tools: tool-loop exceeded MaxTurns (%d) without reaching a non-tool_use stop_reason", maxTurns)}
 }
 
 // emptyEndTurnPrompt is the user-role continuation sent by recoverEmptyEndTurn.
@@ -424,7 +425,7 @@ func recoverEmptyEndTurn(
 ) (anthropic.MessageResponse, anthropic.Usage, error) {
 	retryMessages, err := anthropic.WithTrailingUserText(messages, emptyEndTurnPrompt)
 	if err != nil {
-		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery: %w", err)
+		return anthropic.MessageResponse{}, anthropic.Usage{}, &TurnError{Kind: KindInternal, Msg: "empty-reply recovery", Cause: err}
 	}
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	stopKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
@@ -442,16 +443,15 @@ func recoverEmptyEndTurn(
 	cancel()
 	stopKeepalive()
 	if err != nil {
-		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call exceeded per-call deadline (%s)", callTimeout)
-		}
-		return anthropic.MessageResponse{}, anthropic.Usage{}, fmt.Errorf("empty-reply recovery call: %w", err)
+		return anthropic.MessageResponse{}, anthropic.Usage{}, callError(ctx, cctx, err,
+			"empty-reply recovery call",
+			fmt.Sprintf("empty-reply recovery call exceeded per-call deadline (%s)", callTimeout))
 	}
 	if resp.StopReason == "tool_use" {
-		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and called a tool when asked for the reply; this is not a max_tokens problem")
+		return anthropic.MessageResponse{}, resp.Usage, &TurnError{Kind: KindEmptyReply, Msg: "model ended its turn with no reply text and called a tool when asked for the reply; this is not a max_tokens problem"}
 	}
 	if strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
-		return anthropic.MessageResponse{}, resp.Usage, fmt.Errorf("model ended its turn with no reply text and again produced none when asked (stop_reason %q); this is not a max_tokens problem", resp.StopReason)
+		return anthropic.MessageResponse{}, resp.Usage, &TurnError{Kind: KindEmptyReply, Msg: fmt.Sprintf("model ended its turn with no reply text and again produced none when asked (stop_reason %q); this is not a max_tokens problem", resp.StopReason)}
 	}
 	return resp, resp.Usage, nil
 }
@@ -491,14 +491,13 @@ func finalizeWithoutTools(
 	if err != nil {
 		// Same as the RunLoop branch above (#5994): report only the bound, not
 		// the redundant transport cause.
-		if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call exceeded per-call deadline (%s)", callTimeout)
-		}
-		return LoopResult{}, fmt.Errorf("tools: tool-loop finalize call: %w", err)
+		return LoopResult{}, callError(ctx, cctx, err,
+			"tools: tool-loop finalize call",
+			fmt.Sprintf("tools: tool-loop finalize call exceeded per-call deadline (%s)", callTimeout))
 	}
 	totalUsage = totalUsage.Add(resp.Usage)
 	if strings.TrimSpace(StripToolMarkup(resp.Text)) == "" {
-		return LoopResult{}, fmt.Errorf("tools: tool-loop finalize returned no deliverable text (stop_reason %q)", resp.StopReason)
+		return LoopResult{}, &TurnError{Kind: KindEmptyReply, Msg: fmt.Sprintf("tools: tool-loop finalize returned no deliverable text (stop_reason %q)", resp.StopReason)}
 	}
 	if !req.DeferFinal {
 		if err := req.Emitter.assistant(resp); err != nil {
