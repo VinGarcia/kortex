@@ -176,9 +176,11 @@ func canon(t *testing.T, raw json.RawMessage) string {
 
 func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 	tests := []struct {
-		desc    string
-		call    func() error
-		wantErr string
+		desc string
+		call func() error
+		// wantPrefix is our own text before the cause; the cause text itself
+		// belongs to encoding/json and is deliberately not pinned.
+		wantPrefix string
 		// wantSyntax selects the expected concrete cause type.
 		wantSyntax bool
 	}{
@@ -188,7 +190,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				_, err := RewriteUserText([]byte(`{bad`), upper)
 				return err
 			},
-			wantErr:    "unsupported message content shape: decoding envelope: invalid character 'b' looking for beginning of object key string",
+			wantPrefix: "unsupported message content shape: decoding envelope: ",
 			wantSyntax: true,
 		},
 		{
@@ -197,7 +199,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				_, err := RewriteUserText([]byte(`{"message":5}`), upper)
 				return err
 			},
-			wantErr: "unsupported message content shape: decoding message: json: cannot unmarshal number into Go value of type map[string]jsontext.Value",
+			wantPrefix: "unsupported message content shape: decoding message: ",
 		},
 		{
 			desc: "string content",
@@ -205,7 +207,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				_, _, err := contentText(json.RawMessage(`"abc`))
 				return err
 			},
-			wantErr:    "unsupported message content shape: decoding string content: unexpected end of JSON input",
+			wantPrefix: "unsupported message content shape: decoding string content: ",
 			wantSyntax: true,
 		},
 		{
@@ -214,7 +216,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				_, _, err := contentText(json.RawMessage(`5`))
 				return err
 			},
-			wantErr: "unsupported message content shape: decoding content blocks: json: cannot unmarshal number into Go value of type []jsontext.Value",
+			wantPrefix: "unsupported message content shape: decoding content blocks: ",
 		},
 		{
 			desc: "content block",
@@ -222,7 +224,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				_, _, err := contentText(json.RawMessage(`[5]`))
 				return err
 			},
-			wantErr: "unsupported message content shape: decoding content block: json: cannot unmarshal number into Go value of type struct { Type string \"json:\\\"type\\\"\"; Text string \"json:\\\"text\\\"\" }",
+			wantPrefix: "unsupported message content shape: decoding content block: ",
 		},
 	}
 	for _, test := range tests {
@@ -231,16 +233,21 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 			if !errors.Is(err, ErrUnsupportedContent) {
 				t.Fatalf("errors.Is(ErrUnsupportedContent) = false for %v", err)
 			}
+			var cause error
 			var syntaxErr *json.SyntaxError
 			var typeErr *json.UnmarshalTypeError
-			if test.wantSyntax && !errors.As(err, &syntaxErr) {
-				t.Errorf("errors.As(*json.SyntaxError) = false for %v", err)
+			switch {
+			case test.wantSyntax && errors.As(err, &syntaxErr):
+				cause = syntaxErr
+			case !test.wantSyntax && errors.As(err, &typeErr):
+				cause = typeErr
+			case test.wantSyntax:
+				t.Fatalf("errors.As(*json.SyntaxError) = false for %v", err)
+			default:
+				t.Fatalf("errors.As(*json.UnmarshalTypeError) = false for %v", err)
 			}
-			if !test.wantSyntax && !errors.As(err, &typeErr) {
-				t.Errorf("errors.As(*json.UnmarshalTypeError) = false for %v", err)
-			}
-			if err.Error() != test.wantErr {
-				t.Errorf("Error() =\n%q\nwant\n%q", err.Error(), test.wantErr)
+			if want := test.wantPrefix + cause.Error(); err.Error() != want {
+				t.Errorf("Error() =\n%q\nwant\n%q", err.Error(), want)
 			}
 		})
 	}
