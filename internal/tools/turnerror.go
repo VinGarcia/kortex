@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"errors"
-	"fmt"
 )
 
 // TurnErrorKind classifies why a turn failed. The set is deliberately small
@@ -22,8 +21,6 @@ const (
 	KindCtxCancel TurnErrorKind = "ctx-cancel"
 	// KindInternal: a Kortex-side failure that is not a panic.
 	KindInternal TurnErrorKind = "internal"
-	// KindPanic: a panic recovered on the turn path.
-	KindPanic TurnErrorKind = "panic"
 )
 
 // TurnError is the typed error for a failed turn. Error() returns exactly the
@@ -39,17 +36,11 @@ type TurnError struct {
 	Kind  TurnErrorKind
 	Msg   string
 	Cause error
-	// OmitCause keeps Cause out of Error() (it stays reachable via Unwrap).
-	// Used when the cause must not reach the user-visible text (panics).
-	OmitCause bool
 }
 
 func (e *TurnError) Error() string {
-	if e.Cause == nil || e.OmitCause {
+	if e.Cause == nil {
 		return e.Msg
-	}
-	if e.Msg == "" {
-		return e.Cause.Error()
 	}
 	return e.Msg + ": " + e.Cause.Error()
 }
@@ -65,18 +56,6 @@ func KindOf(err error) TurnErrorKind {
 	return ""
 }
 
-// NewPanicError builds the error for a recovered panic. Its text is short and
-// non-leaky because it reaches the user as "kortex: <err>"; the panic value
-// and stack belong in the diagnostics stream, not here.
-func NewPanicError(value any) *TurnError {
-	return &TurnError{
-		Kind:      KindPanic,
-		Msg:       "internal error (panic recovered)",
-		Cause:     fmt.Errorf("panic: %v", value),
-		OmitCause: true,
-	}
-}
-
 // wrapTurn adds a prefix to err ("prefix: err" text, same as fmt.Errorf with
 // %w) while keeping err's kind; a non-TurnError cause is classified internal.
 func wrapTurn(prefix string, err error) *TurnError {
@@ -87,16 +66,23 @@ func wrapTurn(prefix string, err error) *TurnError {
 	return &TurnError{Kind: kind, Msg: prefix, Cause: err}
 }
 
-// callError wraps a failed Messages call. A per-call deadline (cctx expired
-// while the parent ctx is live) becomes a KindTimeout error with no Cause (see
-// TurnError, #5994) and text deadlineMsg; otherwise the error wraps err with
-// prefix and is classified ctx-cancel or upstream-api.
+// callError wraps a failed Messages call, classifying it explicitly:
+//   - the per-call deadline fired while the parent ctx is live: KindTimeout with
+//     no Cause and text deadlineMsg (see TurnError, #5994);
+//   - the parent ctx itself expired (DeadlineExceeded): KindTimeout, Cause kept.
+//     The turn ran out of time, so it is a timeout for classification; the text
+//     is unchanged ("prefix: cause"), as it was before typed errors;
+//   - the parent ctx was cancelled: KindCtxCancel, Cause kept;
+//   - anything else: KindUpstreamAPI, Cause kept.
 func callError(ctx context.Context, cctx context.Context, err error, prefix string, deadlineMsg string) *TurnError {
 	if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 		return &TurnError{Kind: KindTimeout, Msg: deadlineMsg}
 	}
 	kind := KindUpstreamAPI
-	if errors.Is(err, context.Canceled) {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		kind = KindTimeout
+	case errors.Is(ctx.Err(), context.Canceled), errors.Is(err, context.Canceled):
 		kind = KindCtxCancel
 	}
 	return &TurnError{Kind: kind, Msg: prefix, Cause: err}

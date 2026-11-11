@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -837,5 +838,66 @@ func TestRun_PanicInTurnYieldsErrorResultAndContinues(t *testing.T) {
 	}
 	if !strings.Contains(diag.String(), "secret internal detail") || !strings.Contains(diag.String(), "goroutine") {
 		t.Errorf("diag must carry panic value and stack, got %q", diag.String())
+	}
+}
+
+// panickingGovernor panics from GovernOutput, a part of runTurn outside RunLoop.
+type panickingGovernor struct{ *fakeGovernor }
+
+func (panickingGovernor) GovernOutput(
+	ctx context.Context,
+	turnIndex int,
+	messages []anthropic.Message,
+	ephemeralDigest string,
+	draft string,
+	redraft func(ctx context.Context, tail []anthropic.Message) (string, []anthropic.Message, error),
+	finalize func(ctx context.Context, tail []anthropic.Message) (string, error),
+) (string, string) {
+	panic("governor secret detail")
+}
+
+func TestRun_PanicOutsideRunLoopYieldsErrorResult(t *testing.T) {
+	server, _ := textResponder(t, "draft")
+	client := anthropic.NewClient("secret", server.URL, time.Second)
+
+	var out, diag strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("s", "hi") + "\n"),
+		Stdout: &out, Diag: &diag, Client: client, Dispatcher: tools.NewDispatcher(),
+		Governor: panickingGovernor{&fakeGovernor{}},
+		Store:    NewStore(t.TempDir()), SessionID: "s", Model: "m", MaxTokens: 10, NewUUID: seqUUID(),
+	})
+	if err != nil {
+		t.Fatalf("Run must survive a panic in governTurn: %v", err)
+	}
+	var results []*protocol.Result
+	for _, ev := range parseLines(t, out.String()) {
+		if ev.Type == protocol.TypeResult {
+			results = append(results, ev.Result)
+		}
+	}
+	if len(results) != 1 || !results[0].IsError || results[0].Text != "kortex: internal error (panic recovered)" {
+		t.Fatalf("results = %+v, want one error result with the short panic text", results)
+	}
+	if !strings.Contains(diag.String(), "governor secret detail") || !strings.Contains(diag.String(), "goroutine") {
+		t.Errorf("diag must carry panic value and stack, got %q", diag.String())
+	}
+}
+
+func TestPanicError(t *testing.T) {
+	p := NewPanicError("secret value")
+	if p.Error() != "internal error (panic recovered)" {
+		t.Errorf("Error() = %q, want the short text without the panic value", p.Error())
+	}
+	if cause := errors.Unwrap(p); cause == nil || !strings.Contains(cause.Error(), "secret value") {
+		t.Errorf("Unwrap() = %v, want the cause carrying the panic value", cause)
+	}
+	wrapped := fmt.Errorf("x: %w", p)
+	if strings.Contains(wrapped.Error(), "secret value") {
+		t.Errorf("wrapped Error() = %q leaks the panic value", wrapped.Error())
+	}
+	var pe *PanicError
+	if !errors.As(wrapped, &pe) {
+		t.Error("errors.As must find *PanicError through a wrap")
 	}
 }

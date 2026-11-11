@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -365,7 +364,7 @@ func Run(ctx context.Context, cfg Config) error {
 			// re-inflating that history (#4803 follow-up). Does not alter userText.
 			warnOnEchoDrift(cfg.Diag, cfg.SessionID, inbound, len(msgs))
 			var turn *history.Turn
-			msgs, turn, err = runTurn(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
+			msgs, turn, err = runTurnRecovered(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
 			if err != nil {
 				return err
 			}
@@ -442,7 +441,7 @@ func runTurn(
 	// priorTurns, so it stays independent of the governor's turn view, and it is
 	// never persisted.
 	digest := toneDigest(cfg, priorUserTexts, userText)
-	res, err := runLoopRecovered(ctx, cfg, tools.LoopRequest{
+	res, err := tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, tools.LoopRequest{
 		Model:       cfg.Model,
 		System:      systemPrompt,
 		MaxTokens:   cfg.MaxTokens,
@@ -970,19 +969,4 @@ func diagf(w io.Writer, format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(w, format+"\n", args...)
-}
-
-// runLoopRecovered calls tools.RunLoop and converts a panic anywhere beneath it
-// (loop, dispatcher, tool code, injected callbacks) into a *tools.TurnError of
-// Kind KindPanic, so the turn ends with the normal error result line instead of
-// killing the process. The panic value and stack go to the diag stream only;
-// the error text stays short because it reaches the user.
-func runLoopRecovered(ctx context.Context, cfg Config, req tools.LoopRequest) (res tools.LoopResult, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			diagf(cfg.Diag, "session: panic recovered in turn: %v\n%s", r, debug.Stack())
-			res, err = tools.LoopResult{}, tools.NewPanicError(r)
-		}
-	}()
-	return tools.RunLoop(ctx, cfg.Client, cfg.Dispatcher, req)
 }
