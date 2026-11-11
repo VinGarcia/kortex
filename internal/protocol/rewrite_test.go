@@ -173,3 +173,75 @@ func canon(t *testing.T, raw json.RawMessage) string {
 	}
 	return string(out)
 }
+
+func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
+	tests := []struct {
+		desc    string
+		call    func() error
+		wantErr string
+		// wantSyntax selects the expected concrete cause type.
+		wantSyntax bool
+	}{
+		{
+			desc: "envelope",
+			call: func() error {
+				_, err := RewriteUserText([]byte(`{bad`), upper)
+				return err
+			},
+			wantErr:    "unsupported message content shape: decoding envelope: invalid character 'b' looking for beginning of object key string",
+			wantSyntax: true,
+		},
+		{
+			desc: "message",
+			call: func() error {
+				_, err := RewriteUserText([]byte(`{"message":5}`), upper)
+				return err
+			},
+			wantErr: "unsupported message content shape: decoding message: json: cannot unmarshal number into Go value of type map[string]jsontext.Value",
+		},
+		{
+			desc: "string content",
+			call: func() error {
+				_, _, err := contentText(json.RawMessage(`"abc`))
+				return err
+			},
+			wantErr:    "unsupported message content shape: decoding string content: unexpected end of JSON input",
+			wantSyntax: true,
+		},
+		{
+			desc: "content blocks",
+			call: func() error {
+				_, _, err := contentText(json.RawMessage(`5`))
+				return err
+			},
+			wantErr: "unsupported message content shape: decoding content blocks: json: cannot unmarshal number into Go value of type []jsontext.Value",
+		},
+		{
+			desc: "content block",
+			call: func() error {
+				_, _, err := contentText(json.RawMessage(`[5]`))
+				return err
+			},
+			wantErr: "unsupported message content shape: decoding content block: json: cannot unmarshal number into Go value of type struct { Type string \"json:\\\"type\\\"\"; Text string \"json:\\\"text\\\"\" }",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			err := test.call()
+			if !errors.Is(err, ErrUnsupportedContent) {
+				t.Fatalf("errors.Is(ErrUnsupportedContent) = false for %v", err)
+			}
+			var syntaxErr *json.SyntaxError
+			var typeErr *json.UnmarshalTypeError
+			if test.wantSyntax && !errors.As(err, &syntaxErr) {
+				t.Errorf("errors.As(*json.SyntaxError) = false for %v", err)
+			}
+			if !test.wantSyntax && !errors.As(err, &typeErr) {
+				t.Errorf("errors.As(*json.UnmarshalTypeError) = false for %v", err)
+			}
+			if err.Error() != test.wantErr {
+				t.Errorf("Error() =\n%q\nwant\n%q", err.Error(), test.wantErr)
+			}
+		})
+	}
+}

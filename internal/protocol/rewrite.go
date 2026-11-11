@@ -26,11 +26,11 @@ var ErrUnsupportedContent = errors.New("unsupported message content shape")
 func RewriteUserText(line []byte, rewrite func(text string) (newText string, ok bool)) ([]byte, error) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(line, &envelope); err != nil {
-		return nil, fmt.Errorf("%w: decoding envelope: %v", ErrUnsupportedContent, err)
+		return nil, fmt.Errorf("%w: decoding envelope: %w", ErrUnsupportedContent, err)
 	}
 	var message map[string]json.RawMessage
 	if err := json.Unmarshal(envelope["message"], &message); err != nil {
-		return nil, fmt.Errorf("%w: decoding message: %v", ErrUnsupportedContent, err)
+		return nil, fmt.Errorf("%w: decoding message: %w", ErrUnsupportedContent, err)
 	}
 	content, ok := message["content"]
 	if !ok {
@@ -101,7 +101,7 @@ func contentText(content json.RawMessage) (text string, rebuild func(string) (js
 	if trimmed[0] == '"' {
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return "", nil, fmt.Errorf("%w: decoding string content: %v", ErrUnsupportedContent, err)
+			return "", nil, fmt.Errorf("%w: decoding string content: %w", ErrUnsupportedContent, err)
 		}
 		return s, func(newText string) (json.RawMessage, error) {
 			return json.Marshal(newText)
@@ -110,7 +110,7 @@ func contentText(content json.RawMessage) (text string, rebuild func(string) (js
 	// Block-array content: rewritable only when exactly one text block exists.
 	var blocks []json.RawMessage
 	if err := json.Unmarshal(trimmed, &blocks); err != nil {
-		return "", nil, fmt.Errorf("%w: decoding content blocks: %v", ErrUnsupportedContent, err)
+		return "", nil, fmt.Errorf("%w: decoding content blocks: %w", ErrUnsupportedContent, err)
 	}
 	textIndex := -1
 	var textValue string
@@ -120,7 +120,7 @@ func contentText(content json.RawMessage) (text string, rebuild func(string) (js
 			Text string `json:"text"`
 		}
 		if err := json.Unmarshal(raw, &block); err != nil {
-			return "", nil, fmt.Errorf("%w: decoding content block: %v", ErrUnsupportedContent, err)
+			return "", nil, fmt.Errorf("%w: decoding content block: %w", ErrUnsupportedContent, err)
 		}
 		if block.Type != "text" {
 			continue
