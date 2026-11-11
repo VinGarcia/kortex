@@ -174,15 +174,15 @@ func canon(t *testing.T, raw json.RawMessage) string {
 	return string(out)
 }
 
-func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
+func TestDecodeErrors_KeepCauseInChain(t *testing.T) {
 	tests := []struct {
 		desc string
 		call func() error
 		// wantPrefix is our own text before the cause; the cause text itself
 		// belongs to encoding/json and is deliberately not pinned.
 		wantPrefix string
-		// wantSyntax selects the expected concrete cause type.
-		wantSyntax bool
+		// findCause extracts the expected encoding/json cause via errors.As.
+		findCause func(error) (error, bool)
 	}{
 		{
 			desc: "envelope",
@@ -191,7 +191,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				return err
 			},
 			wantPrefix: "unsupported message content shape: decoding envelope: ",
-			wantSyntax: true,
+			findCause:  asCause[*json.SyntaxError],
 		},
 		{
 			desc: "message",
@@ -200,6 +200,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				return err
 			},
 			wantPrefix: "unsupported message content shape: decoding message: ",
+			findCause:  asCause[*json.UnmarshalTypeError],
 		},
 		{
 			desc: "string content",
@@ -208,7 +209,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				return err
 			},
 			wantPrefix: "unsupported message content shape: decoding string content: ",
-			wantSyntax: true,
+			findCause:  asCause[*json.SyntaxError],
 		},
 		{
 			desc: "content blocks",
@@ -217,6 +218,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				return err
 			},
 			wantPrefix: "unsupported message content shape: decoding content blocks: ",
+			findCause:  asCause[*json.UnmarshalTypeError],
 		},
 		{
 			desc: "content block",
@@ -225,6 +227,7 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 				return err
 			},
 			wantPrefix: "unsupported message content shape: decoding content block: ",
+			findCause:  asCause[*json.UnmarshalTypeError],
 		},
 	}
 	for _, test := range tests {
@@ -233,22 +236,20 @@ func TestDecodeErrorsKeepCauseInChain(t *testing.T) {
 			if !errors.Is(err, ErrUnsupportedContent) {
 				t.Fatalf("errors.Is(ErrUnsupportedContent) = false for %v", err)
 			}
-			var cause error
-			var syntaxErr *json.SyntaxError
-			var typeErr *json.UnmarshalTypeError
-			switch {
-			case test.wantSyntax && errors.As(err, &syntaxErr):
-				cause = syntaxErr
-			case !test.wantSyntax && errors.As(err, &typeErr):
-				cause = typeErr
-			case test.wantSyntax:
-				t.Fatalf("errors.As(*json.SyntaxError) = false for %v", err)
-			default:
-				t.Fatalf("errors.As(*json.UnmarshalTypeError) = false for %v", err)
+			cause, ok := test.findCause(err)
+			if !ok {
+				t.Fatalf("expected json cause not found via errors.As in %v", err)
 			}
 			if want := test.wantPrefix + cause.Error(); err.Error() != want {
 				t.Errorf("Error() =\n%q\nwant\n%q", err.Error(), want)
 			}
 		})
 	}
+}
+
+// asCause reports whether err wraps a T, returning it as the cause.
+func asCause[T error](err error) (error, bool) {
+	var cause T
+	ok := errors.As(err, &cause)
+	return cause, ok
 }

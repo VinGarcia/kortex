@@ -10,7 +10,9 @@ import (
 // ErrUnsupportedContent marks a message whose content shape cannot be
 // rewritten safely: no text, undecodable structure, or more than one text
 // block (splitting one rewrite across blocks would desync any index-based
-// consumer of the text).
+// consumer of the text). Callers should match only this sentinel: a decode
+// failure also wraps the encoding/json cause, but that cause is diagnostic
+// and may change with the decoder.
 var ErrUnsupportedContent = errors.New("unsupported message content shape")
 
 // RewriteUserText rewrites the text of a user-message wire line in place,
