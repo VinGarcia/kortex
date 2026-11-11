@@ -31,6 +31,21 @@ type StreamEmitter struct {
 	// writes through it, so exclusion must live HERE — a half-interleaved NDJSON
 	// line is an unparseable wire — not in caller choreography.
 	writeMu sync.Mutex
+	// results counts terminal result lines written (guarded by writeMu). The
+	// session's panic recovery reads it to avoid emitting a second result line
+	// for a round that already closed (see session.runTurnRecovered).
+	results int
+}
+
+// ResultCount reports how many terminal result lines this emitter has written.
+// Nil-safe like every emitter method (a nil emitter wrote none).
+func (e *StreamEmitter) ResultCount() int {
+	if e == nil {
+		return 0
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.results
 }
 
 // NewStreamEmitter builds an emitter writing to w. sessionID and newUUID are
@@ -149,7 +164,7 @@ func (e *StreamEmitter) result(res LoopResult, usage anthropic.Usage) error {
 	if err != nil {
 		return fmt.Errorf("tools: emitting result: %w", err)
 	}
-	return e.write(line)
+	return e.writeResult(line)
 }
 
 // EmitFinalTurn emits the deferred final turn: one assistant text event
@@ -196,7 +211,7 @@ func (e *StreamEmitter) EmitFinalTurn(text string, numTurns int, stopReason stri
 	if err != nil {
 		return fmt.Errorf("tools: emitting final result: %w", err)
 	}
-	return e.write(resultLine)
+	return e.writeResult(resultLine)
 }
 
 // Keepalive emits one benign system/keepalive line. The session's governor
@@ -252,12 +267,28 @@ func (e *StreamEmitter) ErrorResult(msg string) error {
 	if err != nil {
 		return fmt.Errorf("tools: emitting error result: %w", err)
 	}
-	return e.write(line)
+	return e.writeResult(line)
 }
 
 func (e *StreamEmitter) write(line []byte) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	return e.writeLocked(line)
+}
+
+// writeResult writes a terminal result line and counts it, under one lock so
+// ResultCount never disagrees with what reached the wire.
+func (e *StreamEmitter) writeResult(line []byte) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if err := e.writeLocked(line); err != nil {
+		return err
+	}
+	e.results++
+	return nil
+}
+
+func (e *StreamEmitter) writeLocked(line []byte) error {
 	if _, err := e.w.Write(line); err != nil {
 		return fmt.Errorf("tools: writing stream-json line: %w", err)
 	}

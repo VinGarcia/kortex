@@ -39,10 +39,11 @@ func (e *PanicError) Unwrap() error { return e.cause }
 //
 // Wire well-formedness: the emitter writes each NDJSON line with one Write
 // under a mutex, so a panic cannot leave a half-written line. A panic after the
-// round already emitted its final result line (only Store.Save and the code
-// after governTurn are past that point) makes the error result a SECOND result
-// line for the same round; that is accepted over crashing the process, and the
-// persisted history is simply not updated for that turn.
+// round already emitted its terminal result line (only Store.Save and the code
+// after governTurn are past that point) must NOT emit a second result: OpenClaw
+// would read it as the answer to the NEXT round, showing the user an error in
+// reply to a message that has not run yet. In that case the panic is only
+// logged, and the persisted history is simply not updated for that turn.
 func runTurnRecovered(
 	ctx context.Context,
 	cfg Config,
@@ -53,19 +54,30 @@ func runTurnRecovered(
 	priorUserTexts []string,
 	userText string,
 ) (outMsgs []anthropic.Message, outTurn *history.Turn, err error) {
+	resultsBefore := emitter.ResultCount()
 	defer func() {
-		r := recover()
-		if r == nil {
-			return
+		if r := recover(); r != nil {
+			diagf(cfg.Diag, "session: panic recovered in turn: %v\n%s", r, debug.Stack())
+			outMsgs, outTurn, err = msgs, nil, closeRoundAfterPanic(cfg, emitter, resultsBefore, NewPanicError(r))
 		}
-		diagf(cfg.Diag, "session: panic recovered in turn: %v\n%s", r, debug.Stack())
-		panicErr := NewPanicError(r)
-		outMsgs, outTurn, err = msgs, nil, nil
-		if emitErr := emitter.ErrorResult(fmt.Sprintf("kortex: %v", panicErr)); emitErr != nil {
-			err = fmt.Errorf("session: %w", emitErr)
-			return
-		}
-		diagf(cfg.Diag, "session: turn failed, round closed with error result: %v", panicErr)
 	}()
 	return runTurn(ctx, cfg, emitter, systemPrompt, msgs, priorTurns, priorUserTexts, userText)
+}
+
+// closeRoundAfterPanic ends the round of a turn that panicked. It emits the
+// short error result only when the round has not already written its terminal
+// result line (resultsBefore is the emitter's ResultCount at turn start); a
+// second result would be read by OpenClaw as the answer to the next round. The
+// returned error is non-nil only when the error result itself could not be
+// written (wire presumed broken).
+func closeRoundAfterPanic(cfg Config, emitter *tools.StreamEmitter, resultsBefore int, panicErr *PanicError) error {
+	if emitter.ResultCount() > resultsBefore {
+		diagf(cfg.Diag, "session: panic after the round's result line; not emitting a second result: %v", panicErr)
+		return nil
+	}
+	if err := emitter.ErrorResult(fmt.Sprintf("kortex: %v", panicErr)); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	diagf(cfg.Diag, "session: turn failed, round closed with error result: %v", panicErr)
+	return nil
 }

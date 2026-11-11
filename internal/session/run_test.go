@@ -901,3 +901,32 @@ func TestPanicError(t *testing.T) {
 		t.Error("errors.As must find *PanicError through a wrap")
 	}
 }
+
+func TestCloseRoundAfterPanic_SkipsSecondResult(t *testing.T) {
+	tests := []struct {
+		desc           string
+		resultsInRound int
+		wantResults    int
+	}{
+		{desc: "panic before the round's result emits one error result", resultsInRound: 0, wantResults: 1},
+		{desc: "panic after the round's result emits nothing more", resultsInRound: 1, wantResults: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			var out, diag strings.Builder
+			emitter := tools.NewStreamEmitter(&out, "s", seqUUID())
+			before := emitter.ResultCount()
+			for i := 0; i < tt.resultsInRound; i++ {
+				if err := emitter.ErrorResult("earlier result"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := closeRoundAfterPanic(Config{Diag: &diag}, emitter, before, NewPanicError("boom")); err != nil {
+				t.Fatalf("closeRoundAfterPanic: %v", err)
+			}
+			if got := emitter.ResultCount(); got != tt.wantResults {
+				t.Errorf("result lines = %d, want %d (wire: %q)", got, tt.wantResults, out.String())
+			}
+		})
+	}
+}

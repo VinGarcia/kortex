@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -498,5 +499,30 @@ func TestAssistantBlocks_roundTrip(t *testing.T) {
 	ev := protocol.Parse(line)
 	if !reflect.DeepEqual([]protocol.ContentBlock(ev.Message.Content), want) {
 		t.Errorf("round-tripped blocks = %+v, want %+v", ev.Message.Content, want)
+	}
+}
+
+func TestStreamEmitter_ResultCountCountsOnlyTerminalLines(t *testing.T) {
+	var out strings.Builder
+	n := 0
+	e := NewStreamEmitter(&out, "s", func() string { n++; return "u" + strconv.Itoa(n) })
+	if err := e.Keepalive(); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.ResultCount(); got != 0 {
+		t.Fatalf("after keepalive ResultCount = %d, want 0", got)
+	}
+	if err := e.ErrorResult("x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.EmitFinalTurn("hello", 1, "end_turn", anthropic.Usage{}, anthropic.Usage{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.ResultCount(); got != 2 {
+		t.Errorf("ResultCount = %d, want 2 (error result + final turn result)", got)
+	}
+	var nilEmitter *StreamEmitter
+	if got := nilEmitter.ResultCount(); got != 0 {
+		t.Errorf("nil emitter ResultCount = %d, want 0", got)
 	}
 }
