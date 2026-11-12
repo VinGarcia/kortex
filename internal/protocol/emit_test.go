@@ -14,7 +14,9 @@ func TestEmit_golden(t *testing.T) {
 	}{
 		{
 			desc: "system/init reports the tool list and no capabilities",
-			emit: func() ([]byte, error) { return EmitSystemInit("sess-1", []string{"bash", "read", "mcp__openclaw__foo"}) },
+			emit: func() ([]byte, error) {
+				return EmitSystemInit("sess-1", []string{"bash", "read", "mcp__openclaw__foo"})
+			},
 			want: `{"type":"system","subtype":"init","tools":["bash","read","mcp__openclaw__foo"],"capabilities":[],"session_id":"sess-1"}`,
 		},
 		{
