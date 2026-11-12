@@ -676,6 +676,14 @@ func TestAuthFDsFromEnv(t *testing.T) {
 			want: []int{5},
 		},
 		{
+			desc: "stdio fd 0 is skipped, valid sibling kept",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "0",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "5",
+			},
+			want: []int{5},
+		},
+		{
 			desc: "stdio fd 2 is skipped, valid sibling kept",
 			env: map[string]string{
 				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "2",

@@ -180,14 +180,18 @@ func isSingleLine(data []byte) bool {
 	return bytes.IndexByte(data[:len(data)-1], '\n') == -1
 }
 
+// MinForwardableFD is the lowest FD forwardAuthFDs can re-expose: 0-2 are the
+// child's stdio and ExtraFiles starts at 3.
+const MinForwardableFD = 3
+
 // forwardAuthFDs re-exposes inherited auth file descriptors to the child at
 // the same FD numbers the env announces. ExtraFiles maps index i to child FD
 // 3+i, so gaps are padded with /dev/null to land each FD on its number.
 func forwardAuthFDs(cmd *exec.Cmd, fds []int) error {
 	maxFD := 0
 	for _, fd := range fds {
-		if fd < 3 {
-			return fmt.Errorf("announced auth fd %d is below 3", fd)
+		if fd < MinForwardableFD {
+			return fmt.Errorf("announced auth fd %d is below %d", fd, MinForwardableFD)
 		}
 		if fd > maxFD {
 			maxFD = fd
