@@ -625,3 +625,440 @@ func TestNativeSession_SessionsYieldBypassesGovernorAndEndsTurn(t *testing.T) {
 		t.Errorf("governed text leaked into a yield result: %q", res.Result)
 	}
 }
+
+func TestAuthFDsFromEnv(t *testing.T) {
+	tests := []struct {
+		desc string
+		env  map[string]string
+		want []int
+	}{
+		{desc: "none set", env: map[string]string{}, want: nil},
+		{
+			desc: "oauth fd only",
+			env:  map[string]string{"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "3"},
+			want: []int{3},
+		},
+		{
+			desc: "api key fd only",
+			env:  map[string]string{"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR": "4"},
+			want: []int{4},
+		},
+		{
+			desc: "both honored in authFDEnvVars order",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "3",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "4",
+			},
+			want: []int{3, 4},
+		},
+		{
+			desc: "non-numeric value is skipped, valid sibling kept",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "abc",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "5",
+			},
+			want: []int{5},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			// Pin every var first so the host environment cannot leak in.
+			for _, name := range authFDEnvVars {
+				t.Setenv(name, "")
+			}
+			for name, value := range test.env {
+				t.Setenv(name, value)
+			}
+
+			got := authFDsFromEnv()
+
+			if fmt.Sprint(got) != fmt.Sprint(test.want) {
+				t.Errorf("authFDsFromEnv() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildNativeDispatcher(t *testing.T) {
+	// A fake loopback MCP server exposing one tool; initialize/tools/list
+	// answered per method, the initialized notification with 202.
+	newServer := func(t *testing.T, failToolsList bool) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Method string `json:"method"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			switch req.Method {
+			case "initialize":
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"openclaw","version":"0.1.0"}}}`))
+			case "notifications/initialized":
+				w.WriteHeader(http.StatusAccepted)
+			case "tools/list":
+				if failToolsList {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"memory_search","description":"d","inputSchema":{"type":"object","properties":{}}}]}}`))
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	writeConfig := func(t *testing.T, url string) []string {
+		path := filepath.Join(t.TempDir(), "mcp.json")
+		cfg := fmt.Sprintf(`{"mcpServers":{"openclaw":{"type":"http","url":%q}}}`, url)
+		if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return []string{"--mcp-config", path}
+	}
+	const mcpToolName = "mcp__openclaw__memory_search"
+	builtinCount := len(tools.NewDispatcher().ToolDefs())
+
+	tests := []struct {
+		desc         string
+		argv         func(t *testing.T) []string
+		wantMCPTool  bool
+		wantStderr   string
+		wantNoStderr bool
+	}{
+		{
+			desc:         "no --mcp-config: builtins only, silent",
+			argv:         func(t *testing.T) []string { return []string{"--model", "m"} },
+			wantNoStderr: true,
+		},
+		{
+			desc: "unreadable --mcp-config: builtins only, warns",
+			argv: func(t *testing.T) []string {
+				return []string{"--mcp-config", filepath.Join(t.TempDir(), "missing.json")}
+			},
+			wantStderr: "mcp tools disabled",
+		},
+		{
+			desc: "handshake fails: builtins only, warns",
+			argv: func(t *testing.T) []string {
+				return writeConfig(t, newServer(t, true).URL)
+			},
+			wantStderr: "handshake failed",
+		},
+		{
+			desc: "handshake ok: MCP tools exposed after builtins",
+			argv: func(t *testing.T) []string {
+				return writeConfig(t, newServer(t, false).URL)
+			},
+			wantMCPTool:  true,
+			wantNoStderr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			var stderr bytes.Buffer
+
+			dispatcher := buildNativeDispatcher(context.Background(), test.argv(t), func(string) string { return "" }, &stderr)
+
+			if dispatcher == nil {
+				t.Fatal("dispatcher = nil, want non-nil (fail-open)")
+			}
+			defs := dispatcher.ToolDefs()
+			hasMCP := false
+			for _, def := range defs {
+				if def.Name == mcpToolName {
+					hasMCP = true
+				}
+			}
+			if hasMCP != test.wantMCPTool {
+				t.Errorf("has %s = %v, want %v", mcpToolName, hasMCP, test.wantMCPTool)
+			}
+			wantLen := builtinCount
+			if test.wantMCPTool {
+				wantLen++
+			}
+			if len(defs) != wantLen {
+				t.Errorf("len(ToolDefs) = %d, want %d", len(defs), wantLen)
+			}
+			if test.wantStderr != "" && !strings.Contains(stderr.String(), test.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), test.wantStderr)
+			}
+			if test.wantNoStderr && stderr.Len() != 0 {
+				t.Errorf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
+
+func TestBuildFacetDeps(t *testing.T) {
+	dir := t.TempDir()
+	writeFile := func(name string, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	prompt := writeFile("prompt.md", "header\n---\nBODY\n")
+	memory := writeFile("memory.md", "MEM")
+	noBody := writeFile("nobody.md", "no separator here")
+
+	tests := []struct {
+		desc        string
+		token       string
+		promptPath  string
+		memoryPath  string
+		timeoutSecs int
+		wantErr     string
+		wantTimeout time.Duration
+		wantPrompt  []string // substrings
+	}{
+		{
+			desc:        "default timeout applied when config is 0",
+			token:       "tok",
+			promptPath:  prompt,
+			timeoutSecs: 0,
+			wantTimeout: 7 * time.Second,
+			wantPrompt:  []string{"BODY"},
+		},
+		{
+			desc:        "explicit timeout wins; memory appended to prompt",
+			token:       "tok",
+			promptPath:  prompt,
+			memoryPath:  memory,
+			timeoutSecs: 3,
+			wantTimeout: 3 * time.Second,
+			wantPrompt:  []string{"BODY", "MEM"},
+		},
+		{desc: "empty token", token: "", promptPath: prompt, wantErr: "token env FACET_TEST_TOKEN is empty or unset"},
+		{desc: "missing prompt file", token: "tok", promptPath: filepath.Join(dir, "nope.md"), wantErr: "facet testFacet: reading facet system prompt"},
+		{desc: "prompt without body", token: "tok", promptPath: noBody, wantErr: "has no body"},
+		{desc: "missing memory file", token: "tok", promptPath: prompt, memoryPath: filepath.Join(dir, "nomem.md"), wantErr: "reading emotional memory"},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Setenv("FACET_TEST_TOKEN", test.token)
+
+			client, systemPrompt, timeout, err := buildFacetDeps("testFacet", "FACET_TEST_TOKEN", test.promptPath, test.memoryPath, test.timeoutSecs, 7)
+
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, test.wantErr)
+				}
+				if client != nil {
+					t.Errorf("client = %v, want nil on error", client)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if client == nil {
+				t.Error("client = nil, want non-nil")
+			}
+			if timeout != test.wantTimeout {
+				t.Errorf("timeout = %v, want %v", timeout, test.wantTimeout)
+			}
+			for _, want := range test.wantPrompt {
+				if !strings.Contains(systemPrompt, want) {
+					t.Errorf("systemPrompt = %q, want it to contain %q", systemPrompt, want)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildFacets(t *testing.T) {
+	dir := t.TempDir()
+	prompt := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(prompt, []byte("---\nBODY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FACET_TEST_TOKEN", "tok")
+
+	facetJSON := func(name string, extra string) string {
+		return fmt.Sprintf(`%q:{"enabled":true,"model":"m","tokenEnv":"FACET_TEST_TOKEN","systemPromptPath":%q%s}`, name, prompt, extra)
+	}
+	writeConfig := func(t *testing.T, facets ...string) string {
+		path := filepath.Join(t.TempDir(), "kortex.json")
+		body := `{"facets":{` + strings.Join(facets, ",") + `}}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	tests := []struct {
+		desc            string
+		cfg             func(t *testing.T) string
+		withLog         bool
+		wantErr         bool
+		wantAnnotator   bool
+		wantEvaluator   bool
+		wantSuperego    bool
+		wantGovernor    bool
+		wantBudget      int
+		wantConflictLog bool
+	}{
+		{desc: "empty config path: nothing built", cfg: func(t *testing.T) string { return "" }},
+		{desc: "unreadable config", cfg: func(t *testing.T) string { return filepath.Join(t.TempDir(), "nope.json") }, wantErr: true},
+		{
+			desc: "no facet enabled: nothing built",
+			cfg: func(t *testing.T) string {
+				return writeConfig(t, strings.Replace(facetJSON("inputAnnotator", ""), `"enabled":true`, `"enabled":false`, 1))
+			},
+		},
+		{
+			desc:          "annotator only",
+			cfg:           func(t *testing.T) string { return writeConfig(t, facetJSON("inputAnnotator", "")) },
+			withLog:       true,
+			wantAnnotator: true,
+		},
+		{
+			desc:          "evaluator only",
+			cfg:           func(t *testing.T) string { return writeConfig(t, facetJSON("outputEvaluator", "")) },
+			wantEvaluator: true,
+		},
+		{
+			desc: "shadow superego: evaluator triggers it, no governor",
+			cfg: func(t *testing.T) string {
+				return writeConfig(t, facetJSON("outputEvaluator", ""), facetJSON("superego", `,"mode":"shadow"`))
+			},
+			wantEvaluator: true,
+			wantSuperego:  true,
+		},
+		{
+			desc: "active superego: governor, default redraft budget, conflicts log",
+			cfg: func(t *testing.T) string {
+				return writeConfig(t, facetJSON("outputEvaluator", ""), facetJSON("superego", `,"mode":"active"`))
+			},
+			withLog:         true,
+			wantEvaluator:   true,
+			wantSuperego:    true,
+			wantGovernor:    true,
+			wantBudget:      session.DefaultRedraftToolBudget,
+			wantConflictLog: true,
+		},
+		{
+			desc: "active superego: configured redraft budget honored, no log path",
+			cfg: func(t *testing.T) string {
+				return writeConfig(t, facetJSON("outputEvaluator", ""), facetJSON("superego", `,"mode":"active","redraftToolBudget":9`))
+			},
+			wantEvaluator: true,
+			wantSuperego:  true,
+			wantGovernor:  true,
+			wantBudget:    9,
+		},
+		{
+			desc: "unusable facet deps (prompt missing) surface as error",
+			cfg: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "kortex.json")
+				body := fmt.Sprintf(`{"facets":{"inputAnnotator":{"enabled":true,"model":"m","tokenEnv":"FACET_TEST_TOKEN","systemPromptPath":%q}}}`, filepath.Join(dir, "gone.md"))
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			logPath := ""
+			if test.withLog {
+				logPath = filepath.Join(t.TempDir(), "kortex.log")
+			}
+
+			built, err := buildFacets(test.cfg(t), logPath, "sess-1")
+			t.Cleanup(func() {
+				if built.logFile != nil {
+					built.logFile.Close()
+				}
+				if built.conflictsLogFile != nil {
+					built.conflictsLogFile.Close()
+				}
+			})
+
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("err = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got := built.annotator != nil; got != test.wantAnnotator {
+				t.Errorf("annotator built = %v, want %v", got, test.wantAnnotator)
+			}
+			if got := built.outputEvaluator != nil; got != test.wantEvaluator {
+				t.Errorf("outputEvaluator built = %v, want %v", got, test.wantEvaluator)
+			}
+			if got := built.superego != nil; got != test.wantSuperego {
+				t.Errorf("superego built = %v, want %v", got, test.wantSuperego)
+			}
+			if got := built.governor != nil; got != test.wantGovernor {
+				t.Errorf("governor built = %v, want %v", got, test.wantGovernor)
+			}
+			if built.redraftToolBudget != test.wantBudget {
+				t.Errorf("redraftToolBudget = %d, want %d", built.redraftToolBudget, test.wantBudget)
+			}
+			if got := built.conflictsLogFile != nil; got != test.wantConflictLog {
+				t.Errorf("conflictsLogFile opened = %v, want %v", got, test.wantConflictLog)
+			}
+			wantFacetLog := test.withLog && (test.wantAnnotator || test.wantEvaluator)
+			if got := built.logFile != nil; got != wantFacetLog {
+				t.Errorf("logFile opened = %v, want %v", got, wantFacetLog)
+			}
+			if wantFacetLog {
+				if _, err := os.Stat(logPath + ".facets"); err != nil {
+					t.Errorf("facets log not created: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRunNative_emptyStdinCleanExit(t *testing.T) {
+	// EOF on stdin ends session.Run cleanly with no model call, so this drives
+	// the whole composition root (token file, wire log, inbound tap, facets,
+	// dispatcher) without touching the network.
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(prompt, []byte("---\nBODY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "kortex.json")
+	cfg := fmt.Sprintf(`{"facets":{
+		"inputAnnotator":{"enabled":true,"model":"m","tokenEnv":"FACET_TEST_TOKEN","systemPromptPath":%[1]q},
+		"outputEvaluator":{"enabled":true,"model":"m","tokenEnv":"FACET_TEST_TOKEN","systemPromptPath":%[1]q},
+		"superego":{"enabled":true,"mode":"active","tokenEnv":"FACET_TEST_TOKEN","systemPromptPath":%[1]q}}}`, prompt)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FACET_TEST_TOKEN", "tok")
+	logPath := filepath.Join(dir, "kortex.log")
+	env := map[string]string{
+		"KORTEX_TOKEN_FILE": tokenFile,
+		"KORTEX_CONFIG":     cfgPath,
+		"KORTEX_LOG":        logPath,
+		"KORTEX_STATE_DIR":  filepath.Join(dir, "state"),
+	}
+	getenv := func(name string) string { return env[name] }
+	var stdout, stderr bytes.Buffer
+
+	code := runNative([]string{"--model", "m", "--effort", "low", "--session-id", "sess-1"}, getenv, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	for _, suffix := range []string{".native", ".inbound", ".facets", ".conflicts"} {
+		if _, err := os.Stat(logPath + suffix); err != nil {
+			t.Errorf("expected %s artifact: %v", suffix, err)
+		}
+	}
+}
