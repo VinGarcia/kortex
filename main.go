@@ -745,6 +745,12 @@ func authFDsFromEnv() []int {
 			fmt.Fprintf(os.Stderr, "kortex: auth fd not forwarded: %s=%q is not a number\n", name, value)
 			continue
 		}
+		// 0-2 are stdio, and ExtraFiles (see proxy.forwardAuthFDs) can only
+		// carry FDs from 3 up, so anything lower can never be forwarded.
+		if fd < 3 {
+			fmt.Fprintf(os.Stderr, "kortex: auth fd not forwarded: %s=%q is below 3\n", name, value)
+			continue
+		}
 		fds = append(fds, fd)
 	}
 	return fds

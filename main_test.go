@@ -667,6 +667,29 @@ func TestAuthFDsFromEnv(t *testing.T) {
 			},
 			want: []int{5},
 		},
+		{
+			desc: "negative value is skipped, valid sibling kept",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "-1",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "5",
+			},
+			want: []int{5},
+		},
+		{
+			desc: "stdio fd 2 is skipped, valid sibling kept",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "2",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "5",
+			},
+			want: []int{5},
+		},
+		{
+			desc: "lowest forwardable fd 3 is kept",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "3",
+			},
+			want: []int{3},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
