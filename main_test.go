@@ -652,6 +652,14 @@ func TestAuthFDsFromEnv(t *testing.T) {
 			want: []int{3, 4},
 		},
 		{
+			desc: "empty values are treated as unset",
+			env: map[string]string{
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "",
+				"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     "",
+			},
+			want: nil,
+		},
+		{
 			desc: "non-numeric value is skipped, valid sibling kept",
 			env: map[string]string{
 				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "abc",
@@ -720,23 +728,21 @@ func TestBuildNativeDispatcher(t *testing.T) {
 	builtinCount := len(tools.NewDispatcher().ToolDefs())
 
 	tests := []struct {
-		desc         string
-		argv         func(t *testing.T) []string
-		wantMCPTool  bool
-		wantStderr   string
-		wantNoStderr bool
+		desc        string
+		argv        func(t *testing.T) []string
+		wantMCPTool bool
+		wantStderr  string
 	}{
 		{
-			desc:         "no --mcp-config: builtins only, silent",
-			argv:         func(t *testing.T) []string { return []string{"--model", "m"} },
-			wantNoStderr: true,
+			desc: "no --mcp-config: builtins only, silent",
+			argv: func(t *testing.T) []string { return []string{"--model", "m"} },
 		},
 		{
 			desc: "unreadable --mcp-config: builtins only, warns",
 			argv: func(t *testing.T) []string {
 				return []string{"--mcp-config", filepath.Join(t.TempDir(), "missing.json")}
 			},
-			wantStderr: "mcp tools disabled",
+			wantStderr: "reading config",
 		},
 		{
 			desc: "handshake fails: builtins only, warns",
@@ -750,8 +756,7 @@ func TestBuildNativeDispatcher(t *testing.T) {
 			argv: func(t *testing.T) []string {
 				return writeConfig(t, newServer(t, false).URL)
 			},
-			wantMCPTool:  true,
-			wantNoStderr: true,
+			wantMCPTool: true,
 		},
 	}
 	for _, test := range tests {
@@ -783,7 +788,7 @@ func TestBuildNativeDispatcher(t *testing.T) {
 			if test.wantStderr != "" && !strings.Contains(stderr.String(), test.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), test.wantStderr)
 			}
-			if test.wantNoStderr && stderr.Len() != 0 {
+			if test.wantStderr == "" && stderr.Len() != 0 {
 				t.Errorf("stderr = %q, want empty", stderr.String())
 			}
 		})
@@ -1055,6 +1060,14 @@ func TestRunNative_emptyStdinCleanExit(t *testing.T) {
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty (no input, no output)", stdout.String())
+	}
+	// History is written lazily (first turn), so no turn means no state; any
+	// state that does appear must be under the injected KORTEX_STATE_DIR.
+	if entries, err := os.ReadDir(env["KORTEX_STATE_DIR"]); err == nil && len(entries) != 0 {
+		t.Errorf("unexpected state written with no turns: %v", entries)
 	}
 	for _, suffix := range []string{".native", ".inbound", ".facets", ".conflicts"} {
 		if _, err := os.Stat(logPath + suffix); err != nil {
