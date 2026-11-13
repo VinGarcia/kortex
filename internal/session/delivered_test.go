@@ -15,20 +15,27 @@ import (
 )
 
 // fakeDeliveredFeed returns its queued blocks in order (one per call, "" once
-// exhausted) and records the chat ids it was asked about.
+// exhausted), records the chat ids it was asked about and the commits it got.
+// Each call returns its call number as the offset, so commits identify turns.
 type fakeDeliveredFeed struct {
 	blocks  []string
 	chatIDs []string
+	commits []int64
 }
 
-func (f *fakeDeliveredFeed) Unseen(chatID string) string {
+func (f *fakeDeliveredFeed) Unseen(chatID string) (string, int64, bool) {
 	f.chatIDs = append(f.chatIDs, chatID)
+	offset := int64(len(f.chatIDs))
 	if len(f.blocks) == 0 {
-		return ""
+		return "", offset, true
 	}
 	block := f.blocks[0]
 	f.blocks = f.blocks[1:]
-	return block
+	return block, offset, true
+}
+
+func (f *fakeDeliveredFeed) Commit(nextOffset int64) {
+	f.commits = append(f.commits, nextOffset)
 }
 
 // TestRun_DeliveredFeed proves the "delivered since your last turn" block is
@@ -94,6 +101,9 @@ func TestRun_DeliveredFeed(t *testing.T) {
 	if want := []string{"telegram:-5447333904", "telegram:-5447333904"}; !reflect.DeepEqual(feed.chatIDs, want) {
 		t.Errorf("feed chat ids = %v, want %v", feed.chatIDs, want)
 	}
+	if want := []int64{1, 2}; !reflect.DeepEqual(feed.commits, want) {
+		t.Errorf("commits = %v, want %v (one per successful turn)", feed.commits, want)
+	}
 	if last := withFeed[0][len(withFeed[0])-1]; last.Content != digest+"\n\n"+block {
 		t.Errorf("turn 1 tail = %+v, want digest then delivered block", last.Content)
 	}
@@ -125,5 +135,31 @@ func TestJoinEphemeral(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRun_DeliveredFeedNotCommittedOnFailedTurn proves a turn whose core call
+// fails does not mark its deliveries seen.
+func TestRun_DeliveredFeedNotCommittedOnFailedTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	text := "Conversation info: ⟦openclaw:ctx⟧\n```json\n" + `{"chat_id":"telegram:1"}` + "\n```\n\noi"
+	feed := &fakeDeliveredFeed{blocks: []string{"<delivered_since_last_turn>x</delivered_since_last_turn>"}}
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Stdin:  strings.NewReader(initializeLine("sys") + "\n" + userLine("s", text) + "\n"),
+		Stdout: &out, Client: anthropic.NewClient("secret", server.URL, time.Second), Dispatcher: tools.NewDispatcher(),
+		Store: NewStore(t.TempDir()), SessionID: "s", Model: "m", MaxTokens: 10, NewUUID: seqUUID(), DeliveredFeed: feed,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(feed.chatIDs) != 1 {
+		t.Fatalf("feed asked %d times, want 1", len(feed.chatIDs))
+	}
+	if len(feed.commits) != 0 {
+		t.Errorf("commits = %v, want none after a failed turn", feed.commits)
 	}
 }

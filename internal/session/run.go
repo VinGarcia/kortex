@@ -36,14 +36,17 @@ type TurnEvaluator interface {
 }
 
 // DeliveredFeed is the seam for the ephemeral "delivered since your last turn"
-// block: given the turn's OpenClaw chat_id (e.g. "telegram:-5447333904"), it
-// returns the deliveries background runs made to that chat since this session's
-// previous call, and advances the session's cursor. The block is EPHEMERAL like
-// the tone digest (core call only, never history, never the stream). "" means
-// inject nothing; implementations are fail-open and never fail the turn.
+// block: given the turn's OpenClaw chat_id (e.g. "telegram:-5447333904"),
+// Unseen returns the deliveries background runs made to that chat since the
+// session's last committed cursor, plus the offset to Commit; ok false means
+// nothing to commit. Run commits only after the turn succeeded, so a failed
+// turn re-shows the same deliveries. The block is EPHEMERAL like the tone
+// digest (core call only, never history, never the stream). "" means inject
+// nothing; implementations are fail-open and never fail the turn.
 // delivered.Feed satisfies it structurally. A nil Config.DeliveredFeed skips it.
 type DeliveredFeed interface {
-	Unseen(chatID string) string
+	Unseen(chatID string) (block string, nextOffset int64, ok bool)
+	Commit(nextOffset int64)
 }
 
 // ToneDigester is the facet seam for the ephemeral tone digest: given the
@@ -379,10 +382,15 @@ func Run(ctx context.Context, cfg Config) error {
 			// re-inflating that history (#4803 follow-up). Does not alter userText.
 			warnOnEchoDrift(cfg.Diag, cfg.SessionID, inbound, len(msgs))
 			var turn *history.Turn
-			delivered := deliveredNote(cfg, inbound)
+			delivered, deliveredOffset, deliveredOK := deliveredNote(cfg, inbound)
 			msgs, turn, err = runTurnRecovered(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText, delivered)
 			if err != nil {
 				return err
+			}
+			// Mark the deliveries seen only once the turn that showed them
+			// succeeded; a failed turn (turn == nil) re-shows them next time.
+			if turn != nil && deliveredOK {
+				cfg.DeliveredFeed.Commit(deliveredOffset)
 			}
 			// A failed turn (turn == nil) emitted its error result and left
 			// history unchanged, so there is nothing to accumulate or evaluate.
@@ -559,11 +567,11 @@ func toneDigest(cfg Config, priorUserTexts []string, userText string) string {
 }
 
 // deliveredNote returns the turn's "delivered since your last turn" block for
-// the chat the inbound message came from, or "" when no feed is wired or the
-// message carried no Conversation info (no chat_id to filter the ledger by).
-func deliveredNote(cfg Config, inbound protocol.Inbound) string {
+// the chat the inbound message came from (see DeliveredFeed), or ok false when
+// no feed is wired or the message carried no Conversation info (no chat_id).
+func deliveredNote(cfg Config, inbound protocol.Inbound) (block string, nextOffset int64, ok bool) {
 	if cfg.DeliveredFeed == nil || !inbound.HasInfo || inbound.Info.ChatID == "" {
-		return ""
+		return "", 0, false
 	}
 	return cfg.DeliveredFeed.Unseen(inbound.Info.ChatID)
 }

@@ -117,12 +117,18 @@ package differs — `proxy` versus `session`.
   emits stream-json on stdout, and persists history for cross-process
   resume. It builds the same facets as the proxy path (`buildFacets`) and
   defers the same post-run `WaitInFlight` drain. Its facet seams mirror the
-  proxy's: `session` defines its own `Annotator`, `TurnEvaluator` and
-  `OutputGovernor` ports, satisfied structurally by `facet` (never the
-  reverse), wired by `main`. On the active path the final turn is deferred
+  proxy's: `session` defines its own `Annotator`, `TurnEvaluator`,
+  `OutputGovernor`, `ToneDigester` and `DeliveredFeed` ports, satisfied
+  structurally by `facet`/`delivered` (never the reverse), wired by `main`. On the active path the final turn is deferred
   (`tools` RunLoop `DeferFinal`) so the governor decides the delivered text
   before anything reaches the wire, then re-emitted via
   `StreamEmitter.EmitFinalTurn`.
+- `internal/delivered` — stdlib-only reader of the anti-double-send ledger
+  (`KORTEX_DELIVERED_LOG`) that background runs append to after delivering
+  to a chat. Through `session.DeliveredFeed` it lists, as an ephemeral tail
+  block, what was delivered to the turn's chat since the session's last
+  successful turn (per-session byte cursor, committed only after the turn
+  succeeds). Fail-open: any error injects nothing and is logged to Diag.
 
 Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
 `make lint`): `proxy` may import `protocol` and `history`; `history` may

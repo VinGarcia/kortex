@@ -569,8 +569,12 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 	// persisted history so it survives a cross-process resume.
 	var deliveredFeed session.DeliveredFeed
 	if ledger := getenv("KORTEX_DELIVERED_LOG"); ledger != "" {
-		cursor := filepath.Join(nativeStateDir(getenv), "delivered-cursors", filepath.Base(sessionID))
-		deliveredFeed = delivered.NewFeed(ledger, cursor, nil)
+		if name := filepath.Base(sessionID); name == "." || name == ".." || name == string(filepath.Separator) {
+			fmt.Fprintf(stderr, "kortex: delivered feed disabled: unusable session id %q\n", sessionID)
+		} else {
+			cursor := filepath.Join(nativeStateDir(getenv), "delivered-cursors", name)
+			deliveredFeed = delivered.NewFeed(ledger, cursor, stderr, nil)
+		}
 	}
 
 	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
