@@ -15,6 +15,7 @@ import (
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/config"
+	"github.com/vingarcia/kortex/internal/delivered"
 	"github.com/vingarcia/kortex/internal/facet"
 	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/proxy"
@@ -560,6 +561,18 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		toneDigester = facet.NewToneDigest(0)
 	}
 
+	// KORTEX_DELIVERED_LOG names the anti-double-send ledger background runs
+	// append to after delivering to a chat; when set, each turn's ephemeral tail
+	// lists what was delivered to this chat since the session's previous turn.
+	// Unset disables the feed (the deployment-specific path lives in the
+	// OpenClaw plugin, like KORTEX_LOG). The per-session cursor sits next to the
+	// persisted history so it survives a cross-process resume.
+	var deliveredFeed session.DeliveredFeed
+	if ledger := getenv("KORTEX_DELIVERED_LOG"); ledger != "" {
+		cursor := filepath.Join(nativeStateDir(getenv), "delivered-cursors", filepath.Base(sessionID))
+		deliveredFeed = delivered.NewFeed(ledger, cursor, nil)
+	}
+
 	// A client-level timeout of 0 leaves each turn bounded only by ctx: a
 	// legitimate long generation (a deep tool loop) must not be cut off, and
 	// OpenClaw owns the outer round deadline.
@@ -628,6 +641,7 @@ func runNative(argv []string, getenv func(string) string, stdin io.Reader, stdou
 		TurnEvaluator:           turnEvaluator,
 		Governor:                governor,
 		ToneDigester:            toneDigester,
+		DeliveredFeed:           deliveredFeed,
 		InboundTap:              inboundTap,
 		IsTerminalTool:          isTerminalTool,
 	})

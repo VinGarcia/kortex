@@ -35,6 +35,17 @@ type TurnEvaluator interface {
 	EvaluateCompletedTurn(turnIndex int, snapshot history.Snapshot)
 }
 
+// DeliveredFeed is the seam for the ephemeral "delivered since your last turn"
+// block: given the turn's OpenClaw chat_id (e.g. "telegram:-5447333904"), it
+// returns the deliveries background runs made to that chat since this session's
+// previous call, and advances the session's cursor. The block is EPHEMERAL like
+// the tone digest (core call only, never history, never the stream). "" means
+// inject nothing; implementations are fail-open and never fail the turn.
+// delivered.Feed satisfies it structurally. A nil Config.DeliveredFeed skips it.
+type DeliveredFeed interface {
+	Unseen(chatID string) string
+}
+
 // ToneDigester is the facet seam for the ephemeral tone digest: given the
 // session's user messages (each already carrying the input annotator's
 // `[emoções pN]` lines, oldest first, the current turn's message last), it
@@ -258,6 +269,10 @@ type Config struct {
 	// user messages in, a bounded digest block out). Nil skips the digest, leaving
 	// the core context unchanged. The digest never enters canonical history.
 	ToneDigester ToneDigester
+	// DeliveredFeed, when non-nil, supplies the ephemeral "delivered since your
+	// last turn" block, appended after the tone digest in the core's ephemeral
+	// tail. Nil skips it. It never enters canonical history or the governor.
+	DeliveredFeed DeliveredFeed
 	// Governor, when non-nil, puts the session on the active-superego path: the
 	// final turn is deferred (RunLoop DeferFinal), the governor decides the text
 	// to deliver, and the delivered text — not the core's raw draft — is emitted
@@ -364,7 +379,8 @@ func Run(ctx context.Context, cfg Config) error {
 			// re-inflating that history (#4803 follow-up). Does not alter userText.
 			warnOnEchoDrift(cfg.Diag, cfg.SessionID, inbound, len(msgs))
 			var turn *history.Turn
-			msgs, turn, err = runTurnRecovered(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText)
+			delivered := deliveredNote(cfg, inbound)
+			msgs, turn, err = runTurnRecovered(ctx, cfg, emitter, systemPrompt, msgs, turns, priorUserTexts, userText, delivered)
 			if err != nil {
 				return err
 			}
@@ -409,6 +425,7 @@ func runTurn(
 	priorTurns []history.Turn,
 	priorUserTexts []string,
 	userText string,
+	delivered string,
 ) ([]anthropic.Message, *history.Turn, error) {
 	// Prune stale thinking/redacted_thinking blocks out of the history this
 	// turn is about to re-send. msgs is, by construction, the full set of
@@ -453,7 +470,7 @@ func runTurn(
 		// be kept alive on the wire exactly like the ladder's silent span.
 		KeepaliveInterval: cfg.GovernKeepaliveInterval,
 		Emitter:           emitter,
-		EphemeralContext:  digest,
+		EphemeralContext:  joinEphemeral(digest, delivered),
 		IsTerminalTool:    cfg.IsTerminalTool,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
@@ -539,6 +556,29 @@ func toneDigest(cfg Config, priorUserTexts []string, userText string) string {
 	userTexts = append(userTexts, priorUserTexts...)
 	userTexts = append(userTexts, userText)
 	return cfg.ToneDigester.Digest(userTexts)
+}
+
+// deliveredNote returns the turn's "delivered since your last turn" block for
+// the chat the inbound message came from, or "" when no feed is wired or the
+// message carried no Conversation info (no chat_id to filter the ledger by).
+func deliveredNote(cfg Config, inbound protocol.Inbound) string {
+	if cfg.DeliveredFeed == nil || !inbound.HasInfo || inbound.Info.ChatID == "" {
+		return ""
+	}
+	return cfg.DeliveredFeed.Unseen(inbound.Info.ChatID)
+}
+
+// joinEphemeral combines the turn's ephemeral blocks into the single
+// EphemeralContext string, skipping empty ones, so a turn with neither block
+// sends no ephemeral tail at all (byte-identical to the no-feed path).
+func joinEphemeral(blocks ...string) string {
+	nonEmpty := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block != "" {
+			nonEmpty = append(nonEmpty, block)
+		}
+	}
+	return strings.Join(nonEmpty, "\n\n")
 }
 
 // toolCallsFromMessages derives this turn's tool calls from the native message

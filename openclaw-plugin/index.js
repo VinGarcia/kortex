@@ -17,6 +17,9 @@ const require = createRequire(import.meta.url);
 const KORTEX_CONFIG_PATH =
   "/home/vingarcia/projects/sylphie/kortex/canary-config.json";
 const KORTEX_LOG_PATH = "/home/vingarcia/.openclaw/kortex/kortex.log";
+// Anti-double-send ledger written by sylphie's finish-run (see
+// internal/delivered): kortex injects what it delivered since the last turn.
+const KORTEX_DELIVERED_LOG_PATH = "/home/vingarcia/projects/sylphie/log/delivered.log";
 const KORTEX_TOKEN_PATH =
   "/home/vingarcia/.openclaw/secrets/kortex-setup-token";
 
@@ -34,6 +37,7 @@ function kortexEnv() {
     return {
       KORTEX_CONFIG: KORTEX_CONFIG_PATH,
       KORTEX_LOG: KORTEX_LOG_PATH,
+      KORTEX_DELIVERED_LOG: KORTEX_DELIVERED_LOG_PATH,
       KORTEX_STREAM_EMITTER: "1",
       KORTEX_TOKEN_FILE: KORTEX_TOKEN_PATH,
       CODECOMPANION_OAUTH_TOKEN: token,

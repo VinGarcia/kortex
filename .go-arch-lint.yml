@@ -35,6 +35,11 @@ components:
   # turn, persists history for cross-process resume, and emits stream-json.
   session:
     in: internal/session
+  # Native "delivered since your last turn" feed: reads the anti-double-send
+  # ledger and keeps a per-session cursor. Stdlib only; main wires it into
+  # session through session.DeliveredFeed.
+  delivered:
+    in: internal/delivered
   # Live-smoke driver for RunLoop (F3b caveat): runs the tool-loop against the
   # real Messages API. A hack/ entrypoint, so it wires the client + builtins
   # the same way main does.
@@ -46,6 +51,7 @@ deps:
       - krest
   main:
     mayDependOn:
+      - delivered
       - proxy
       - facet
       - config

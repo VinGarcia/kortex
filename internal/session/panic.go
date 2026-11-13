@@ -53,6 +53,7 @@ func runTurnRecovered(
 	priorTurns []history.Turn,
 	priorUserTexts []string,
 	userText string,
+	delivered string,
 ) (outMsgs []anthropic.Message, outTurn *history.Turn, err error) {
 	resultsBefore := emitter.ResultCount()
 	defer func() {
@@ -61,7 +62,7 @@ func runTurnRecovered(
 			outMsgs, outTurn, err = msgs, nil, closeRoundAfterPanic(cfg, emitter, resultsBefore, NewPanicError(r))
 		}
 	}()
-	return runTurn(ctx, cfg, emitter, systemPrompt, msgs, priorTurns, priorUserTexts, userText)
+	return runTurn(ctx, cfg, emitter, systemPrompt, msgs, priorTurns, priorUserTexts, userText, delivered)
 }
 
 // closeRoundAfterPanic ends the round of a turn that panicked. It emits the
