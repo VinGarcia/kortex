@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -405,6 +406,8 @@ func TestCreateMessage_errors(t *testing.T) {
 			defer server.Close()
 
 			client := NewClient("t", server.URL, time.Second)
+			// The 529 case is retried; keep its backoff out of the test's runtime.
+			client.retryBaseDelay, client.retryMaxDelay = time.Millisecond, time.Millisecond
 			_, err := client.CreateMessage(context.Background(), MessageRequest{Model: "m", MaxTokens: 10, Messages: []Message{{Role: "user", Content: "x"}}})
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) {
@@ -431,6 +434,151 @@ func TestCreateMessage_contextTimeout(t *testing.T) {
 	_, err := client.CreateMessage(ctx, MessageRequest{Model: "m", MaxTokens: 10, Messages: []Message{{Role: "user", Content: "x"}}})
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want deadline exceeded, got %v", err)
+	}
+}
+
+func TestCreateMessage_retry(t *testing.T) {
+	// fakeAnswer is what the server does on one attempt: hang up without an
+	// HTTP response, or answer status with header and an error body.
+	type fakeAnswer struct {
+		hangUp bool
+		status int
+		header map[string]string
+	}
+	overloaded := fakeAnswer{status: 529}
+	ok := fakeAnswer{status: http.StatusOK}
+	tests := []struct {
+		desc         string
+		answers      []fakeAnswer
+		wantAttempts int
+		wantStatus   int // 0 means the call must succeed
+	}{
+		{
+			desc:         "529 overloaded then success is retried transparently",
+			answers:      []fakeAnswer{overloaded, ok},
+			wantAttempts: 2,
+		},
+		{
+			desc:         "dropped connection then success is retried transparently",
+			answers:      []fakeAnswer{{hangUp: true}, ok},
+			wantAttempts: 2,
+		},
+		{
+			desc:         "429 with anthropic rate-limit headers is retried",
+			answers:      []fakeAnswer{{status: 429, header: map[string]string{"anthropic-ratelimit-requests-remaining": "0"}}, ok},
+			wantAttempts: 2,
+		},
+		{
+			desc:         "429 with retry-after is retried",
+			answers:      []fakeAnswer{{status: 429, header: map[string]string{"retry-after": "1"}}, ok},
+			wantAttempts: 2,
+		},
+		{
+			desc:         "header-less 429 (OAuth preamble policy rejection) is not retried",
+			answers:      []fakeAnswer{{status: 429}, ok},
+			wantAttempts: 1,
+			wantStatus:   429,
+		},
+		{
+			desc:         "4xx client error is not retried",
+			answers:      []fakeAnswer{{status: 400}, ok},
+			wantAttempts: 1,
+			wantStatus:   400,
+		},
+		{
+			desc:         "persistent 529 gives up after max attempts",
+			answers:      []fakeAnswer{overloaded, overloaded, overloaded, ok},
+			wantAttempts: 3,
+			wantStatus:   529,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				answer := test.answers[attempts.Add(1)-1]
+				if answer.hangUp {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Errorf("hijacking connection: %v", err)
+						return
+					}
+					conn.Close()
+					return
+				}
+				for name, value := range answer.header {
+					w.Header().Set(name, value)
+				}
+				w.WriteHeader(answer.status)
+				if answer.status == http.StatusOK {
+					w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
+					return
+				}
+				w.Write([]byte(`{"type":"error","error":{"type":"some_error","message":"nope"}}`))
+			}))
+			defer server.Close()
+
+			client := NewClient("t", server.URL, time.Second)
+			client.retryBaseDelay, client.retryMaxDelay = time.Millisecond, time.Millisecond
+			resp, err := client.CreateMessage(context.Background(), MessageRequest{Model: "m", MaxTokens: 10, Messages: []Message{{Role: "user", Content: "x"}}})
+
+			if got := int(attempts.Load()); got != test.wantAttempts {
+				t.Errorf("attempts: got %d, want %d", got, test.wantAttempts)
+			}
+			if test.wantStatus == 0 {
+				if err != nil || resp.Text != "ok" {
+					t.Fatalf("want success with text ok, got resp=%+v err=%v", resp, err)
+				}
+				return
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != test.wantStatus || apiErr.Message != "nope" {
+				t.Fatalf("want *APIError status %d, got %v", test.wantStatus, err)
+			}
+		})
+	}
+}
+
+// cancelOnRetryLog is a wire log that cancels a context the moment the client
+// logs that it is retrying, i.e. right before it starts the backoff wait.
+type cancelOnRetryLog struct {
+	cancel context.CancelFunc
+}
+
+func (l cancelOnRetryLog) Write(line []byte) (int, error) {
+	if strings.Contains(string(line), " retrying ") {
+		l.cancel()
+	}
+	return len(line), nil
+}
+
+func TestCreateMessage_retryStopsOnContextCancel(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(529)
+	}))
+	defer server.Close()
+
+	client := NewClient("t", server.URL, time.Second)
+	// A backoff far longer than the test: only the cancel can end the wait.
+	client.retryBaseDelay, client.retryMaxDelay = time.Minute, time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.SetWireLog(cancelOnRetryLog{cancel: cancel})
+
+	start := time.Now()
+	_, err := client.CreateMessage(ctx, MessageRequest{Model: "m", MaxTokens: 10, Messages: []Message{{Role: "user", Content: "x"}}})
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("cancel did not cut the backoff short: took %v", elapsed)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts: got %d, want 1", got)
+	}
+	var apiErr *APIError
+	if !errors.Is(err, context.Canceled) || !errors.As(err, &apiErr) || apiErr.Status != 529 {
+		t.Fatalf("want context.Canceled wrapping the last 529, got %v", err)
 	}
 }
 

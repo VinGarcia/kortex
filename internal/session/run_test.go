@@ -664,10 +664,10 @@ func TestRun_ToneDigestInjectedButNotPersisted(t *testing.T) {
 }
 
 func TestRun_TurnErrorEmitsResultAndContinues(t *testing.T) {
-	// A server that 500s fails the Messages call, so RunLoop errors; the session
+	// A server that 400s (not retried) fails the Messages call, so RunLoop errors; the session
 	// must still emit a terminal error result and keep reading the next turn.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
+		http.Error(w, "boom", http.StatusBadRequest)
 	}))
 	defer server.Close()
 	client := anthropic.NewClient("secret", server.URL, time.Second)

@@ -2,6 +2,11 @@ version: 3
 allow:
   depOnAnyVendor: false
   deepScan: false
+# Third-party modules a component may import (depOnAnyVendor is off).
+vendors:
+  # HTTP transport with bounded retry/backoff for the Messages API client.
+  krest:
+    in: github.com/vingarcia/krest
 components:
   main:
     in: .
@@ -36,6 +41,9 @@ components:
   loopsmoke:
     in: hack/loopsmoke
 deps:
+  anthropic:
+    canUse:
+      - krest
   main:
     mayDependOn:
       - proxy

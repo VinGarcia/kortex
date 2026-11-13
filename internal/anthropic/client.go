@@ -5,15 +5,17 @@
 package anthropic
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vingarcia/krest"
 )
 
 const (
@@ -23,13 +25,29 @@ const (
 	// oauthBeta is the beta header value that makes the API accept
 	// subscription OAuth Bearer tokens instead of x-api-key.
 	oauthBeta = "oauth-2025-04-20"
+
+	// maxResponseBytes caps a success body so a misbehaving endpoint cannot
+	// balloon memory; real responses are a few KB to a few hundred KB of JSON.
+	maxResponseBytes = 4 << 20
+
+	// The retry budget is small on purpose: it rides out a transient 529
+	// overload or a dropped connection, while a persistent outage still fails
+	// within a few seconds instead of stalling the turn.
+	defaultMaxAttempts    = 3
+	defaultRetryBaseDelay = 1 * time.Second
+	defaultRetryMaxDelay  = 8 * time.Second
 )
 
 // Client calls the Messages API. Construct with NewClient.
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
+	baseURL string
+	token   string
+	rest    *krest.Client
+	// maxAttempts counts the first try; the delays bound krest's exponential
+	// backoff between attempts. Fixed by NewClient; tests shrink the delays.
+	maxAttempts    int
+	retryBaseDelay time.Duration
+	retryMaxDelay  time.Duration
 	// wireLog, when non-nil, receives a line-oriented copy of every request and
 	// response body for debugging (see SetWireLog). wireMu serializes those
 	// writes so concurrent callers never interleave a line.
@@ -43,16 +61,20 @@ type Client struct {
 
 // NewClient builds a client holding the OAuth token. baseURL "" means the
 // real Anthropic API; tests point it at a local server. timeout bounds each
-// whole HTTP call (callers can bound tighter per-call via context); 0 means
-// no client-level timeout.
+// HTTP attempt (a retried call may take up to maxAttempts of them plus the
+// backoff; callers bound the whole call via context); 0 means no client-level
+// timeout.
 func NewClient(token string, baseURL string, timeout time.Duration) *Client {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
 	return &Client{
-		baseURL:    strings.TrimSuffix(baseURL, "/"),
-		token:      token,
-		httpClient: &http.Client{Timeout: timeout},
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		token:          token,
+		rest:           krest.New(timeout),
+		maxAttempts:    defaultMaxAttempts,
+		retryBaseDelay: defaultRetryBaseDelay,
+		retryMaxDelay:  defaultRetryMaxDelay,
 	}
 }
 
@@ -404,38 +426,78 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 	}
 	c.logWire("request", body)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+messagesPath, bytes.NewReader(body))
-	if err != nil {
-		return MessageResponse{}, fmt.Errorf("anthropic: building request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
-	httpReq.Header.Set("anthropic-beta", oauthBeta)
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
+	// retried collects the responses of attempts krest discarded to retry: it
+	// leaves their bodies open, so close them here to release the connections.
+	var retried []*http.Response
+	defer func() {
+		for _, r := range retried {
+			r.Body.Close()
+		}
+	}()
+	attempts := 0
+	resp, err := c.rest.Post(ctx, c.baseURL+messagesPath, krest.RequestData{
+		// Pre-marshaled bytes (not the struct) so the wire log above shows the
+		// exact payload, and so krest can replay it on every attempt.
+		Body: body,
+		Headers: map[string]any{
+			"Content-Type":      "application/json",
+			"Authorization":     "Bearer " + c.token,
+			"anthropic-version": anthropicVersion,
+			"anthropic-beta":    oauthBeta,
+		},
+		MaxRetries:     c.maxAttempts,
+		BaseRetryDelay: c.retryBaseDelay,
+		MaxRetryDelay:  c.retryMaxDelay,
+		RetryRule: func(attempt *http.Response, err error) bool {
+			// Declining the final attempt changes nothing for krest (it stops
+			// there anyway) but keeps that response out of retried and the log.
+			attempts++
+			if attempts >= c.maxAttempts || !isRetryable(ctx, attempt, err) {
+				return false
+			}
+			if attempt != nil {
+				retried = append(retried, attempt)
+				c.logWire("retrying", fmt.Appendf(nil, "after http %d", attempt.StatusCode))
+			} else {
+				c.logWire("retrying", fmt.Appendf(nil, "after %v", err))
+			}
+			return true
+		},
+		// Stream hands the success body over unread so the size cap below
+		// applies; krest still buffers non-2xx bodies into resp.Body.
+		Stream: true,
+	})
+	if resp.StatusCode == 0 {
+		if ctx.Err() != nil && !errors.Is(err, ctx.Err()) {
+			// A transport failure was followed by a cancel during the backoff
+			// wait: surface the cancellation, as the non-2xx branch below does.
+			return MessageResponse{}, fmt.Errorf("anthropic: request failed: %w; last attempt: %w", ctx.Err(), err)
+		}
 		return MessageResponse{}, fmt.Errorf("anthropic: request failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	// The cap keeps a misbehaving endpoint from ballooning memory; real
-	// annotator responses are a few KB of JSON tags.
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logWire("response", resp.Body)
+		apiErr := &APIError{Status: resp.StatusCode}
+		var we wireError
+		if json.Unmarshal(resp.Body, &we) == nil {
+			apiErr.Type = we.Error.Type
+			apiErr.Message = we.Error.Message
+		}
+		if ctx.Err() != nil {
+			// The context ended during a backoff wait: report the cancellation
+			// first, keeping the last API answer reachable via errors.As.
+			return MessageResponse{}, fmt.Errorf("anthropic: request failed: %w; last answer: %w", ctx.Err(), apiErr)
+		}
+		return MessageResponse{}, apiErr
+	}
+	defer resp.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp, maxResponseBytes))
 	if err != nil {
 		return MessageResponse{}, fmt.Errorf("anthropic: reading response: %w", err)
 	}
 	c.logWire("response", respBody)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		apiErr := &APIError{Status: resp.StatusCode}
-		var we wireError
-		if json.Unmarshal(respBody, &we) == nil {
-			apiErr.Type = we.Error.Type
-			apiErr.Message = we.Error.Message
-		}
-		return MessageResponse{}, apiErr
-	}
 
 	var wr wireResponse
 	if err := json.Unmarshal(respBody, &wr); err != nil {
@@ -467,6 +529,38 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 		StopReason: wr.StopReason,
 		Usage:      wr.Usage,
 	}, nil
+}
+
+// isRetryable is the RetryRule for one attempt. It retries transport failures,
+// 5xx (529 overloaded included) and genuine rate limits, and nothing once ctx
+// is done. A 429 counts as genuine only when it carries rate-limit headers: the
+// OAuth policy rejection (see claudeCodePreamble) is a bare 429 with none, and
+// retrying it would just repeat the same rejection.
+func isRetryable(ctx context.Context, resp *http.Response, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return hasRateLimitHeaders(resp.Header)
+	}
+	return resp.StatusCode >= 500
+}
+
+// hasRateLimitHeaders reports whether h carries the headers Anthropic attaches
+// to a real rate-limit answer: retry-after or any anthropic-ratelimit-* field.
+func hasRateLimitHeaders(h http.Header) bool {
+	if h.Get("Retry-After") != "" {
+		return true
+	}
+	for name := range h {
+		if strings.HasPrefix(strings.ToLower(name), "anthropic-ratelimit-") {
+			return true
+		}
+	}
+	return false
 }
 
 // observeCache runs the cache watchdog over one successful response. It is

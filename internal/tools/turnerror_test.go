@@ -27,7 +27,7 @@ func TestRunLoop_ErrorKinds(t *testing.T) {
 		{
 			desc: "upstream http error",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				http.Error(w, "boom", http.StatusInternalServerError)
+				http.Error(w, "boom", http.StatusBadRequest)
 			},
 			wantKind: KindUpstreamAPI,
 		},
@@ -89,7 +89,7 @@ func TestRunLoop_ErrorKinds(t *testing.T) {
 
 func TestRunLoop_UpstreamErrorKeepsAPIErrorChain(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
+		http.Error(w, "boom", http.StatusBadRequest)
 	}))
 	defer server.Close()
 	client := anthropic.NewClient("secret-token", server.URL, time.Second)
@@ -145,7 +145,7 @@ const (
 	stepThinkingEnd = `{"content":[{"type":"thinking","thinking":"","signature":"s"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 	stepNoContent   = `{"content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 	stepHang        = "HANG"
-	stepHTTP500     = "HTTP500"
+	stepHTTP400     = "HTTP400"
 )
 
 // scriptedServer answers call N with steps[N-1] (the last step repeats). A
@@ -163,8 +163,8 @@ func scriptedServer(t *testing.T, steps []string) *httptest.Server {
 			case <-r.Context().Done():
 			case <-teardown:
 			}
-		case stepHTTP500:
-			http.Error(w, "boom", http.StatusInternalServerError)
+		case stepHTTP400:
+			http.Error(w, "boom", http.StatusBadRequest)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(step))
@@ -203,7 +203,7 @@ func TestRunLoop_ErrorTextAndKindPerSite(t *testing.T) {
 		},
 		{
 			desc:       "finalize call upstream error",
-			steps:      []string{stepToolUse, stepHTTP500},
+			steps:      []string{stepToolUse, stepHTTP400},
 			req:        LoopRequest{MaxTurns: 1, FinalizeOnBudget: true},
 			wantKind:   KindUpstreamAPI,
 			wantPrefix: "tools: tool-loop finalize call: ",
@@ -224,7 +224,7 @@ func TestRunLoop_ErrorTextAndKindPerSite(t *testing.T) {
 		},
 		{
 			desc:       "recovery call upstream error (cause prefix)",
-			steps:      []string{stepToolUse, stepThinkingEnd, stepHTTP500},
+			steps:      []string{stepToolUse, stepThinkingEnd, stepHTTP400},
 			req:        LoopRequest{},
 			wantKind:   KindUpstreamAPI,
 			wantPrefix: "tools: tool-loop turn 2: empty-reply recovery call: ",
@@ -245,7 +245,7 @@ func TestRunLoop_ErrorTextAndKindPerSite(t *testing.T) {
 		},
 		{
 			desc:       "upstream error on first call",
-			steps:      []string{stepHTTP500},
+			steps:      []string{stepHTTP400},
 			req:        LoopRequest{},
 			wantKind:   KindUpstreamAPI,
 			wantPrefix: "tools: tool-loop turn 1: ",

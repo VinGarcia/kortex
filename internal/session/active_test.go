@@ -646,9 +646,9 @@ func TestRun_ActiveGovernorRedraftToolErrorFallsBackToText(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, endTurnDraftBody)
 		case 2:
-			// The redraft tool loop's first call fails (not a deadline) -> RunLoop
+			// The redraft tool loop's first call fails with a non-retried 400 (not a deadline) -> RunLoop
 			// errors -> the closure falls back to the text-only redraft.
-			http.Error(w, "boom", http.StatusInternalServerError)
+			http.Error(w, "boom", http.StatusBadRequest)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, endTurnTextBody("fallback-reworded"))
