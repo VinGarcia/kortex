@@ -446,3 +446,49 @@ func TestCreateMessage_malformedSuccessBody(t *testing.T) {
 		t.Fatalf("want decoding error, got %v", err)
 	}
 }
+
+func TestCreateMessage_effortPerModel(t *testing.T) {
+	tests := []struct {
+		name       string
+		model      string
+		effort     string
+		wantEffort string // "" means output_config must be absent
+	}{
+		{name: "fable forwards effort", model: "claude-fable-5-1", effort: "medium", wantEffort: "medium"},
+		{name: "opus forwards effort", model: "claude-opus-5-5", effort: "low", wantEffort: "low"},
+		{name: "haiku drops effort (API rejects it)", model: "claude-haiku-4-5-20251001", effort: "medium", wantEffort: ""},
+		{name: "empty effort omits output_config", model: "claude-fable-5-1", effort: "", wantEffort: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Errorf("decoding request body: %v", err)
+				}
+				w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}}`))
+			}))
+			defer server.Close()
+
+			client := NewClient("tok", server.URL, time.Second)
+			_, err := client.CreateMessage(context.Background(), MessageRequest{
+				Model: test.model, MaxTokens: 10, Effort: test.effort,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oc, present := gotBody["output_config"]
+			if test.wantEffort == "" {
+				if present {
+					t.Fatalf("output_config = %v, want absent", oc)
+				}
+				return
+			}
+			got, _ := oc.(map[string]any)["effort"].(string)
+			if got != test.wantEffort {
+				t.Errorf("output_config.effort = %q, want %q", got, test.wantEffort)
+			}
+		})
+	}
+}

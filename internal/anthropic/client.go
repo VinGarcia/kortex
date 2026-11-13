@@ -164,7 +164,8 @@ type MessageRequest struct {
 	Tools         []ToolDef
 	// Effort selects output_config.effort ("low".."max"), which bounds how deeply
 	// a thinking model reasons before it answers. "" omits output_config so the
-	// API applies its default ("high"). It matters for the canary core model
+	// API applies its default ("high"); it is also omitted for a model whose
+	// traits say it rejects the knob (see modelTraits.SupportsEffort). It matters for the canary core model
 	// (fable): thinking is always on there, so at high effort a small MaxTokens
 	// can be spent entirely on thinking, leaving zero text — the empty-final-turn
 	// failure this field (wired from the spawn's --effort) guards against.
@@ -323,19 +324,6 @@ type wireError struct {
 // in the following block.
 const claudeCodePreamble = "You are Claude Code, Anthropic's official CLI for Claude."
 
-// minCacheableTokens is the smallest system prefix the Messages API will
-// actually cache for a model. A cache_control breakpoint on a shorter prefix is
-// ignored silently — no error, no caching — so marking below this floor is
-// pointless. Haiku 4.5's floor is 4096 tokens; every other model this client
-// targets (opus-4-8, sonnet, fable-5) sits at or below 1024, so 1024 is the
-// safe default that never marks below a model's real floor.
-func minCacheableTokens(model string) int {
-	if strings.Contains(model, "haiku") {
-		return 4096
-	}
-	return 1024
-}
-
 // markStableSystemPrefix places one ephemeral cache breakpoint at the END of
 // the stable system prefix (the last system block), so the whole turn-invariant
 // system — the Claude Code preamble plus the caller's prompt — is cached once
@@ -407,7 +395,7 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (Message
 		Messages:  messages,
 		Tools:     req.Tools,
 	}
-	if req.Effort != "" {
+	if req.Effort != "" && traitsFor(req.Model).SupportsEffort {
 		wire.OutputConfig = &outputConfig{Effort: req.Effort}
 	}
 	body, err := json.Marshal(wire)
