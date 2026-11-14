@@ -83,11 +83,11 @@ func (e *Executor) runSpawn(ctx context.Context, rawInput json.RawMessage) (outp
 		return fmt.Sprintf("error: %s: %s", gatewaySpawnTool, raw), true
 	}
 
-	runID, sessionKey, err := parseSpawnResult(raw)
+	runID, sessionKey, idNotRunID, err := parseSpawnResult(raw)
 	if err != nil {
 		return fmt.Sprintf("error: %v", err), true
 	}
-	e.registry.put(runID, subagentRecord{sessionKey: sessionKey, label: input.Label})
+	e.registry.put(runID, subagentRecord{sessionKey: sessionKey, label: input.Label, idNotRunID: idNotRunID})
 
 	wait := true
 	if input.Wait != nil {
@@ -121,7 +121,7 @@ func (e *Executor) runSpawn(ctx context.Context, rawInput json.RawMessage) (outp
 // request shape is confirmed from the gateway's published schema, but this
 // response shape is not, so several plausible field names are tried rather
 // than one assumed.
-func parseSpawnResult(raw string) (runID string, sessionKey string, err error) {
+func parseSpawnResult(raw string) (runID string, sessionKey string, idNotRunID bool, err error) {
 	var fields struct {
 		TaskID          string `json:"taskId"`
 		ID              string `json:"id"`
@@ -131,15 +131,17 @@ func parseSpawnResult(raw string) (runID string, sessionKey string, err error) {
 		SessionID       string `json:"sessionId"`
 	}
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
-		return "", "", fmt.Errorf("sessions_spawn returned a result spawn_subagent cannot parse (wanted a JSON object with a run/task id and a session key, got %.200q): %w — this needs a live smoke to confirm the real response shape (see package doc)", raw, err)
+		return "", "", false, fmt.Errorf("sessions_spawn returned a result spawn_subagent cannot parse (wanted a JSON object with a run/task id and a session key, got %.200q): %w — this needs a live smoke to confirm the real response shape (see package doc)", raw, err)
 	}
-	runID = firstNonEmpty(fields.TaskID, fields.RunID, fields.ID)
+	// runId first: the subagents list that wait polls is keyed by runId.
+	runID = firstNonEmpty(fields.RunID, fields.TaskID, fields.ID)
+	idNotRunID = fields.RunID == ""
 	sessionKey = firstNonEmpty(fields.ChildSessionKey, fields.SessionKey, fields.SessionID)
 	if runID == "" {
-		return "", "", fmt.Errorf("sessions_spawn result had no recognizable run/task id field (taskId/runId/id); raw=%.200q — this needs a live smoke to confirm the real response shape (see package doc)", raw)
+		return "", "", false, fmt.Errorf("sessions_spawn result had no recognizable run/task id field (taskId/runId/id); raw=%.200q — this needs a live smoke to confirm the real response shape (see package doc)", raw)
 	}
 	if sessionKey == "" {
-		return "", "", fmt.Errorf("sessions_spawn result had no recognizable session-key field (sessionKey/childSessionKey/sessionId); raw=%.200q — this needs a live smoke to confirm the real response shape (see package doc)", raw)
+		return "", "", false, fmt.Errorf("sessions_spawn result had no recognizable session-key field (sessionKey/childSessionKey/sessionId); raw=%.200q — this needs a live smoke to confirm the real response shape (see package doc)", raw)
 	}
-	return runID, sessionKey, nil
+	return runID, sessionKey, idNotRunID, nil
 }

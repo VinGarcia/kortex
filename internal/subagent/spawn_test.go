@@ -167,7 +167,7 @@ func TestParseSpawnResult(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runID, sessionKey, err := parseSpawnResult(tc.raw)
+			runID, sessionKey, _, err := parseSpawnResult(tc.raw)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}

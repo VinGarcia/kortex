@@ -71,10 +71,11 @@ type Executor struct {
 	mcp      mcpCaller
 	registry *registry
 
-	// listPollInterval, notFoundPolls and maxListFailures tune waitForAll
+	// listPollInterval, notFoundPolls, notFoundGrace and maxListFailures tune waitForAll
 	// (see the default* constants in wait.go); tests shrink listPollInterval.
 	listPollInterval time.Duration
 	notFoundPolls    int
+	notFoundGrace    time.Duration
 	maxListFailures  int
 }
 
@@ -85,6 +86,7 @@ func NewExecutor(mcpClient mcpCaller) *Executor {
 		registry:         newRegistry(),
 		listPollInterval: defaultListPollInterval,
 		notFoundPolls:    defaultNotFoundPolls,
+		notFoundGrace:    defaultNotFoundGrace,
 		maxListFailures:  defaultMaxListFailures,
 	}
 }

@@ -7,6 +7,10 @@ import "sync"
 type subagentRecord struct {
 	sessionKey string
 	label      string
+	// idNotRunID is true when the spawn result carried no runId and the id
+	// came from taskId/id instead; the subagents list is keyed by runId, so
+	// such an id may never match (see Executor.notFoundMessage).
+	idNotRunID bool
 }
 
 // registry maps a spawn_subagent call's runID to the child's gateway session

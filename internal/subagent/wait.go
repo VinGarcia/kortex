@@ -26,14 +26,22 @@ const defaultWaitTimeoutSeconds = 1800
 // entries, so polling it keyed by runId needs no runId->taskId mapping.
 const defaultListPollInterval = 3 * time.Second
 
-// defaultNotFoundPolls is how many consecutive polls may omit a run id from
-// both active[] and recent[] before waitForAll gives up on that id as "not
-// found" instead of waiting out the full timeout (e.g. a mistyped id).
+// defaultNotFoundPolls is how many consecutive polls may omit a NEVER-SEEN
+// run id from both active[] and recent[] before waitForAll gives up on that
+// id as "not found" instead of waiting out the full timeout (e.g. a mistyped
+// id). It applies together with defaultNotFoundGrace: both must be exceeded.
 const defaultNotFoundPolls = 2
 
+// defaultNotFoundGrace is the minimum time since the wait started before a
+// never-seen id may be declared not found. Right after sessions_spawn the
+// child may not be listed yet, and a couple of 3s polls are too short a
+// window for that.
+const defaultNotFoundGrace = 15 * time.Second
+
 // defaultMaxListFailures is how many consecutive failed list polls (call
-// error, tool error, or undecodable response) waitForAll tolerates before
-// giving up and returning whatever it already gathered.
+// error, tool error, or undecodable response) waitForAll tolerates: the next
+// failure after that (the N+1th in a row) makes it give up and return
+// whatever it already gathered.
 const defaultMaxListFailures = 3
 
 // stateFinished is the gateway's execution.state value for a run that has
@@ -195,19 +203,29 @@ func (e *Executor) pollList(ctx context.Context) (map[string]listEntry, error) {
 // until every one is finished, found missing, or timeoutSeconds elapse, then
 // fetches each finished id's final report via sessions_history. It is
 // ctx-aware: a cancelled ctx stops the loop before the next poll and returns
-// (nil, err).
+// (nil, err). One last poll runs after the deadline, so a run that finished
+// during the final sleep is not misreported as a timeout.
 //
-// An id absent from both lists for e.notFoundPolls consecutive polls is
-// reported with Status "not_found" rather than waited out. Up to
-// e.maxListFailures consecutive failed polls are tolerated; past that,
-// waitForAll returns the results gathered so far (finished ids with their
-// reports, the rest marked unknown) TOGETHER with the error. Shared by
-// wait_subagents and spawn_subagent's wait=true path.
+// Missing ids: an id NEVER seen in a list is reported "not_found" once it
+// has been absent for e.notFoundPolls consecutive polls AND e.notFoundGrace
+// has passed since the wait started (the child may not be listed right after
+// spawn). An id that WAS seen and later drops out of the lists (gateway
+// restart, list pruning) is NOT declared not found: waitForAll keeps waiting
+// for it until the timeout (whose message says it vanished), because it may
+// reappear and its report is only fetchable once it is seen finished.
+//
+// Failures: e.maxListFailures consecutive failed polls are tolerated; one
+// more makes waitForAll return the results gathered so far (finished ids
+// with their reports, the rest marked unknown) TOGETHER with the error.
+// Shared by wait_subagents and spawn_subagent's wait=true path.
 func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds int) (map[string]subagentStatus, error) {
-	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+	start := time.Now()
+	deadline := start.Add(time.Duration(timeoutSeconds) * time.Second)
 	remaining := append([]string(nil), ids...)
 	results := make(map[string]subagentStatus, len(ids))
+	seen := make(map[string]bool, len(ids))
 	absent := make(map[string]int, len(ids))
+	vanished := make(map[string]bool, len(ids))
 	lastState := make(map[string]string, len(ids))
 	failures := 0
 	var giveUpErr error
@@ -216,9 +234,6 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("%s: %w", WaitToolName, err)
 		}
-		if time.Until(deadline) <= 0 {
-			break
-		}
 
 		entries, err := e.pollList(ctx)
 		if err != nil {
@@ -226,7 +241,7 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 				return nil, fmt.Errorf("%s: %w", WaitToolName, ctxErr)
 			}
 			failures++
-			if failures >= e.maxListFailures {
+			if failures > e.maxListFailures {
 				giveUpErr = fmt.Errorf("%s: giving up after %d consecutive list failures: %w", WaitToolName, failures, err)
 				break
 			}
@@ -236,17 +251,23 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 			for _, id := range remaining {
 				entry, ok := entries[id]
 				switch {
+				case !ok && seen[id]:
+					// Vanished after being listed: keep waiting (see doc).
+					vanished[id] = true
 				case !ok:
 					absent[id]++
-					if absent[id] >= e.notFoundPolls {
-						results[id] = subagentStatus{Status: "not_found", Error: fmt.Sprintf("run %q not found in the %s list (absent from %d consecutive polls)", id, gatewaySubagentsTool, absent[id])}
+					if absent[id] >= e.notFoundPolls && time.Since(start) >= e.notFoundGrace {
+						results[id] = subagentStatus{Status: "not_found", Error: e.notFoundMessage(id, absent[id])}
 						continue
 					}
 				case entry.finished():
+					seen[id] = true
+					vanished[id] = false
 					results[id] = subagentStatus{Status: entry.Status}
 					continue
 				default:
-					absent[id] = 0
+					seen[id] = true
+					vanished[id] = false
 					lastState[id] = entry.Execution.State
 				}
 				stillPending = append(stillPending, id)
@@ -257,16 +278,20 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 			}
 		}
 
+		left := time.Until(deadline)
+		if left <= 0 {
+			break
+		}
 		sleep := e.listPollInterval
-		if left := time.Until(deadline); left < sleep {
+		if left < sleep {
 			sleep = left
 		}
-		if sleep > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("%s: %w", WaitToolName, ctx.Err())
-			case <-time.After(sleep):
-			}
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("%s: %w", WaitToolName, ctx.Err())
+		case <-timer.C:
 		}
 	}
 
@@ -276,8 +301,14 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 			continue
 		}
 		msg := fmt.Sprintf("did not finish within %ds", timeoutSeconds)
-		if state := lastState[id]; state != "" {
-			msg += fmt.Sprintf(" (last execution state: %q)", state)
+		switch {
+		case seen[id] && lastState[id] != "":
+			msg += fmt.Sprintf(" (last execution state: %q)", lastState[id])
+		case seen[id]:
+			msg += " (last seen with no execution state)"
+		}
+		if vanished[id] {
+			msg += "; it was listed earlier but is no longer in the gateway's list"
 		}
 		results[id] = subagentStatus{Status: "timeout", Error: msg}
 	}
@@ -301,6 +332,17 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 		results[id] = st
 	}
 	return results, giveUpErr
+}
+
+// notFoundMessage words the error for a never-seen id, adding a hint when
+// spawn_subagent took the id from a field other than runId (the list is keyed
+// by runId, so such an id may simply not match).
+func (e *Executor) notFoundMessage(id string, absentPolls int) string {
+	msg := fmt.Sprintf("run %q not found in the %s list (never listed; absent from %d consecutive polls over %s)", id, gatewaySubagentsTool, absentPolls, e.notFoundGrace)
+	if rec, ok := e.registry.get(id); ok && rec.idNotRunID {
+		msg += "; this id came from the spawn result's taskId/id field rather than runId, so it may not match the list's runId"
+	}
+	return msg
 }
 
 // fetchFinalText reads the finished child's history and returns its last

@@ -41,6 +41,7 @@ func historyEnvelope(text string) string {
 func newTestExecutor(caller *fakeCaller) *Executor {
 	e := NewExecutor(caller)
 	e.listPollInterval = time.Millisecond
+	e.notFoundGrace = 0
 	return e
 }
 
@@ -158,6 +159,7 @@ func TestExecutor_WaitForAll_TransientListErrorRecovers(t *testing.T) {
 		script(gatewaySubagentsTool,
 			scriptedCall{err: errors.New("connection reset")},
 			scriptedCall{result: errorResult("gateway busy")},
+			scriptedCall{result: textResult("not json")},
 			scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))}).
 		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("ok"))})
 	e := newTestExecutor(caller)
@@ -165,7 +167,7 @@ func TestExecutor_WaitForAll_TransientListErrorRecovers(t *testing.T) {
 
 	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
 	if err != nil {
-		t.Fatalf("waitForAll error: %v, want recovery after 2 transient failures", err)
+		t.Fatalf("waitForAll error: %v, want recovery after maxListFailures (3) transient failures", err)
 	}
 	if statuses["run-1"].Result != "ok" {
 		t.Errorf("run-1 = %+v, want result ok", statuses["run-1"])
@@ -192,9 +194,9 @@ func TestExecutor_WaitForAll_PersistentListErrorReturnsPartialResults(t *testing
 	if st := statuses["run-2"]; st.Status != "unknown" || st.Error == "" {
 		t.Errorf("run-2 = %+v, want unknown with the error", st)
 	}
-	// 1 good poll + maxListFailures failing polls.
-	if n := len(caller.callsTo(gatewaySubagentsTool)); n != 1+e.maxListFailures {
-		t.Errorf("polled %d times, want %d", n, 1+e.maxListFailures)
+	// 1 good poll + maxListFailures tolerated failures + the one that gives up.
+	if n := len(caller.callsTo(gatewaySubagentsTool)); n != 1+e.maxListFailures+1 {
+		t.Errorf("polled %d times, want %d", n, 1+e.maxListFailures+1)
 	}
 
 	// A fresh executor over the same script, so runWait starts at poll 1.
@@ -326,5 +328,93 @@ func TestParseList(t *testing.T) {
 	}
 	if _, err := parseList("not json"); err == nil {
 		t.Error("parseList(non-JSON) error = nil, want a decode error")
+	}
+}
+
+func TestExecutor_WaitForAll_VanishedRunKeepsWaitingAndRecovers(t *testing.T) {
+	caller := newFakeCaller().
+		script(gatewaySubagentsTool,
+			scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))},
+			// Dropped from both lists for more than notFoundPolls polls.
+			scriptedCall{result: textResult(liveList(nil, nil))},
+			scriptedCall{result: textResult(liveList(nil, nil))},
+			scriptedCall{result: textResult(liveList(nil, nil))},
+			scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("back"))})
+	e := newTestExecutor(caller)
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if st := statuses["run-1"]; st.Status == "not_found" || st.Result != "back" {
+		t.Errorf("run-1 = %+v, want its report once it reappears (a seen run is never not_found)", st)
+	}
+}
+
+func TestExecutor_WaitForAll_VanishedRunTimesOutWithHint(t *testing.T) {
+	caller := newFakeCaller().script(gatewaySubagentsTool,
+		scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))},
+		scriptedCall{result: textResult(liveList(nil, nil))})
+	e := newTestExecutor(caller)
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if st := statuses["run-1"]; st.Status != "timeout" || !strings.Contains(st.Error, "no longer in the gateway's list") {
+		t.Errorf("run-1 = %+v, want a timeout that says it vanished", st)
+	}
+}
+
+func TestExecutor_WaitForAll_NotFoundWaitsOutGraceWindow(t *testing.T) {
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList(nil, nil))})
+	e := newTestExecutor(caller)
+	e.notFoundGrace = time.Hour // far longer than the 1s wait
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if st := statuses["run-1"]; st.Status != "timeout" {
+		t.Errorf("run-1 = %+v, want timeout: not_found must wait for the grace window", st)
+	}
+}
+
+func TestExecutor_WaitForAll_NotFoundHintsWhenIDIsNotARunID(t *testing.T) {
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList(nil, nil))})
+	e := newTestExecutor(caller)
+	e.registry.put("task-1", subagentRecord{sessionKey: "s", idNotRunID: true})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"task-1"}, 5)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if st := statuses["task-1"]; st.Status != "not_found" || !strings.Contains(st.Error, "may not match the list's runId") {
+		t.Errorf("task-1 = %+v, want a not_found error with the id-source hint", st)
+	}
+}
+
+func TestExecutor_WaitForAll_FinalPollAfterDeadline(t *testing.T) {
+	// run-1 is running on the first poll and finished on every later one;
+	// with a 1s wait and a 600ms interval, only the post-deadline poll can
+	// see it finished.
+	caller := newFakeCaller().
+		script(gatewaySubagentsTool,
+			scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))},
+			scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))},
+			scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("late"))})
+	e := newTestExecutor(caller)
+	e.listPollInterval = 600 * time.Millisecond
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if statuses["run-1"].Result != "late" {
+		t.Errorf("run-1 = %+v, want the result from the final poll, not a timeout", statuses["run-1"])
 	}
 }
