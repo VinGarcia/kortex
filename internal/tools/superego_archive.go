@@ -43,7 +43,7 @@ func RunLoadSuperegoArchive(loader ArchiveLoader, input SuperegoArchiveInput) (o
 	if err != nil {
 		return fmt.Sprintf("error: %v", err), true
 	}
-	cut, truncated := truncateUTF8([]byte(content), superegoArchiveMaxBytes)
+	cut, truncated := TruncateUTF8([]byte(content), superegoArchiveMaxBytes)
 	if truncated {
 		return fmt.Sprintf("%s\n[truncated: showing first %d of %d bytes]", cut, len(cut), len(content)), false
 	}

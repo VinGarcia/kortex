@@ -24,6 +24,27 @@ type mcpCaller interface {
 	CallTool(ctx context.Context, name string, arguments map[string]any) (mcp.CallToolResult, error)
 }
 
+// SubagentPort is the generic seam through which Dispatcher declares and
+// executes kortex's native spawn/wait/list-subagent tools, mirroring
+// ArchiveLoader's role for load_superego_archive but owning its own tool
+// declarations too, since it adds three tools rather than one whose
+// definition already lives in this package. The concrete implementation
+// (internal/subagent.Executor) knows the OpenClaw gateway's tool names,
+// argument shapes, and model-id policy; this package only needs to ask for
+// ToolDefs() and route an Execute() call by name, never any of that
+// knowledge itself — the same layer-purity goal openclaw_terminal_tool.go
+// documents for isTerminalTool.
+type SubagentPort interface {
+	// ToolDefs returns the tool declarations this port adds to the Messages
+	// API "tools" field.
+	ToolDefs() []anthropic.ToolDef
+	// Execute runs the named tool (one of the names ToolDefs() declared)
+	// with its raw tool_use input, returning the tool_result content and
+	// whether it is an error turn — the same convention every builtin in
+	// this package follows.
+	Execute(ctx context.Context, name string, input json.RawMessage) (output string, isError bool)
+}
+
 // Dispatcher executes tool_use content blocks by name, routing the native
 // builtins (bash, read, write, edit) to their executors and the
 // mcp__openclaw__* tools to the OpenClaw loopback server, producing the
@@ -38,6 +59,39 @@ type Dispatcher struct {
 	// archive backs load_superego_archive; nil (the default) means the tool
 	// is neither declared nor executable.
 	archive ArchiveLoader
+	// subagent, when non-nil, adds and executes the native
+	// spawn_subagent/wait_subagents/list_subagents tools (see
+	// WithSubagentTools). Nil disables all three, exactly like a nil archive
+	// disables load_superego_archive.
+	subagent SubagentPort
+	// hiddenMCPTools names raw (unprefixed) gateway MCP tools that ToolDefs()
+	// must not declare to the model — e.g. the gateway's own sessions_spawn
+	// once SubagentPort wraps it: the model must go through spawn_subagent,
+	// which injects the no-yield preamble and the model allowlist that a raw
+	// call would bypass (see HideMCPTools). Execute still forwards any of
+	// these names if asked (same fail-open behavior executeMCP already has
+	// for a name outside mcpTools entirely) — only the declaration is hidden.
+	hiddenMCPTools map[string]bool
+}
+
+// WithSubagentTools enables the native spawn_subagent/wait_subagents/
+// list_subagents tools, declared and executed through port. A nil port
+// leaves them disabled (the default). It returns d for chaining.
+func (d *Dispatcher) WithSubagentTools(port SubagentPort) *Dispatcher {
+	d.subagent = port
+	return d
+}
+
+// HideMCPTools removes the named raw (unprefixed) gateway MCP tools from
+// ToolDefs()'s declaration. It returns d for chaining.
+func (d *Dispatcher) HideMCPTools(names ...string) *Dispatcher {
+	if d.hiddenMCPTools == nil {
+		d.hiddenMCPTools = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		d.hiddenMCPTools[name] = true
+	}
+	return d
 }
 
 // WithSuperegoArchive enables the load_superego_archive tool, reading
@@ -75,7 +129,25 @@ func (d *Dispatcher) ToolDefs() []anthropic.ToolDef {
 	if d.archive != nil {
 		defs = append(defs, SuperegoArchiveDef)
 	}
-	return append(defs, MCPToolDefs(d.mcpTools)...)
+	if d.subagent != nil {
+		defs = append(defs, d.subagent.ToolDefs()...)
+	}
+	return append(defs, MCPToolDefs(d.visibleMCPTools())...)
+}
+
+// visibleMCPTools returns mcpTools with any name in hiddenMCPTools removed,
+// preserving order; see HideMCPTools.
+func (d *Dispatcher) visibleMCPTools() []mcp.Tool {
+	if len(d.hiddenMCPTools) == 0 {
+		return d.mcpTools
+	}
+	visible := make([]mcp.Tool, 0, len(d.mcpTools))
+	for _, tool := range d.mcpTools {
+		if !d.hiddenMCPTools[tool.Name] {
+			visible = append(visible, tool)
+		}
+	}
+	return visible
 }
 
 // Execute runs the builtin named by block.Name with block.Input and returns
@@ -91,6 +163,18 @@ func (d *Dispatcher) Execute(ctx context.Context, block anthropic.ContentBlock) 
 
 	if strings.HasPrefix(block.Name, MCPToolPrefix) {
 		return d.executeMCP(ctx, block)
+	}
+
+	// Routed by membership in the port's own ToolDefs(), never by a literal
+	// name list here: that keeps this package fully agnostic of what the
+	// three subagent tools are even called (see SubagentPort's doc comment).
+	if d.subagent != nil {
+		for _, def := range d.subagent.ToolDefs() {
+			if def.Name == block.Name {
+				output, isError := d.subagent.Execute(ctx, block.Name, block.Input)
+				return anthropic.NewToolResultBlock(block.ID, output, isError)
+			}
+		}
 	}
 
 	switch block.Name {

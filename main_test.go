@@ -739,7 +739,12 @@ func TestBuildNativeDispatcher(t *testing.T) {
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"memory_search","description":"d","inputSchema":{"type":"object","properties":{}}}]}}`))
+				w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[
+					{"name":"memory_search","description":"d","inputSchema":{"type":"object","properties":{}}},
+					{"name":"sessions_spawn","description":"d","inputSchema":{"type":"object","properties":{}}},
+					{"name":"agents_wait","description":"d","inputSchema":{"type":"object","properties":{}}},
+					{"name":"subagents","description":"d","inputSchema":{"type":"object","properties":{}}}
+				]}}`))
 			default:
 				w.WriteHeader(http.StatusInternalServerError)
 			}
@@ -757,6 +762,10 @@ func TestBuildNativeDispatcher(t *testing.T) {
 	}
 	const mcpToolName = "mcp__openclaw__memory_search"
 	builtinCount := len(tools.NewDispatcher().ToolDefs())
+	// A successful handshake always wires the three native subagent tools
+	// (spawn_subagent/wait_subagents/list_subagents) regardless of what the
+	// loopback server's own catalog contains — see buildNativeDispatcher.
+	const subagentToolCount = 3
 
 	tests := []struct {
 		desc        string
@@ -811,10 +820,26 @@ func TestBuildNativeDispatcher(t *testing.T) {
 			}
 			wantLen := builtinCount
 			if test.wantMCPTool {
-				wantLen++
+				wantLen += 1 + subagentToolCount
 			}
 			if len(defs) != wantLen {
 				t.Errorf("len(ToolDefs) = %d, want %d", len(defs), wantLen)
+			}
+			if test.wantMCPTool {
+				declared := make(map[string]bool, len(defs))
+				for _, def := range defs {
+					declared[def.Name] = true
+				}
+				for _, native := range []string{"spawn_subagent", "wait_subagents", "list_subagents"} {
+					if !declared[native] {
+						t.Errorf("native tool %q not declared after a successful handshake", native)
+					}
+				}
+				for _, hidden := range []string{"mcp__openclaw__sessions_spawn", "mcp__openclaw__agents_wait", "mcp__openclaw__subagents"} {
+					if declared[hidden] {
+						t.Errorf("raw gateway tool %q still declared; it must be hidden behind the native tools", hidden)
+					}
+				}
 			}
 			if test.wantStderr != "" && !strings.Contains(stderr.String(), test.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), test.wantStderr)

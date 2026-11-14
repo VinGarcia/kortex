@@ -39,7 +39,7 @@ func RunRead(input ReadInput) (output string, isError bool) {
 	if err != nil {
 		return fmt.Sprintf("error: reading %s: %v", input.Path, err), true
 	}
-	out, truncated := truncateUTF8(data, readMaxOutputBytes)
+	out, truncated := TruncateUTF8(data, readMaxOutputBytes)
 	result := string(out)
 	if truncated {
 		result += fmt.Sprintf("\n[output truncated at %d bytes]", readMaxOutputBytes)

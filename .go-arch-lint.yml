@@ -45,6 +45,14 @@ components:
   # the same way main does.
   loopsmoke:
     in: hack/loopsmoke
+  # Composition-root seam for kortex's native spawn/wait/list-subagent tools:
+  # the only component that knows the OpenClaw gateway's
+  # sessions_spawn/subagents/sessions_history MCP tool names, their argument
+  # shapes, and the model-id allowlist. Implements tools.SubagentPort without
+  # tools importing this package, mirroring how facet implements session's
+  # ports without session importing facet.
+  subagent:
+    in: internal/subagent
 deps:
   anthropic:
     canUse:
@@ -65,6 +73,10 @@ deps:
       # F3d slice-3c: main branches into the native session runner when the
       # stream-emitter gate is on, wiring it with the client/dispatcher/store.
       - session
+      # main builds the subagent.Executor (over the same mcp.Client
+      # buildNativeDispatcher already holds) and wires it into the Dispatcher
+      # via tools.Dispatcher.WithSubagentTools/HideMCPTools.
+      - subagent
   # proxy calls facets only through its own Interceptor interface (wired by
   # main); it must never import facet — the reverse direction is the rule.
   proxy:
@@ -114,4 +126,15 @@ deps:
   loopsmoke:
     mayDependOn:
       - anthropic
+      - tools
+  subagent:
+    mayDependOn:
+      - anthropic
+      # The gateway's CallTool result/error shapes (mcp.CallToolResult,
+      # mcp.Client) are what Executor's mcpCaller interface wraps.
+      - mcp
+      # Only for tools.TruncateUTF8, so the 8 KiB report cap reuses the same
+      # rune-safe truncation bash/read/load_superego_archive already share,
+      # instead of a fourth copy (one-way edge: tools has no knowledge of
+      # subagent).
       - tools

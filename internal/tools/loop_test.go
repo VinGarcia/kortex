@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/mcp"
+	"github.com/vingarcia/kortex/internal/protocol"
 )
 
 // bigEnoughForFloor clears every model's cacheable floor (opus/sonnet/
@@ -1003,5 +1005,73 @@ func TestRunLoop_callTimeoutFailsClosed(t *testing.T) {
 	if strings.Contains(err.Error(), "context deadline exceeded") ||
 		strings.Contains(strings.ToLower(err.Error()), "request failed") {
 		t.Errorf("error = %q, must carry only the per-call deadline, not the raw transport cause", err)
+	}
+}
+
+// TestRunLoop_keepaliveBracketsSlowToolExecution proves tool EXECUTION gets
+// the same keepalive bracket as a model call: a bash command that runs well
+// past KeepaliveInterval must not leave the wire silent, the same risk
+// TestRunLoop_keepaliveBracketsSlowCall guards for a slow model call. This
+// also covers kortex's own wait_subagents/spawn_subagent-with-wait, which can
+// block for a while with nothing else happening — that gap, found while
+// building internal/subagent, is what motivated bracketing the whole
+// tool-execution batch in RunLoop rather than just the model call.
+func TestRunLoop_keepaliveBracketsSlowToolExecution(t *testing.T) {
+	const (
+		keepaliveInterval = 15 * time.Millisecond
+		toolStall         = 200 * time.Millisecond
+	)
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			w.Write([]byte(`{
+				"content": [{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"sleep 0.2"}}],
+				"stop_reason": "tool_use",
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			}`))
+			return
+		}
+		w.Write([]byte(`{
+			"content": [{"type":"text","text":"done"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	client := anthropic.NewClient("secret-token", server.URL, time.Second)
+	_, err := RunLoop(context.Background(), client, NewDispatcher(), LoopRequest{
+		Model:             "m",
+		MaxTokens:         1024,
+		UserMessage:       "run a slow command",
+		KeepaliveInterval: keepaliveInterval,
+		Emitter:           NewStreamEmitter(&out, "sess-k", sequencedUUIDs()),
+	})
+	if err != nil {
+		t.Fatalf("RunLoop error: %v", err)
+	}
+
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	keepalives, toolResultIdx := 0, -1
+	for i, line := range lines {
+		ev := protocol.Parse(line)
+		if ev.ParseErr != nil {
+			t.Fatalf("line %d failed to parse: %v\n%s", i, ev.ParseErr, line)
+		}
+		switch {
+		case ev.Type == protocol.TypeSystem && ev.Subtype == "keepalive":
+			keepalives++
+		case ev.Type == protocol.TypeUser && toolResultIdx == -1:
+			toolResultIdx = i
+		}
+	}
+	if keepalives == 0 {
+		t.Fatalf("no keepalive emitted during the %s bash call; a real wait_subagents/spawn_subagent block would silently trip the watchdog:\n%s", toolStall, out.String())
+	}
+	if toolResultIdx == -1 {
+		t.Fatalf("no tool_result (user) event found:\n%s", out.String())
 	}
 }

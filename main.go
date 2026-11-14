@@ -20,6 +20,7 @@ import (
 	"github.com/vingarcia/kortex/internal/mcp"
 	"github.com/vingarcia/kortex/internal/proxy"
 	"github.com/vingarcia/kortex/internal/session"
+	"github.com/vingarcia/kortex/internal/subagent"
 	"github.com/vingarcia/kortex/internal/tools"
 )
 
@@ -696,7 +697,15 @@ func buildNativeDispatcher(ctx context.Context, argv []string, getenv func(strin
 		fmt.Fprintf(stderr, "kortex: mcp tools disabled: handshake failed: %v\n", err)
 		return tools.NewDispatcher()
 	}
-	return tools.NewDispatcherWithMCP(client, handshake.Tools)
+	dispatcher := tools.NewDispatcherWithMCP(client, handshake.Tools)
+	// The gateway's own sessions_spawn/subagents/agents_wait tools are hidden
+	// from the model and replaced by spawn_subagent/wait_subagents/
+	// list_subagents, which wrap the same client (reusing the handshake above
+	// instead of a second one) so every call carries the no-yield preamble and
+	// the fable-rejecting model allowlist a raw gateway call would bypass.
+	return dispatcher.
+		WithSubagentTools(subagent.NewExecutor(client)).
+		HideMCPTools(subagent.HiddenGatewayTools()...)
 }
 
 // nativeSessionID resolves the session id this process owns from argv

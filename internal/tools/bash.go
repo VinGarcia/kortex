@@ -80,7 +80,7 @@ func RunBash(ctx context.Context, input BashInput) (output string, isError bool)
 
 	runErr := cmd.Run()
 
-	out, truncated := truncateUTF8(combined.Bytes(), bashMaxOutputBytes)
+	out, truncated := TruncateUTF8(combined.Bytes(), bashMaxOutputBytes)
 	result := string(out)
 	if truncated {
 		result += fmt.Sprintf("\n[output truncated at %d bytes]", bashMaxOutputBytes)

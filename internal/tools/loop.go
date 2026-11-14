@@ -330,10 +330,21 @@ func RunLoop(ctx context.Context, client *anthropic.Client, dispatcher *Dispatch
 			return result, nil
 		}
 
+		// Tool EXECUTION is bracketed with the same keepalive mechanism as each
+		// model call above: a tool can itself run silent on the wire for a long
+		// time (bash with a generous timeout_seconds, or kortex's own
+		// wait_subagents/spawn_subagent-with-wait, which blocks up to its own
+		// configured timeout — default 1800s), and OpenClaw's no-output
+		// watchdog does not care whether the silence came from a model call or
+		// a tool call. stopToolKeepalive() still runs BEFORE the tool_result
+		// emission below, preserving the ordering invariant StartKeepalive
+		// documents.
+		stopToolKeepalive := req.Emitter.startCallKeepalive(keepaliveInterval)
 		results := make([]anthropic.ToolResultBlock, len(toolUses))
 		for i, block := range toolUses {
 			results[i] = dispatcher.Execute(ctx, block)
 		}
+		stopToolKeepalive()
 		if err := req.Emitter.toolResults(results); err != nil {
 			return LoopResult{}, err
 		}
