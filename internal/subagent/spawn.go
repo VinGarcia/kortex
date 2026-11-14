@@ -134,7 +134,7 @@ func parseSpawnResult(raw string) (runID string, sessionKey string, err error) {
 		return "", "", fmt.Errorf("sessions_spawn returned a result spawn_subagent cannot parse (wanted a JSON object with a run/task id and a session key, got %.200q): %w — this needs a live smoke to confirm the real response shape (see package doc)", raw, err)
 	}
 	runID = firstNonEmpty(fields.TaskID, fields.RunID, fields.ID)
-	sessionKey = firstNonEmpty(fields.SessionKey, fields.ChildSessionKey, fields.SessionID)
+	sessionKey = firstNonEmpty(fields.ChildSessionKey, fields.SessionKey, fields.SessionID)
 	if runID == "" {
 		return "", "", fmt.Errorf("sessions_spawn result had no recognizable run/task id field (taskId/runId/id); raw=%.200q — this needs a live smoke to confirm the real response shape (see package doc)", raw)
 	}
