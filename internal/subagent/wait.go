@@ -133,10 +133,12 @@ func (e *Executor) runWait(ctx context.Context, rawInput json.RawMessage) (outpu
 }
 
 // pendingIDs returns, sorted, the registry's run ids that the gateway's list
-// reports as present but not finished: the "all pending children" default for
-// wait_subagents with no ids. Registry ids absent from the list are skipped
-// (finished long ago and pruned, or not yet listed), so they never turn a
-// no-op wait into a not_found round trip.
+// reports as present but not finished, plus those absent from the list that
+// were spawned within e.notFoundGrace (the gateway may not list a fresh child
+// yet; this is the "spawn wait=false, then wait with no ids" flow): the "all
+// pending children" default for wait_subagents with no ids. Older registry ids
+// absent from the list are skipped (finished long ago and pruned), so they
+// never turn a no-op wait into a not_found round trip.
 func (e *Executor) pendingIDs(ctx context.Context) ([]string, error) {
 	known := e.registry.all()
 	if len(known) == 0 {
@@ -147,8 +149,9 @@ func (e *Executor) pendingIDs(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("%s: listing pending subagents: %w", WaitToolName, err)
 	}
 	var pending []string
-	for id := range known {
-		if entry, ok := entries[id]; ok && !entry.finished() {
+	for id, rec := range known {
+		entry, listed := entries[id]
+		if listed && !entry.finished() || !listed && time.Since(rec.spawnedAt) < e.notFoundGrace {
 			pending = append(pending, id)
 		}
 	}

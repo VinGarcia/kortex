@@ -1,6 +1,9 @@
 package subagent
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // subagentRecord is what Executor remembers about one spawned child, keyed by
 // runID in registry.
@@ -11,6 +14,9 @@ type subagentRecord struct {
 	// came from taskId/id instead; the subagents list is keyed by runId, so
 	// such an id may never match (see Executor.notFoundMessage).
 	idNotRunID bool
+	// spawnedAt is when this process spawned the child; wait_subagents with
+	// no ids uses it to still wait for a child the gateway has not listed yet.
+	spawnedAt time.Time
 }
 
 // registry maps a spawn_subagent call's runID to the child's gateway session

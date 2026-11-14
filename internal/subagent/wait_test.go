@@ -427,7 +427,21 @@ func TestExecutor_RunWait_IDsDefaulting(t *testing.T) {
 		lists         []string
 		wantOut       []string
 		wantListCalls int
+		fresh         []string // registry ids spawned just now, with a 1h grace window
 	}{
+		{
+			desc:     "empty ids waits for a just-spawned child the gateway does not list yet",
+			input:    `{"timeout_seconds":5}`,
+			registry: []string{"run-1", "run-2"},
+			fresh:    []string{"run-2"}, // run-1 is old and unlisted: pruned, excluded.
+			lists: []string{
+				liveList(nil, nil), // resolves the pending set: run-2 not listed yet
+				liveList([]string{"run-2"}, nil),
+				liveList(nil, []string{"run-2"}),
+			},
+			wantOut:       []string{`"runId":"run-2"`, `report run-2`},
+			wantListCalls: 3,
+		},
 		{
 			desc:     "empty ids waits for both pending children and skips finished ones",
 			input:    `{"timeout_seconds":5}`,
@@ -470,10 +484,17 @@ func TestExecutor_RunWait_IDsDefaulting(t *testing.T) {
 				caller.script(gatewaySubagentsTool, scriptedCall{result: textResult(l)})
 			}
 			e := newTestExecutor(caller)
+			e.notFoundGrace = time.Hour
 			for _, id := range test.registry {
 				sk := "sess-" + id
 				caller.scriptForSession(gatewaySessionsHistoryTool, sk, scriptedCall{result: textResult(historyEnvelope("report " + id))})
-				e.registry.put(id, subagentRecord{sessionKey: sk})
+				rec := subagentRecord{sessionKey: sk}
+				for _, f := range test.fresh {
+					if f == id {
+						rec.spawnedAt = time.Now()
+					}
+				}
+				e.registry.put(id, rec)
 			}
 
 			out, isError := e.runWait(context.Background(), json.RawMessage(test.input))
@@ -485,8 +506,11 @@ func TestExecutor_RunWait_IDsDefaulting(t *testing.T) {
 					t.Errorf("output %q missing %q", out, want)
 				}
 			}
-			if strings.Contains(out, "run-3") {
+			if len(test.fresh) == 0 && strings.Contains(out, "run-3") {
 				t.Errorf("output %q includes already-finished run-3", out)
+			}
+			if len(test.fresh) > 0 && strings.Contains(out, `"run-1"`) {
+				t.Errorf("output %q includes pruned run-1", out)
 			}
 			if n := len(caller.callsTo(gatewaySubagentsTool)); n != test.wantListCalls {
 				t.Errorf("list calls = %d, want %d", n, test.wantListCalls)

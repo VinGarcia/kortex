@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // subagentPreamble is prefixed onto every spawned subagent's task, ahead of
@@ -87,7 +88,7 @@ func (e *Executor) runSpawn(ctx context.Context, rawInput json.RawMessage) (outp
 	if err != nil {
 		return fmt.Sprintf("error: %v", err), true
 	}
-	e.registry.put(runID, subagentRecord{sessionKey: sessionKey, label: input.Label, idNotRunID: idNotRunID})
+	e.registry.put(runID, subagentRecord{sessionKey: sessionKey, label: input.Label, idNotRunID: idNotRunID, spawnedAt: time.Now()})
 
 	wait := true
 	if input.Wait != nil {
