@@ -418,3 +418,79 @@ func TestExecutor_WaitForAll_FinalPollAfterDeadline(t *testing.T) {
 		t.Errorf("run-1 = %+v, want the result from the final poll, not a timeout", statuses["run-1"])
 	}
 }
+
+func TestExecutor_RunWait_IDsDefaulting(t *testing.T) {
+	tests := []struct {
+		desc          string
+		input         string
+		registry      []string
+		lists         []string
+		wantOut       []string
+		wantListCalls int
+	}{
+		{
+			desc:     "empty ids waits for both pending children and skips finished ones",
+			input:    `{"timeout_seconds":5}`,
+			registry: []string{"run-1", "run-2", "run-3"},
+			lists: []string{
+				liveList([]string{"run-1", "run-2"}, []string{"run-3"}), // resolves the pending set
+				liveList([]string{"run-2"}, []string{"run-1", "run-3"}),
+				liveList(nil, []string{"run-1", "run-2", "run-3"}),
+			},
+			wantOut:       []string{`"runId":"run-1"`, `"runId":"run-2"`, `report run-1`, `report run-2`},
+			wantListCalls: 3, // 1 to resolve the pending set + 2 polls (run-2 needs a second).
+		},
+		{
+			desc:          "explicit empty ids list behaves like omitted",
+			input:         `{"ids":[],"timeout_seconds":5}`,
+			registry:      []string{"run-1"},
+			lists:         []string{liveList(nil, []string{"run-1"})},
+			wantOut:       []string{"[]"},
+			wantListCalls: 1,
+		},
+		{
+			desc:          "empty ids with an empty registry returns immediately without listing",
+			input:         `{}`,
+			wantOut:       []string{"[]"},
+			wantListCalls: 0,
+		},
+		{
+			desc:          "explicit ids are used as given, finished or not",
+			input:         `{"ids":["run-1"],"timeout_seconds":5}`,
+			registry:      []string{"run-1", "run-2"},
+			lists:         []string{liveList([]string{"run-2"}, []string{"run-1"})},
+			wantOut:       []string{`"runId":"run-1"`, `report run-1`},
+			wantListCalls: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			caller := newFakeCaller()
+			for _, l := range test.lists {
+				caller.script(gatewaySubagentsTool, scriptedCall{result: textResult(l)})
+			}
+			e := newTestExecutor(caller)
+			for _, id := range test.registry {
+				sk := "sess-" + id
+				caller.scriptForSession(gatewaySessionsHistoryTool, sk, scriptedCall{result: textResult(historyEnvelope("report " + id))})
+				e.registry.put(id, subagentRecord{sessionKey: sk})
+			}
+
+			out, isError := e.runWait(context.Background(), json.RawMessage(test.input))
+			if isError {
+				t.Fatalf("runWait error: %s", out)
+			}
+			for _, want := range test.wantOut {
+				if !strings.Contains(out, want) {
+					t.Errorf("output %q missing %q", out, want)
+				}
+			}
+			if strings.Contains(out, "run-3") {
+				t.Errorf("output %q includes already-finished run-3", out)
+			}
+			if n := len(caller.callsTo(gatewaySubagentsTool)); n != test.wantListCalls {
+				t.Errorf("list calls = %d, want %d", n, test.wantListCalls)
+			}
+		})
+	}
+}

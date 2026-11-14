@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,14 +65,13 @@ const historyFetchLimit = 5
 
 var waitDef = mustAnthropicToolDef(
 	WaitToolName,
-	"Block until every listed subagent run finishes (or the timeout elapses), then return each run's final report.",
+	"Block until every listed subagent run finishes (or the timeout elapses), then return each run's final report. If ids is omitted or empty, waits for ALL of this session's subagents that are not yet finished (returns an empty list immediately if none are pending).",
 	map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"ids":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The run ids returned by spawn_subagent with wait=false."},
+			"ids":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The run ids returned by spawn_subagent with wait=false. Omit or pass [] to wait for every not-yet-finished subagent of this session."},
 			"timeout_seconds": map[string]any{"type": "integer", "description": "How long to block before giving up on whatever hasn't finished; defaults to 1800 (30 minutes)."},
 		},
-		"required": []string{"ids"},
 	},
 )
 
@@ -93,21 +93,30 @@ func (e *Executor) runWait(ctx context.Context, rawInput json.RawMessage) (outpu
 	if err := json.Unmarshal(rawInput, &input); err != nil {
 		return fmt.Sprintf("error: decoding %s input: %v", WaitToolName, err), true
 	}
-	if len(input.IDs) == 0 {
-		return "error: ids is required and must be non-empty", true
-	}
 	timeout := input.TimeoutSeconds
 	if timeout <= 0 {
 		timeout = defaultWaitTimeoutSeconds
 	}
 
-	statuses, waitErr := e.waitForAll(ctx, input.IDs, timeout)
+	ids := input.IDs
+	if len(ids) == 0 {
+		pending, err := e.pendingIDs(ctx)
+		if err != nil {
+			return fmt.Sprintf("error: %v", err), true
+		}
+		if len(pending) == 0 {
+			return "[]", false
+		}
+		ids = pending
+	}
+
+	statuses, waitErr := e.waitForAll(ctx, ids, timeout)
 	if waitErr != nil && statuses == nil {
 		return fmt.Sprintf("error: %v", waitErr), true
 	}
 
-	entries := make([]waitResultEntry, 0, len(input.IDs))
-	for _, id := range input.IDs {
+	entries := make([]waitResultEntry, 0, len(ids))
+	for _, id := range ids {
 		st := statuses[id]
 		entries = append(entries, waitResultEntry{RunID: id, Status: st.Status, Result: st.Result, Error: st.Error})
 	}
@@ -121,6 +130,30 @@ func (e *Executor) runWait(ctx context.Context, rawInput json.RawMessage) (outpu
 		return fmt.Sprintf("error: %v\npartial results: %s", waitErr, out), true
 	}
 	return string(out), false
+}
+
+// pendingIDs returns, sorted, the registry's run ids that the gateway's list
+// reports as present but not finished: the "all pending children" default for
+// wait_subagents with no ids. Registry ids absent from the list are skipped
+// (finished long ago and pruned, or not yet listed), so they never turn a
+// no-op wait into a not_found round trip.
+func (e *Executor) pendingIDs(ctx context.Context) ([]string, error) {
+	known := e.registry.all()
+	if len(known) == 0 {
+		return nil, nil
+	}
+	entries, err := e.pollList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s: listing pending subagents: %w", WaitToolName, err)
+	}
+	var pending []string
+	for id := range known {
+		if entry, ok := entries[id]; ok && !entry.finished() {
+			pending = append(pending, id)
+		}
+	}
+	sort.Strings(pending)
+	return pending, nil
 }
 
 // subagentStatus is what waitForAll learns about one run id: the gateway's
