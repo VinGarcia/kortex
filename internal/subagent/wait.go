@@ -15,11 +15,22 @@ import (
 // omits timeout_seconds.
 const defaultWaitTimeoutSeconds = 1800
 
-// gatewayWaitPollSeconds is the "subagents" action="wait" tool's own
-// timeoutSeconds cap, per the gateway's published schema (maximum: 60): one
-// wait call blocks server-side for at most this long, so waitForAll polls in
-// slices of this size until its own (longer) deadline.
-const gatewayWaitPollSeconds = 60
+// listPollInterval is how long waitForAll sleeps between "subagents"
+// action="list" polls. It is a var so tests can shrink it.
+//
+// Why list-polling instead of the gateway's action="wait": LIVE SMOKE
+// (2026-11-14) showed action="wait" only accepts the gateway's internal
+// *taskId*, which sessions_spawn does NOT return (it returns runId +
+// childSessionKey); waiting by runId or childSessionKey answers
+// reason:"unavailable". action="list" does carry runId in its active[]/recent[]
+// entries (status "running" -> "done"), so polling it keyed by runId needs no
+// runId->taskId mapping.
+var listPollInterval = 3 * time.Second
+
+// listRecentMinutes is the recentMinutes window passed to action="list" so a
+// run that finished long before wait_subagents was called is still reported
+// (the gateway default window is short; 1440 was accepted live).
+const listRecentMinutes = 1440
 
 // resultMaxBytes caps one subagent's fetched report, so a child that ignored
 // the preamble's size guidance cannot balloon the next request's token cost.
@@ -97,7 +108,7 @@ type subagentStatus struct {
 	Result   string
 }
 
-// waitForAll polls the gateway's "subagents" action="wait" tool for ids
+// waitForAll polls the gateway's "subagents" action="list" tool for ids
 // until every one is reported finished or timeoutSeconds elapses, then
 // fetches each finished (non-error) id's final report via sessions_history.
 // It is ctx-aware: a cancelled ctx stops the loop before the next poll
@@ -112,24 +123,13 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("%s: %w", WaitToolName, err)
 		}
-		remainingTime := time.Until(deadline)
-		if remainingTime <= 0 {
+		if time.Until(deadline) <= 0 {
 			break
-		}
-		pollSeconds := gatewayWaitPollSeconds
-		if secs := int(remainingTime.Seconds()); secs < pollSeconds {
-			pollSeconds = secs
-		}
-		if pollSeconds <= 0 {
-			// A sub-second remainder still deserves one last poll rather than
-			// being declared a timeout without ever asking the gateway.
-			pollSeconds = 1
 		}
 
 		result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{
-			"action":         "wait",
-			"taskIds":        remaining,
-			"timeoutSeconds": pollSeconds,
+			"action":        "list",
+			"recentMinutes": listRecentMinutes,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("%s: calling %s: %w", WaitToolName, gatewaySubagentsTool, err)
@@ -149,6 +149,20 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 			results[id] = st
 		}
 		remaining = stillPending
+		if len(remaining) == 0 {
+			break
+		}
+		sleep := listPollInterval
+		if left := time.Until(deadline); left < sleep {
+			sleep = left
+		}
+		if sleep > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("%s: %w", WaitToolName, ctx.Err())
+			case <-time.After(sleep):
+			}
+		}
 	}
 
 	for _, id := range remaining {
@@ -202,12 +216,22 @@ func (e *Executor) fetchFinalText(ctx context.Context, sessionKey string) (strin
 // silently dropped. Needs a live smoke to confirm whether the structured path
 // ever actually fires (see package doc).
 func extractLastAssistantText(raw string) string {
-	var entries []struct {
-		Role    string `json:"role"`
-		Text    string `json:"text"`
-		Content string `json:"content"`
+	// LIVE SMOKE (2026-11-14): sessions_history returns an envelope
+	// {"messages":[{"role":"assistant","content":[{"type":"text","text":...}]}]},
+	// where content is a block array (a plain string is also tolerated, as are
+	// bare arrays and a top-level "text" field).
+	type message struct {
+		Role    string          `json:"role"`
+		Text    string          `json:"text"`
+		Content json.RawMessage `json:"content"`
 	}
-	if err := json.Unmarshal([]byte(raw), &entries); err != nil || len(entries) == 0 {
+	var entries []message
+	var envelope struct {
+		Messages []message `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err == nil && len(envelope.Messages) > 0 {
+		entries = envelope.Messages
+	} else if err := json.Unmarshal([]byte(raw), &entries); err != nil || len(entries) == 0 {
 		return raw
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
@@ -217,8 +241,24 @@ func extractLastAssistantText(raw string) string {
 		if entries[i].Text != "" {
 			return entries[i].Text
 		}
-		if entries[i].Content != "" {
-			return entries[i].Content
+		var asString string
+		if json.Unmarshal(entries[i].Content, &asString) == nil && asString != "" {
+			return asString
+		}
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(entries[i].Content, &blocks) == nil {
+			var texts []string
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					texts = append(texts, b.Text)
+				}
+			}
+			if len(texts) > 0 {
+				return strings.Join(texts, "\n")
+			}
 		}
 	}
 	return raw
@@ -297,7 +337,7 @@ func firstStringField(m map[string]any, keys ...string) string {
 // nonTerminalStatusWords is checked first so an ambiguous match (e.g. a
 // status containing both "queued" and, coincidentally, "done") resolves to
 // "not finished yet" rather than ending the wait early.
-var terminalStatusWords = []string{"complet", "done", "finish", "fail", "error", "cancel", "timeout"}
+var terminalStatusWords = []string{"complet", "done", "finish", "fail", "error", "cancel", "timeout", "kill", "abort"}
 var nonTerminalStatusWords = []string{"pending", "running", "queued", "active", "in_progress", "waiting"}
 
 func subagentStatusFromFields(m map[string]any) subagentStatus {

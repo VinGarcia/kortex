@@ -7,17 +7,12 @@
 // it behind the generic tools.SubagentPort interface (ToolDefs/Execute) that
 // Executor satisfies.
 //
-// UNCERTAINTY (read before changing wait.go or list.go): this package was
-// written without a live gateway to inspect, so the *request* shapes below
-// (sessions_spawn's arguments, subagents' action/taskIds/timeoutSeconds) are
-// taken from the gateway's own published tool schema and are solid, but the
-// *response* shapes (what sessions_spawn's result JSON actually names its
-// run id and session key, what subagents action=wait/list actually names its
-// per-task status) are not documented anywhere this package could read, so
-// parseSpawnResult and parseSubagentsStatuses parse defensively — trying
-// several plausible field names rather than asserting one — and are the two
-// places to patch once a live smoke run (see the package's test files for
-// what each assumes) confirms the real shape.
+// LIVE-SMOKE STATUS (2026-11-14, real gateway): sessions_spawn returns
+// {status:"accepted", childSessionKey, runId, mode, ...} (no taskId), which
+// parseSpawnResult handles. subagents action="wait" only accepts the gateway's
+// internal taskId, which spawn does not return, so waiting is done by polling
+// action="list" keyed by runId (see wait.go). sessions_history returns a
+// {messages:[{role, content:[{type:"text",text}]}]} envelope.
 package subagent
 
 import (

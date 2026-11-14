@@ -133,6 +133,11 @@ func TestParseSpawnResult(t *testing.T) {
 		wantSessionKey string
 		wantErr        bool
 	}{
+		"live gateway response (smoke 2026-11-14)": {
+			raw:            `{"status":"accepted","childSessionKey":"agent:x:subagent:fac5","runId":"8f9c","mode":"run","completionTarget":"parent","modelApplied":true}`,
+			wantRunID:      "8f9c",
+			wantSessionKey: "agent:x:subagent:fac5",
+		},
 		"taskId and sessionKey": {
 			raw:            `{"taskId":"t1","sessionKey":"s1"}`,
 			wantRunID:      "t1",

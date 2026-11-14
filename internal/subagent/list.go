@@ -31,7 +31,7 @@ func (e *Executor) runList(ctx context.Context, _ json.RawMessage) (output strin
 			ids = append(ids, id)
 		}
 
-		result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{"action": "list"})
+		result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{"action": "list", "recentMinutes": listRecentMinutes})
 		if err != nil {
 			return fmt.Sprintf("error: calling %s: %v", gatewaySubagentsTool, err), true
 		}

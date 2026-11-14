@@ -6,17 +6,42 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+// liveList builds a subagents action="list" response in the shape observed
+// live (2026-11-14): entries keyed by runId under active[] (status "running")
+// and recent[] (status "done"), plus a tasks[] array keyed by an unrelated
+// taskId that must be ignored.
+func liveList(active []string, recent []string) string {
+	entry := func(id string, status string) string {
+		return `{"index":1,"runId":"` + id + `","sessionKey":"s-` + id + `","label":"l","status":"` + status + `","execution":{"state":"x"}}`
+	}
+	var a, r []string
+	for _, id := range active {
+		a = append(a, entry(id, "running"))
+	}
+	for _, id := range recent {
+		r = append(r, entry(id, "done"))
+	}
+	return `{"status":"ok","action":"list","tasks":[{"taskId":"task-uuid","status":"running","label":"l"}],"active":[` + strings.Join(a, ",") + `],"recent":[` + strings.Join(r, ",") + `]}`
+}
+
+func historyEnvelope(text string) string {
+	return `{"sessionKey":"k","messages":[{"role":"user","content":"task"},{"role":"assistant","content":[{"type":"text","text":"` + text + `"}],"stopReason":"stop"}],"truncated":true}`
+}
+
+func init() { listPollInterval = time.Millisecond }
 
 func TestExecutor_WaitForAll_Finishes(t *testing.T) {
 	caller := newFakeCaller().
-		script(gatewaySubagentsTool, scriptedCall{result: textResult(`[{"taskId":"run-1","status":"completed"},{"taskId":"run-2","status":"pending"}]`)}).
-		script(gatewaySessionsHistoryTool, scriptedCall{result: textResult(`[{"role":"assistant","text":"report one"}]`)})
+		script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-1"}))}).
+		script(gatewaySessionsHistoryTool,
+			scriptedCall{result: textResult(historyEnvelope("report one"))},
+			scriptedCall{result: textResult(historyEnvelope("report two"))})
 	// run-2 finishes on the second poll.
 	caller.scripts[gatewaySubagentsTool] = append(caller.scripts[gatewaySubagentsTool],
-		scriptedCall{result: textResult(`[{"taskId":"run-2","status":"completed"}]`)})
-	caller.scripts[gatewaySessionsHistoryTool] = append(caller.scripts[gatewaySessionsHistoryTool],
-		scriptedCall{result: textResult(`[{"role":"assistant","text":"report two"}]`)})
+		scriptedCall{result: textResult(liveList(nil, []string{"run-1", "run-2"}))})
 
 	e := NewExecutor(caller)
 	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
@@ -26,24 +51,22 @@ func TestExecutor_WaitForAll_Finishes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("waitForAll error: %v", err)
 	}
-	if statuses["run-1"].Result != "report one" {
-		t.Errorf("run-1 result = %q, want %q", statuses["run-1"].Result, "report one")
-	}
-	if statuses["run-2"].Result != "report two" {
-		t.Errorf("run-2 result = %q, want %q", statuses["run-2"].Result, "report two")
+	got := []string{statuses["run-1"].Result, statuses["run-2"].Result}
+	if !(got[0] == "report one" && got[1] == "report two") && !(got[0] == "report two" && got[1] == "report one") {
+		t.Errorf("results = %q, want both reports fetched", got)
 	}
 
 	calls := caller.callsTo(gatewaySubagentsTool)
 	if len(calls) != 2 {
-		t.Fatalf("got %d subagents(wait) calls, want 2 (run-2 needed a second poll)", len(calls))
+		t.Fatalf("got %d subagents(list) calls, want 2 (run-2 needed a second poll)", len(calls))
 	}
-	if ids, ok := calls[1].arguments["taskIds"].([]string); !ok || len(ids) != 1 || ids[0] != "run-2" {
-		t.Errorf("second poll taskIds = %v, want only the still-pending run-2", calls[1].arguments["taskIds"])
+	if calls[0].arguments["action"] != "list" {
+		t.Errorf("poll action = %v, want list (action=wait only accepts gateway taskIds, not runIds)", calls[0].arguments["action"])
 	}
 }
 
 func TestExecutor_WaitForAll_TimeoutLeavesUnfinishedIDsReported(t *testing.T) {
-	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(`[{"taskId":"run-1","status":"running"}]`)})
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))})
 	e := NewExecutor(caller)
 
 	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
@@ -58,7 +81,7 @@ func TestExecutor_WaitForAll_TimeoutLeavesUnfinishedIDsReported(t *testing.T) {
 
 func TestExecutor_WaitForAll_CtxCancelStopsPromptly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(`[{"taskId":"run-1","status":"running"}]`)})
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))})
 	caller.onCall = func(name string, arguments map[string]any) {
 		if name == gatewaySubagentsTool {
 			cancel()
@@ -76,7 +99,7 @@ func TestExecutor_WaitForAll_CtxCancelStopsPromptly(t *testing.T) {
 }
 
 func TestExecutor_WaitForAll_MissingRegistryRecordIsAClearError(t *testing.T) {
-	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(`[{"taskId":"run-1","status":"completed"}]`)})
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))})
 	e := NewExecutor(caller) // registry never populated: simulates a resumed process.
 
 	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
@@ -122,6 +145,10 @@ func TestExtractLastAssistantText(t *testing.T) {
 			raw:  `[{"role":"assistant","content":"from content"}]`,
 			want: "from content",
 		},
+		"live envelope with content blocks": {
+			raw:  `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"text","text":"PONG"}]}],"truncated":true}`,
+			want: "PONG",
+		},
 		"non-JSON falls back to the raw text verbatim": {
 			raw:  "plain transcript text, not JSON",
 			want: "plain transcript text, not JSON",
@@ -158,6 +185,15 @@ func TestParseSubagentsStatuses(t *testing.T) {
 			queried: []string{"run-1"},
 			wantFound: map[string]subagentStatus{
 				"run-1": {Status: "failed", Finished: true, Error: "boom"},
+			},
+		},
+		"live list shape: runId in active/recent, taskId in tasks ignored": {
+			raw:     liveList([]string{"run-2"}, []string{"run-1"}),
+			queried: []string{"run-1", "run-2", "task-uuid"},
+			wantFound: map[string]subagentStatus{
+				"run-1":     {Status: "done", Finished: true},
+				"run-2":     {Status: "running", Finished: false},
+				"task-uuid": {Status: "running", Finished: false},
 			},
 		},
 		"unqueried entries are ignored": {
