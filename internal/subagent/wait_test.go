@@ -9,41 +9,51 @@ import (
 	"time"
 )
 
-// liveList builds a subagents action="list" response in the shape observed
-// live (2026-11-14): entries keyed by runId under active[] (status "running")
-// and recent[] (status "done"), plus a tasks[] array keyed by an unrelated
-// taskId that must be ignored.
-func liveList(active []string, recent []string) string {
-	entry := func(id string, status string) string {
-		return `{"index":1,"runId":"` + id + `","sessionKey":"s-` + id + `","label":"l","status":"` + status + `","execution":{"state":"x"}}`
-	}
+// liveEntry builds one active[]/recent[] element in the shape observed live
+// (2026-11-14): status is the human label, state is execution.state.
+func liveEntry(id string, status string, state string) string {
+	return `{"index":1,"runId":"` + id + `","sessionKey":"s-` + id + `","label":"l","status":"` + status + `","execution":{"state":"` + state + `"}}`
+}
+
+// liveListRaw wraps raw active/recent entries in a list response, plus a
+// tasks[] array keyed by an unrelated taskId that must be ignored.
+func liveListRaw(active []string, recent []string) string {
+	return `{"status":"ok","action":"list","tasks":[{"taskId":"task-uuid","status":"completed","execution":{"state":"finished"},"label":"l"}],"active":[` + strings.Join(active, ",") + `],"recent":[` + strings.Join(recent, ",") + `]}`
+}
+
+// liveList lists activeIDs as running and recentIDs as done/finished.
+func liveList(activeIDs []string, recentIDs []string) string {
 	var a, r []string
-	for _, id := range active {
-		a = append(a, entry(id, "running"))
+	for _, id := range activeIDs {
+		a = append(a, liveEntry(id, "running", "running"))
 	}
-	for _, id := range recent {
-		r = append(r, entry(id, "done"))
+	for _, id := range recentIDs {
+		r = append(r, liveEntry(id, "done", "finished"))
 	}
-	return `{"status":"ok","action":"list","tasks":[{"taskId":"task-uuid","status":"running","label":"l"}],"active":[` + strings.Join(a, ",") + `],"recent":[` + strings.Join(r, ",") + `]}`
+	return liveListRaw(a, r)
 }
 
 func historyEnvelope(text string) string {
 	return `{"sessionKey":"k","messages":[{"role":"user","content":"task"},{"role":"assistant","content":[{"type":"text","text":"` + text + `"}],"stopReason":"stop"}],"truncated":true}`
 }
 
-func init() { listPollInterval = time.Millisecond }
+// newTestExecutor returns an Executor polling every millisecond.
+func newTestExecutor(caller *fakeCaller) *Executor {
+	e := NewExecutor(caller)
+	e.listPollInterval = time.Millisecond
+	return e
+}
 
 func TestExecutor_WaitForAll_Finishes(t *testing.T) {
 	caller := newFakeCaller().
-		script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-1"}))}).
-		script(gatewaySessionsHistoryTool,
-			scriptedCall{result: textResult(historyEnvelope("report one"))},
-			scriptedCall{result: textResult(historyEnvelope("report two"))})
-	// run-2 finishes on the second poll.
-	caller.scripts[gatewaySubagentsTool] = append(caller.scripts[gatewaySubagentsTool],
-		scriptedCall{result: textResult(liveList(nil, []string{"run-1", "run-2"}))})
+		script(gatewaySubagentsTool,
+			scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-1"}))},
+			// run-2 finishes on the second poll.
+			scriptedCall{result: textResult(liveList(nil, []string{"run-1", "run-2"}))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("report one"))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-2", scriptedCall{result: textResult(historyEnvelope("report two"))})
 
-	e := NewExecutor(caller)
+	e := newTestExecutor(caller)
 	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
 	e.registry.put("run-2", subagentRecord{sessionKey: "sess-2"})
 
@@ -51,9 +61,11 @@ func TestExecutor_WaitForAll_Finishes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("waitForAll error: %v", err)
 	}
-	got := []string{statuses["run-1"].Result, statuses["run-2"].Result}
-	if !(got[0] == "report one" && got[1] == "report two") && !(got[0] == "report two" && got[1] == "report one") {
-		t.Errorf("results = %q, want both reports fetched", got)
+	if got := statuses["run-1"].Result; got != "report one" {
+		t.Errorf("run-1 result = %q, want %q", got, "report one")
+	}
+	if got := statuses["run-2"].Result; got != "report two" {
+		t.Errorf("run-2 result = %q, want %q", got, "report two")
 	}
 
 	calls := caller.callsTo(gatewaySubagentsTool)
@@ -65,9 +77,144 @@ func TestExecutor_WaitForAll_Finishes(t *testing.T) {
 	}
 }
 
+func TestExecutor_WaitForAll_UnknownStateIsNotTerminal(t *testing.T) {
+	// "inactive"/"blocked" must neither read as finished nor as an error: the
+	// wait runs to its timeout, whose message names the last state seen.
+	for _, state := range []string{"inactive", "blocked", ""} {
+		t.Run("state="+state, func(t *testing.T) {
+			caller := newFakeCaller().script(gatewaySubagentsTool,
+				scriptedCall{result: textResult(liveListRaw([]string{liveEntry("run-1", "done", state)}, nil))})
+			e := newTestExecutor(caller)
+
+			statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
+			if err != nil {
+				t.Fatalf("waitForAll error: %v", err)
+			}
+			st := statuses["run-1"]
+			if st.Status != "timeout" || !strings.Contains(st.Error, "did not finish") {
+				t.Errorf("run-1 status = %+v, want timeout", st)
+			}
+			if state != "" && !strings.Contains(st.Error, state) {
+				t.Errorf("error %q does not name the last state %q", st.Error, state)
+			}
+		})
+	}
+}
+
+func TestExecutor_WaitForAll_DuplicateInActiveAndRecentPrefersFinished(t *testing.T) {
+	list := liveListRaw(
+		[]string{liveEntry("run-1", "running", "running")},
+		[]string{liveEntry("run-1", "done", "finished")})
+	caller := newFakeCaller().
+		script(gatewaySubagentsTool, scriptedCall{result: textResult(list)}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("final"))})
+	e := newTestExecutor(caller)
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if statuses["run-1"].Result != "final" || statuses["run-1"].Error != "" {
+		t.Errorf("run-1 = %+v, want finished with result", statuses["run-1"])
+	}
+	// Order must not matter: finished in active[], running in recent[].
+	list = liveListRaw(
+		[]string{liveEntry("run-1", "done", "finished")},
+		[]string{liveEntry("run-1", "running", "running")})
+	entries, err := parseList(list)
+	if err != nil || !entries["run-1"].finished() {
+		t.Errorf("parseList = %+v, %v; want run-1 finished", entries, err)
+	}
+}
+
+func TestExecutor_WaitForAll_RunNeverSeenFailsEarly(t *testing.T) {
+	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-3"}))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-3", scriptedCall{result: textResult(historyEnvelope("three"))})
+	e := newTestExecutor(caller)
+	e.registry.put("run-3", subagentRecord{sessionKey: "sess-3"})
+
+	start := time.Now()
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1", "run-3"}, 60)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("took %v, want an early failure instead of the 60s timeout", time.Since(start))
+	}
+	if st := statuses["run-1"]; st.Status != "not_found" || !strings.Contains(st.Error, "not found") {
+		t.Errorf("run-1 = %+v, want a not_found error", st)
+	}
+	if statuses["run-3"].Result != "three" {
+		t.Errorf("run-3 = %+v, want its result despite run-1 missing", statuses["run-3"])
+	}
+	if n := len(caller.callsTo(gatewaySubagentsTool)); n != e.notFoundPolls {
+		t.Errorf("polled %d times, want %d (notFoundPolls)", n, e.notFoundPolls)
+	}
+}
+
+func TestExecutor_WaitForAll_TransientListErrorRecovers(t *testing.T) {
+	caller := newFakeCaller().
+		script(gatewaySubagentsTool,
+			scriptedCall{err: errors.New("connection reset")},
+			scriptedCall{result: errorResult("gateway busy")},
+			scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("ok"))})
+	e := newTestExecutor(caller)
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
+	if err != nil {
+		t.Fatalf("waitForAll error: %v, want recovery after 2 transient failures", err)
+	}
+	if statuses["run-1"].Result != "ok" {
+		t.Errorf("run-1 = %+v, want result ok", statuses["run-1"])
+	}
+}
+
+func TestExecutor_WaitForAll_PersistentListErrorReturnsPartialResults(t *testing.T) {
+	caller := newFakeCaller().
+		script(gatewaySubagentsTool,
+			scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-1"}))},
+			scriptedCall{err: errors.New("connection refused")}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("one"))})
+	e := newTestExecutor(caller)
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+	e.registry.put("run-2", subagentRecord{sessionKey: "sess-2"})
+
+	statuses, err := e.waitForAll(context.Background(), []string{"run-1", "run-2"}, 5)
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("waitForAll error = %v, want the list error", err)
+	}
+	if statuses["run-1"].Result != "one" {
+		t.Errorf("run-1 = %+v, want its finished result kept", statuses["run-1"])
+	}
+	if st := statuses["run-2"]; st.Status != "unknown" || st.Error == "" {
+		t.Errorf("run-2 = %+v, want unknown with the error", st)
+	}
+	// 1 good poll + maxListFailures failing polls.
+	if n := len(caller.callsTo(gatewaySubagentsTool)); n != 1+e.maxListFailures {
+		t.Errorf("polled %d times, want %d", n, 1+e.maxListFailures)
+	}
+
+	// A fresh executor over the same script, so runWait starts at poll 1.
+	caller = newFakeCaller().
+		script(gatewaySubagentsTool,
+			scriptedCall{result: textResult(liveList([]string{"run-2"}, []string{"run-1"}))},
+			scriptedCall{err: errors.New("connection refused")}).
+		scriptForSession(gatewaySessionsHistoryTool, "sess-1", scriptedCall{result: textResult(historyEnvelope("one"))})
+	e = newTestExecutor(caller)
+	e.registry.put("run-1", subagentRecord{sessionKey: "sess-1"})
+	e.registry.put("run-2", subagentRecord{sessionKey: "sess-2"})
+	out, isError := e.runWait(context.Background(), json.RawMessage(`{"ids":["run-1","run-2"],"timeout_seconds":5}`))
+	if !isError || !strings.Contains(out, "partial results") || !strings.Contains(out, `"one"`) {
+		t.Errorf("runWait = (%q, %v), want an error carrying the partial results", out, isError)
+	}
+}
+
 func TestExecutor_WaitForAll_TimeoutLeavesUnfinishedIDsReported(t *testing.T) {
 	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList([]string{"run-1"}, nil))})
-	e := NewExecutor(caller)
+	e := newTestExecutor(caller)
 
 	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 1)
 	if err != nil {
@@ -100,7 +247,7 @@ func TestExecutor_WaitForAll_CtxCancelStopsPromptly(t *testing.T) {
 
 func TestExecutor_WaitForAll_MissingRegistryRecordIsAClearError(t *testing.T) {
 	caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{result: textResult(liveList(nil, []string{"run-1"}))})
-	e := NewExecutor(caller) // registry never populated: simulates a resumed process.
+	e := newTestExecutor(caller) // registry never populated: simulates a resumed process.
 
 	statuses, err := e.waitForAll(context.Background(), []string{"run-1"}, 5)
 	if err != nil {
@@ -166,65 +313,18 @@ func TestExtractLastAssistantText(t *testing.T) {
 	}
 }
 
-func TestParseSubagentsStatuses(t *testing.T) {
-	for name, tc := range map[string]struct {
-		raw       string
-		queried   []string
-		wantFound map[string]subagentStatus
-	}{
-		"bare array of entries": {
-			raw:     `[{"taskId":"run-1","status":"completed"},{"taskId":"run-2","status":"running"}]`,
-			queried: []string{"run-1", "run-2"},
-			wantFound: map[string]subagentStatus{
-				"run-1": {Status: "completed", Finished: true},
-				"run-2": {Status: "running", Finished: false},
-			},
-		},
-		"wrapped under a tasks key": {
-			raw:     `{"tasks":[{"id":"run-1","status":"failed","error":"boom"}]}`,
-			queried: []string{"run-1"},
-			wantFound: map[string]subagentStatus{
-				"run-1": {Status: "failed", Finished: true, Error: "boom"},
-			},
-		},
-		"live list shape: runId in active/recent, taskId in tasks ignored": {
-			raw:     liveList([]string{"run-2"}, []string{"run-1"}),
-			queried: []string{"run-1", "run-2", "task-uuid"},
-			wantFound: map[string]subagentStatus{
-				"run-1":     {Status: "done", Finished: true},
-				"run-2":     {Status: "running", Finished: false},
-				"task-uuid": {Status: "running", Finished: false},
-			},
-		},
-		"unqueried entries are ignored": {
-			raw:       `[{"taskId":"other","status":"completed"}]`,
-			queried:   []string{"run-1"},
-			wantFound: map[string]subagentStatus{},
-		},
-		"an error field marks it finished even with an unrecognized status word": {
-			raw:     `[{"taskId":"run-1","status":"blocked","errorMessage":"needs input"}]`,
-			queried: []string{"run-1"},
-			wantFound: map[string]subagentStatus{
-				"run-1": {Status: "blocked", Finished: true, Error: "needs input"},
-			},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			got := parseSubagentsStatuses(tc.raw, tc.queried)
-			if len(got) != len(tc.wantFound) {
-				t.Fatalf("parseSubagentsStatuses = %+v, want %+v", got, tc.wantFound)
-			}
-			for id, want := range tc.wantFound {
-				if got[id] != want {
-					t.Errorf("status[%q] = %+v, want %+v", id, got[id], want)
-				}
-			}
-		})
+func TestParseList(t *testing.T) {
+	entries, err := parseList(liveList([]string{"run-2"}, []string{"run-1"}))
+	if err != nil {
+		t.Fatalf("parseList error: %v", err)
 	}
-}
-
-func TestParseSubagentsStatuses_NonJSONReturnsNil(t *testing.T) {
-	if got := parseSubagentsStatuses("not json", []string{"run-1"}); got != nil {
-		t.Errorf("parseSubagentsStatuses(non-JSON) = %+v, want nil", got)
+	if len(entries) != 2 || !entries["run-1"].finished() || entries["run-2"].finished() {
+		t.Errorf("entries = %+v, want run-1 finished and run-2 running (tasks[] ignored)", entries)
+	}
+	if _, found := entries["task-uuid"]; found {
+		t.Error("tasks[] taskId must not be treated as a runId")
+	}
+	if _, err := parseList("not json"); err == nil {
+		t.Error("parseList(non-JSON) error = nil, want a decode error")
 	}
 }

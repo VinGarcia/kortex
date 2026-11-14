@@ -15,17 +15,30 @@ import (
 // omits timeout_seconds.
 const defaultWaitTimeoutSeconds = 1800
 
-// listPollInterval is how long waitForAll sleeps between "subagents"
-// action="list" polls. It is a var so tests can shrink it.
+// Executor.listPollInterval (default defaultListPollInterval) is how long
+// waitForAll sleeps between "subagents" action="list" polls.
 //
 // Why list-polling instead of the gateway's action="wait": LIVE SMOKE
 // (2026-11-14) showed action="wait" only accepts the gateway's internal
 // *taskId*, which sessions_spawn does NOT return (it returns runId +
 // childSessionKey); waiting by runId or childSessionKey answers
 // reason:"unavailable". action="list" does carry runId in its active[]/recent[]
-// entries (status "running" -> "done"), so polling it keyed by runId needs no
-// runId->taskId mapping.
-var listPollInterval = 3 * time.Second
+// entries, so polling it keyed by runId needs no runId->taskId mapping.
+const defaultListPollInterval = 3 * time.Second
+
+// defaultNotFoundPolls is how many consecutive polls may omit a run id from
+// both active[] and recent[] before waitForAll gives up on that id as "not
+// found" instead of waiting out the full timeout (e.g. a mistyped id).
+const defaultNotFoundPolls = 2
+
+// defaultMaxListFailures is how many consecutive failed list polls (call
+// error, tool error, or undecodable response) waitForAll tolerates before
+// giving up and returning whatever it already gathered.
+const defaultMaxListFailures = 3
+
+// stateFinished is the gateway's execution.state value for a run that has
+// reached a terminal state.
+const stateFinished = "finished"
 
 // listRecentMinutes is the recentMinutes window passed to action="list" so a
 // run that finished long before wait_subagents was called is still reported
@@ -80,9 +93,9 @@ func (e *Executor) runWait(ctx context.Context, rawInput json.RawMessage) (outpu
 		timeout = defaultWaitTimeoutSeconds
 	}
 
-	statuses, err := e.waitForAll(ctx, input.IDs, timeout)
-	if err != nil {
-		return fmt.Sprintf("error: %v", err), true
+	statuses, waitErr := e.waitForAll(ctx, input.IDs, timeout)
+	if waitErr != nil && statuses == nil {
+		return fmt.Sprintf("error: %v", waitErr), true
 	}
 
 	entries := make([]waitResultEntry, 0, len(input.IDs))
@@ -94,30 +107,110 @@ func (e *Executor) runWait(ctx context.Context, rawInput json.RawMessage) (outpu
 	if err != nil {
 		return fmt.Sprintf("error: encoding %s result: %v", WaitToolName, err), true
 	}
+	if waitErr != nil {
+		// Partial results: the entries gathered before waitForAll gave up,
+		// returned alongside the error so finished reports are not lost.
+		return fmt.Sprintf("error: %v\npartial results: %s", waitErr, out), true
+	}
 	return string(out), false
 }
 
 // subagentStatus is what waitForAll learns about one run id: the gateway's
-// own status label, whether that label is terminal, and — once resolved via
-// sessions_history — the child's final report or a reason it could not be
-// fetched.
+// own status label and — once resolved via sessions_history — the child's
+// final report or a reason it could not be fetched.
 type subagentStatus struct {
-	Status   string
-	Finished bool
-	Error    string
-	Result   string
+	Status string
+	Error  string
+	Result string
+}
+
+// listEntry is one element of the active[] or recent[] arrays of a
+// subagents action="list" response, as observed live (2026-11-14). The
+// response's tasks[] array is keyed by an unrelated gateway taskId and is
+// deliberately not decoded.
+type listEntry struct {
+	RunID     string `json:"runId"`
+	Status    string `json:"status"`
+	Execution struct {
+		State string `json:"state"`
+	} `json:"execution"`
+}
+
+// finished reports whether the run reached a terminal state. Only
+// execution.state == "finished" is terminal. Any other value — "running",
+// any state this package has never seen, or a missing field — is treated as
+// NOT finished: waiting on a run that is really done costs at most the
+// caller's timeout (whose message names the last state seen), while
+// reporting an unfinished run as done would fetch a partial transcript as
+// its final report. Exact equality, never substring matching ("inactive"
+// must not read as "active").
+func (l listEntry) finished() bool {
+	return l.Execution.State == stateFinished
+}
+
+type listResponse struct {
+	Active []listEntry `json:"active"`
+	Recent []listEntry `json:"recent"`
+}
+
+// parseList decodes one list response into entries keyed by runId. When a
+// run appears in both active[] and recent[], the finished entry wins, so a
+// run caught mid-transition is never reported as still running.
+func parseList(raw string) (map[string]listEntry, error) {
+	var resp listResponse
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		return nil, fmt.Errorf("decoding %s list response: %w", gatewaySubagentsTool, err)
+	}
+	entries := make(map[string]listEntry, len(resp.Active)+len(resp.Recent))
+	for _, group := range [][]listEntry{resp.Active, resp.Recent} {
+		for _, entry := range group {
+			if entry.RunID == "" {
+				continue
+			}
+			if prev, seen := entries[entry.RunID]; seen && prev.finished() && !entry.finished() {
+				continue
+			}
+			entries[entry.RunID] = entry
+		}
+	}
+	return entries, nil
+}
+
+// pollList makes one list call and decodes it.
+func (e *Executor) pollList(ctx context.Context) (map[string]listEntry, error) {
+	result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{
+		"action":        "list",
+		"recentMinutes": listRecentMinutes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("calling %s: %w", gatewaySubagentsTool, err)
+	}
+	if result.IsError {
+		return nil, fmt.Errorf("%s: %s", gatewaySubagentsTool, joinContent(result))
+	}
+	return parseList(joinContent(result))
 }
 
 // waitForAll polls the gateway's "subagents" action="list" tool for ids
-// until every one is reported finished or timeoutSeconds elapses, then
-// fetches each finished (non-error) id's final report via sessions_history.
-// It is ctx-aware: a cancelled ctx stops the loop before the next poll
-// rather than running it to the timeout. Shared by wait_subagents and
-// spawn_subagent's wait=true path.
+// until every one is finished, found missing, or timeoutSeconds elapse, then
+// fetches each finished id's final report via sessions_history. It is
+// ctx-aware: a cancelled ctx stops the loop before the next poll and returns
+// (nil, err).
+//
+// An id absent from both lists for e.notFoundPolls consecutive polls is
+// reported with Status "not_found" rather than waited out. Up to
+// e.maxListFailures consecutive failed polls are tolerated; past that,
+// waitForAll returns the results gathered so far (finished ids with their
+// reports, the rest marked unknown) TOGETHER with the error. Shared by
+// wait_subagents and spawn_subagent's wait=true path.
 func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds int) (map[string]subagentStatus, error) {
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	remaining := append([]string(nil), ids...)
 	results := make(map[string]subagentStatus, len(ids))
+	absent := make(map[string]int, len(ids))
+	lastState := make(map[string]string, len(ids))
+	failures := 0
+	var giveUpErr error
 
 	for len(remaining) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -127,32 +220,44 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 			break
 		}
 
-		result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{
-			"action":        "list",
-			"recentMinutes": listRecentMinutes,
-		})
+		entries, err := e.pollList(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("%s: calling %s: %w", WaitToolName, gatewaySubagentsTool, err)
-		}
-		if result.IsError {
-			return nil, fmt.Errorf("%s: %s: %s", WaitToolName, gatewaySubagentsTool, joinContent(result))
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("%s: %w", WaitToolName, ctxErr)
+			}
+			failures++
+			if failures >= e.maxListFailures {
+				giveUpErr = fmt.Errorf("%s: giving up after %d consecutive list failures: %w", WaitToolName, failures, err)
+				break
+			}
+		} else {
+			failures = 0
+			var stillPending []string
+			for _, id := range remaining {
+				entry, ok := entries[id]
+				switch {
+				case !ok:
+					absent[id]++
+					if absent[id] >= e.notFoundPolls {
+						results[id] = subagentStatus{Status: "not_found", Error: fmt.Sprintf("run %q not found in the %s list (absent from %d consecutive polls)", id, gatewaySubagentsTool, absent[id])}
+						continue
+					}
+				case entry.finished():
+					results[id] = subagentStatus{Status: entry.Status}
+					continue
+				default:
+					absent[id] = 0
+					lastState[id] = entry.Execution.State
+				}
+				stillPending = append(stillPending, id)
+			}
+			remaining = stillPending
+			if len(remaining) == 0 {
+				break
+			}
 		}
 
-		statuses := parseSubagentsStatuses(joinContent(result), remaining)
-		var stillPending []string
-		for _, id := range remaining {
-			st, ok := statuses[id]
-			if !ok || !st.Finished {
-				stillPending = append(stillPending, id)
-				continue
-			}
-			results[id] = st
-		}
-		remaining = stillPending
-		if len(remaining) == 0 {
-			break
-		}
-		sleep := listPollInterval
+		sleep := e.listPollInterval
 		if left := time.Until(deadline); left < sleep {
 			sleep = left
 		}
@@ -166,7 +271,15 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 	}
 
 	for _, id := range remaining {
-		results[id] = subagentStatus{Status: "timeout", Error: fmt.Sprintf("did not finish within %ds", timeoutSeconds)}
+		if giveUpErr != nil {
+			results[id] = subagentStatus{Status: "unknown", Error: giveUpErr.Error()}
+			continue
+		}
+		msg := fmt.Sprintf("did not finish within %ds", timeoutSeconds)
+		if state := lastState[id]; state != "" {
+			msg += fmt.Sprintf(" (last execution state: %q)", state)
+		}
+		results[id] = subagentStatus{Status: "timeout", Error: msg}
 	}
 
 	for id, st := range results {
@@ -187,7 +300,7 @@ func (e *Executor) waitForAll(ctx context.Context, ids []string, timeoutSeconds 
 		}
 		results[id] = st
 	}
-	return results, nil
+	return results, giveUpErr
 }
 
 // fetchFinalText reads the finished child's history and returns its last
@@ -273,94 +386,4 @@ func truncateResult(s string, max int) string {
 		return s
 	}
 	return fmt.Sprintf("%s\n[truncated: showing first %d of %d bytes]", cut, len(cut), len(s))
-}
-
-// parseSubagentsStatuses defensively extracts a per-id status from one
-// "subagents" action="wait"/"list" call's result text. See the package doc
-// comment: the gateway's exact response shape for this action is not
-// documented beyond its request schema, so this walks the decoded JSON
-// looking for objects that carry a recognizable id, rather than assuming one
-// fixed envelope.
-func parseSubagentsStatuses(raw string, queriedIDs []string) map[string]subagentStatus {
-	queried := make(map[string]bool, len(queriedIDs))
-	for _, id := range queriedIDs {
-		queried[id] = true
-	}
-
-	var decoded any
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
-		// Not JSON: nothing structured to extract per id. The caller's own
-		// deadline/timeout handling covers eventually declaring these ids
-		// unresolved rather than hanging on an unparseable response forever.
-		return nil
-	}
-
-	statuses := make(map[string]subagentStatus)
-	scanSubagentEntries(decoded, queried, statuses)
-	return statuses
-}
-
-// scanSubagentEntries walks a decoded JSON value looking for objects that
-// carry both an id-like field (taskId/id/runId/name) matching one of
-// queried, and status-like fields. It does not assume a fixed envelope
-// (a bare array vs. {"tasks":[...]} vs. {"items":[...]}) since that envelope
-// is one of the unconfirmed parts of the response shape (see package doc);
-// walking finds matching entries wherever they are nested.
-func scanSubagentEntries(node any, queried map[string]bool, out map[string]subagentStatus) {
-	switch v := node.(type) {
-	case map[string]any:
-		if id := firstStringField(v, "taskId", "id", "runId", "name"); id != "" && queried[id] {
-			out[id] = subagentStatusFromFields(v)
-		}
-		for _, child := range v {
-			scanSubagentEntries(child, queried, out)
-		}
-	case []any:
-		for _, child := range v {
-			scanSubagentEntries(child, queried, out)
-		}
-	}
-}
-
-func firstStringField(m map[string]any, keys ...string) string {
-	for _, k := range keys {
-		if s, ok := m[k].(string); ok && s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
-// terminalStatusWords and nonTerminalStatusWords classify a status string by
-// case-insensitive substring. The exact enum the gateway uses for this field
-// is one of the unconfirmed parts of the response shape (see package doc);
-// nonTerminalStatusWords is checked first so an ambiguous match (e.g. a
-// status containing both "queued" and, coincidentally, "done") resolves to
-// "not finished yet" rather than ending the wait early.
-var terminalStatusWords = []string{"complet", "done", "finish", "fail", "error", "cancel", "timeout", "kill", "abort"}
-var nonTerminalStatusWords = []string{"pending", "running", "queued", "active", "in_progress", "waiting"}
-
-func subagentStatusFromFields(m map[string]any) subagentStatus {
-	status := firstStringField(m, "status", "state")
-	errMsg := firstStringField(m, "error", "errorMessage", "message")
-	lower := strings.ToLower(status)
-
-	for _, w := range nonTerminalStatusWords {
-		if strings.Contains(lower, w) {
-			return subagentStatus{Status: status}
-		}
-	}
-	finished := false
-	for _, w := range terminalStatusWords {
-		if strings.Contains(lower, w) {
-			finished = true
-			break
-		}
-	}
-	if errMsg != "" {
-		// An explicit error field means the run is done, even when its status
-		// word isn't one this package recognizes as terminal.
-		finished = true
-	}
-	return subagentStatus{Status: status, Finished: finished, Error: errMsg}
 }

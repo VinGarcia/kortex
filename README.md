@@ -130,6 +130,12 @@ package differs — `proxy` versus `session`.
   successful turn (per-session byte cursor, committed only after the turn
   succeeds). Fail-open: any error injects nothing and is logged to Diag.
 
+- `internal/subagent` — native `spawn_subagent`/`wait_subagents`/
+  `list_subagents` tools. The only package that knows the gateway's tool
+  names and response shapes (waiting polls the gateway's run list keyed by
+  run id); it satisfies `tools.SubagentPort`, wired by `main`, and imports
+  `tools` only for shared helpers (never the reverse).
+
 Import directions (enforced by `go-arch-lint`, `.go-arch-lint.yml`, run via
 `make lint`): `proxy` may import `protocol` and `history`; `history` may
 import `protocol`; `facet` may import `protocol`, `anthropic` and `history`

@@ -26,23 +26,20 @@ func (e *Executor) runList(ctx context.Context, _ json.RawMessage) (output strin
 
 	entries := make([]listResultEntry, 0, len(records))
 	if len(records) > 0 {
-		ids := make([]string, 0, len(records))
-		for id := range records {
-			ids = append(ids, id)
-		}
-
-		result, err := e.mcp.CallTool(ctx, gatewaySubagentsTool, map[string]any{"action": "list", "recentMinutes": listRecentMinutes})
+		listed, err := e.pollList(ctx)
 		if err != nil {
-			return fmt.Sprintf("error: calling %s: %v", gatewaySubagentsTool, err), true
+			return fmt.Sprintf("error: %v", err), true
 		}
-		if result.IsError {
-			return fmt.Sprintf("error: %s: %s", gatewaySubagentsTool, joinContent(result)), true
-		}
-		statuses := parseSubagentsStatuses(joinContent(result), ids)
 
 		for id, rec := range records {
-			st := statuses[id]
-			entries = append(entries, listResultEntry{RunID: id, Label: rec.label, Status: st.Status, Error: st.Error})
+			entry := listResultEntry{RunID: id, Label: rec.label}
+			if l, ok := listed[id]; ok {
+				entry.Status = l.Status
+			} else {
+				entry.Status = "not_found"
+				entry.Error = "not present in the gateway's run list"
+			}
+			entries = append(entries, entry)
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].RunID < entries[j].RunID })

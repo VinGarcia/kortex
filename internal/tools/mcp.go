@@ -8,7 +8,7 @@ import (
 )
 
 // MCPToolPrefix is prepended to each gateway tool name: the gateway's
-// tools/list catalog omits this prefix (e.g. "sessions_send"), so we add it
+// tools/list catalog omits this prefix (a bare tool name), so we add it
 // when exposing the tool to the Messages API.
 const MCPToolPrefix = "mcp__openclaw__"
 

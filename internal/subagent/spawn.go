@@ -106,7 +106,7 @@ func (e *Executor) runSpawn(ctx context.Context, rawInput json.RawMessage) (outp
 		timeout = defaultWaitTimeoutSeconds
 	}
 	statuses, err := e.waitForAll(ctx, []string{runID}, timeout)
-	if err != nil {
+	if err != nil && statuses == nil {
 		return fmt.Sprintf("error: %v", err), true
 	}
 	st := statuses[runID]

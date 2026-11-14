@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/vingarcia/kortex/internal/anthropic"
 	"github.com/vingarcia/kortex/internal/mcp"
@@ -69,11 +70,23 @@ const (
 type Executor struct {
 	mcp      mcpCaller
 	registry *registry
+
+	// listPollInterval, notFoundPolls and maxListFailures tune waitForAll
+	// (see the default* constants in wait.go); tests shrink listPollInterval.
+	listPollInterval time.Duration
+	notFoundPolls    int
+	maxListFailures  int
 }
 
 // NewExecutor builds an Executor that calls the gateway through mcpClient.
 func NewExecutor(mcpClient mcpCaller) *Executor {
-	return &Executor{mcp: mcpClient, registry: newRegistry()}
+	return &Executor{
+		mcp:              mcpClient,
+		registry:         newRegistry(),
+		listPollInterval: defaultListPollInterval,
+		notFoundPolls:    defaultNotFoundPolls,
+		maxListFailures:  defaultMaxListFailures,
+	}
 }
 
 // ToolDefs returns the three native tool declarations for the Messages API

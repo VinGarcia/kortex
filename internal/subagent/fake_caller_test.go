@@ -25,7 +25,11 @@ type fakeCaller struct {
 	mu       sync.Mutex
 	scripts  map[string][]scriptedCall
 	nextCall map[string]int
-	calls    []fakeCallRecord
+	// bySession answers a call to the named tool by its "sessionKey"
+	// argument instead of by call order, so tests do not depend on the
+	// (map-iteration) order in which waitForAll fetches several histories.
+	bySession map[string]map[string]scriptedCall
+	calls     []fakeCallRecord
 	// onCall, when set, runs synchronously inside CallTool before the
 	// scripted reply is returned — tests use it to cancel a context after N
 	// calls, proving the wait loop is ctx-aware.
@@ -38,7 +42,7 @@ type fakeCallRecord struct {
 }
 
 func newFakeCaller() *fakeCaller {
-	return &fakeCaller{scripts: make(map[string][]scriptedCall), nextCall: make(map[string]int)}
+	return &fakeCaller{scripts: make(map[string][]scriptedCall), nextCall: make(map[string]int), bySession: make(map[string]map[string]scriptedCall)}
 }
 
 // script queues calls for name, consumed in order as CallTool(name, ...) is
@@ -48,11 +52,27 @@ func (f *fakeCaller) script(name string, calls ...scriptedCall) *fakeCaller {
 	return f
 }
 
+// scriptForSession answers CallTool(name, {"sessionKey": sessionKey, ...})
+// with call, regardless of call order. It takes precedence over script().
+func (f *fakeCaller) scriptForSession(name string, sessionKey string, call scriptedCall) *fakeCaller {
+	if f.bySession[name] == nil {
+		f.bySession[name] = make(map[string]scriptedCall)
+	}
+	f.bySession[name][sessionKey] = call
+	return f
+}
+
 func (f *fakeCaller) CallTool(ctx context.Context, name string, arguments map[string]any) (mcp.CallToolResult, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, fakeCallRecord{name: name, arguments: arguments})
 	if f.onCall != nil {
 		f.onCall(name, arguments)
+	}
+	if key, _ := arguments["sessionKey"].(string); key != "" {
+		if call, ok := f.bySession[name][key]; ok {
+			f.mu.Unlock()
+			return call.result, call.err
+		}
 	}
 	queue := f.scripts[name]
 	idx := f.nextCall[name]

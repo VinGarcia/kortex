@@ -25,7 +25,7 @@ func TestExecutor_RunList(t *testing.T) {
 
 	t.Run("enriches the gateway's statuses with the registry's labels", func(t *testing.T) {
 		caller := newFakeCaller().script(gatewaySubagentsTool, scriptedCall{
-			result: textResult(`[{"taskId":"run-1","status":"completed"},{"taskId":"run-2","status":"running"}]`),
+			result: textResult(liveList([]string{"run-2"}, []string{"run-1"})),
 		})
 		e := NewExecutor(caller)
 		e.registry.put("run-1", subagentRecord{sessionKey: "sess-1", label: "first"})
@@ -44,7 +44,7 @@ func TestExecutor_RunList(t *testing.T) {
 			t.Fatalf("got %d entries, want 2: %+v", len(entries), entries)
 		}
 		want := map[string]listResultEntry{
-			"run-1": {RunID: "run-1", Label: "first", Status: "completed"},
+			"run-1": {RunID: "run-1", Label: "first", Status: "done"},
 			"run-2": {RunID: "run-2", Label: "second", Status: "running"},
 		}
 		for _, e := range entries {

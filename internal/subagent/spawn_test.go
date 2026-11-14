@@ -71,7 +71,7 @@ func TestExecutor_RunSpawn(t *testing.T) {
 			input:       `{"task":"do it"}`,
 			spawnResult: scriptedCall{result: textResult(`{"taskId":"run-1","sessionKey":"sess-1"}`)},
 			waitScripts: map[string][]scriptedCall{
-				gatewaySubagentsTool:       {{result: textResult(`{"taskId":"run-1","status":"completed"}`)}},
+				gatewaySubagentsTool:       {{result: textResult(liveList(nil, []string{"run-1"}))}},
 				gatewaySessionsHistoryTool: {{result: textResult(`[{"role":"assistant","text":"the final report"}]`)}},
 			},
 			wantContains: "the final report",
@@ -82,7 +82,7 @@ func TestExecutor_RunSpawn(t *testing.T) {
 			for toolName, calls := range tc.waitScripts {
 				caller.script(toolName, calls...)
 			}
-			e := NewExecutor(caller)
+			e := newTestExecutor(caller)
 
 			output, isError := e.runSpawn(context.Background(), json.RawMessage(tc.input))
 			if isError != tc.wantErr {
@@ -112,7 +112,7 @@ func TestExecutor_RunSpawn(t *testing.T) {
 
 func TestExecutor_RunSpawnPopulatesRegistry(t *testing.T) {
 	caller := newFakeCaller().script(gatewaySpawnTool, scriptedCall{result: textResult(`{"taskId":"run-1","sessionKey":"sess-1"}`)})
-	e := NewExecutor(caller)
+	e := newTestExecutor(caller)
 
 	if _, isError := e.runSpawn(context.Background(), json.RawMessage(`{"task":"do it","label":"my-label","wait":false}`)); isError {
 		t.Fatal("runSpawn reported an error")

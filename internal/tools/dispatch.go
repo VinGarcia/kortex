@@ -65,7 +65,7 @@ type Dispatcher struct {
 	// disables load_superego_archive.
 	subagent SubagentPort
 	// hiddenMCPTools names raw (unprefixed) gateway MCP tools that ToolDefs()
-	// must not declare to the model — e.g. the gateway's own sessions_spawn
+	// must not declare to the model — e.g. a gateway spawn tool
 	// once SubagentPort wraps it: the model must go through spawn_subagent,
 	// which injects the no-yield preamble and the model allowlist that a raw
 	// call would bypass (see HideMCPTools). Execute still forwards any of

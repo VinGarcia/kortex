@@ -12,7 +12,8 @@ import (
 // fakeSubagentPort is a scripted SubagentPort standing in for
 // internal/subagent.Executor, so Dispatcher's generic routing is tested
 // without depending on that package (which would also violate the
-// one-way tools -> subagent dependency direction).
+// one-way subagent -> tools dependency direction: subagent imports tools,
+// so tools importing subagent would be a cycle).
 type fakeSubagentPort struct {
 	defs      []anthropic.ToolDef
 	output    string
