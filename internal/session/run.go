@@ -272,7 +272,7 @@ type Config struct {
 	// user messages in, a bounded digest block out). Nil skips the digest, leaving
 	// the core context unchanged. The digest never enters canonical history.
 	ToneDigester ToneDigester
-	// DeliveredFeed, when non-nil, supplies the ephemeral "delivered since your
+	// DeliveredFeed, when non-nil, supplies the "delivered since your
 	// last turn" block, appended after the tone digest in the core's ephemeral
 	// tail. Nil skips it. It never enters canonical history or the governor.
 	DeliveredFeed DeliveredFeed
@@ -459,6 +459,17 @@ func runTurn(
 	// always prunes to the same output.
 	msgs = anthropic.PruneThinkingFromHistory(msgs)
 
+	// Deliveries made to this chat by background runs since the last turn enter
+	// the canonical history as their own user message right before the new user
+	// message, so they persist (Store.Save below) and come back on every later
+	// turn in the order the user saw them — the same permanence the user has on
+	// their side (Vini, 2026-11-13). The Messages API merges consecutive user
+	// turns, so the extra message is wire-safe. Appending to a clone keeps the
+	// caller's msgs untouched when the turn fails and history must stay as it was.
+	if delivered != "" {
+		msgs = append(slices.Clone(msgs), anthropic.Message{Role: "user", Content: delivered})
+	}
+
 	// The ephemeral tone digest is computed once per turn and shared: it is
 	// injected as the last item of the core's context (EphemeralContext below) and
 	// forwarded to the governor so the superego reviews against the same tone
@@ -478,7 +489,7 @@ func runTurn(
 		// be kept alive on the wire exactly like the ladder's silent span.
 		KeepaliveInterval: cfg.GovernKeepaliveInterval,
 		Emitter:           emitter,
-		EphemeralContext:  joinEphemeral(digest, delivered),
+		EphemeralContext:  digest,
 		IsTerminalTool:    cfg.IsTerminalTool,
 		// The active path defers the final turn so the governor can decide the
 		// delivered text before anything reaches the wire.
@@ -574,19 +585,6 @@ func deliveredNote(cfg Config, inbound protocol.Inbound) (block string, nextOffs
 		return "", 0, false
 	}
 	return cfg.DeliveredFeed.Unseen(inbound.Info.ChatID)
-}
-
-// joinEphemeral combines the turn's ephemeral blocks into the single
-// EphemeralContext string, skipping empty ones, so a turn with neither block
-// sends no ephemeral tail at all (byte-identical to the no-feed path).
-func joinEphemeral(blocks ...string) string {
-	nonEmpty := make([]string, 0, len(blocks))
-	for _, block := range blocks {
-		if block != "" {
-			nonEmpty = append(nonEmpty, block)
-		}
-	}
-	return strings.Join(nonEmpty, "\n\n")
 }
 
 // toolCallsFromMessages derives this turn's tool calls from the native message

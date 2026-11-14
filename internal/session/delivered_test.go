@@ -38,10 +38,11 @@ func (f *fakeDeliveredFeed) Commit(nextOffset int64) {
 	f.commits = append(f.commits, nextOffset)
 }
 
-// TestRun_DeliveredFeed proves the "delivered since your last turn" block is
-// appended to the ephemeral tail (after the tone digest), keyed on the inbound
-// chat_id, never persisted, and that the request prefix before the tail is
-// byte-identical to a run without the feed (the prompt-cache prefix is intact).
+// TestRun_DeliveredFeed proves the "delivered since your last turn" block enters
+// the canonical history as its own user message right before the new user
+// message (persisted, so later turns carry it in order), keyed on the inbound
+// chat_id, that the cursor is committed once per successful turn, and that the
+// tone digest stays the only ephemeral tail.
 func TestRun_DeliveredFeed(t *testing.T) {
 	const digest = "<<<TOM>>>"
 	const block = "<delivered_since_last_turn>\n13:00 x\n</delivered_since_last_turn>"
@@ -83,10 +84,18 @@ func TestRun_DeliveredFeed(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.Load: %v", err)
 		}
-		for i, m := range saved {
+		persisted := 0
+		for _, m := range saved {
 			if s, ok := m.Content.(string); ok && strings.Contains(s, "delivered_since_last_turn") {
-				t.Errorf("persisted message %d carries the delivered block", i)
+				persisted++
 			}
+		}
+		want := 0
+		if feed != nil {
+			want = 1 // shown once, kept forever
+		}
+		if persisted != want {
+			t.Errorf("persisted delivered blocks = %d, want %d", persisted, want)
 		}
 		if len(calls) != 2 {
 			t.Fatalf("captured %d core calls, want 2", len(calls))
@@ -104,37 +113,24 @@ func TestRun_DeliveredFeed(t *testing.T) {
 	if want := []int64{1, 2}; !reflect.DeepEqual(feed.commits, want) {
 		t.Errorf("commits = %v, want %v (one per successful turn)", feed.commits, want)
 	}
-	if last := withFeed[0][len(withFeed[0])-1]; last.Content != digest+"\n\n"+block {
-		t.Errorf("turn 1 tail = %+v, want digest then delivered block", last.Content)
+	// Turn 1 wire: [..., delivered block (user), new user msg, digest (tail)].
+	t1 := withFeed[0]
+	if got := t1[len(t1)-3].Content; got != block {
+		t.Errorf("turn 1 message before the user text = %+v, want the delivered block", got)
 	}
-	if last := withFeed[1][len(withFeed[1])-1]; last.Content != digest {
-		t.Errorf("turn 2 tail = %+v, want digest only (nothing new delivered)", last.Content)
+	if got := t1[len(t1)-1].Content; got != digest {
+		t.Errorf("turn 1 tail = %+v, want digest only", got)
 	}
-	for turn := range withFeed {
-		got, want := withFeed[turn], withoutFeed[turn]
-		if !reflect.DeepEqual(got[:len(got)-1], want[:len(want)-1]) {
-			t.Errorf("turn %d: request prefix differs with the feed wired; the delivered block leaked out of the ephemeral tail", turn+1)
-		}
+	// Turn 2 re-sends the persisted block in place (nothing new delivered).
+	t2 := withFeed[1]
+	if got := t2[len(t2)-1].Content; got != digest {
+		t.Errorf("turn 2 tail = %+v, want digest only", got)
 	}
-}
-
-func TestJoinEphemeral(t *testing.T) {
-	tests := []struct {
-		desc   string
-		blocks []string
-		want   string
-	}{
-		{desc: "all empty sends no tail", blocks: []string{"", ""}, want: ""},
-		{desc: "only digest", blocks: []string{"d", ""}, want: "d"},
-		{desc: "only delivered", blocks: []string{"", "x"}, want: "x"},
-		{desc: "both, digest first", blocks: []string{"d", "x"}, want: "d\n\nx"},
+	if len(t2) != len(withoutFeed[1])+1 {
+		t.Fatalf("turn 2 has %d messages, want %d (history + the one persisted delivered block)", len(t2), len(withoutFeed[1])+1)
 	}
-	for _, tc := range tests {
-		t.Run(tc.desc, func(t *testing.T) {
-			if got := joinEphemeral(tc.blocks...); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
+	if got := t2[len(t1)-3].Content; got != block {
+		t.Errorf("turn 2 history lost the delivered block at its original position: %+v", got)
 	}
 }
 

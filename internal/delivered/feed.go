@@ -114,7 +114,8 @@ func (f *Feed) Unseen(chatID string) (block string, nextOffset int64, ok bool) {
 		return "", nextOffset, true
 	}
 	block = "<delivered_since_last_turn>\n" +
-		"Delivered to you in this chat by background runs since your last turn " +
+		"[origin: kortex delivered-feed, not written by the user] Messages delivered " +
+		"to you in this chat by your own background runs since your last turn " +
 		"(already sent; do not repeat or re-offer them):\n" +
 		strings.Join(lines, "\n") + "\n</delivered_since_last_turn>"
 	return block, nextOffset, true
